@@ -326,12 +326,12 @@ async fn auth_route(State(state): State<AppState>, headers: HeaderMap) -> Respon
         return StatusCode::OK.into_response();
     }
 
-    let token = match extract_bearer(&headers) {
+    let token = match extract_token(&headers) {
         Some(t) => t,
         None => {
             return json_status(
                 StatusCode::UNAUTHORIZED,
-                json!({"error": "missing or invalid Authorization header"}),
+                json!({"error": "missing or invalid Authorization header or api-key"}),
             );
         }
     };
@@ -343,13 +343,14 @@ async fn auth_route(State(state): State<AppState>, headers: HeaderMap) -> Respon
     }
 }
 
-/// Extract bearer token from Authorization header (case-insensitive scheme).
-fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
-    let value = headers.get("authorization")?.to_str().ok()?;
-    // RFC 6750: token type is case-insensitive
-    if value.len() > 7 && value[..7].eq_ignore_ascii_case("bearer ") {
-        Some(&value[7..])
-    } else {
-        None
+/// Extract token from `Authorization: Bearer <token>` or `api-key: <token>` header.
+fn extract_token(headers: &HeaderMap) -> Option<&str> {
+    // Try Authorization: Bearer first
+    if let Some(value) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        if value.len() > 7 && value[..7].eq_ignore_ascii_case("bearer ") {
+            return Some(&value[7..]);
+        }
     }
+    // Fall back to api-key header (Qdrant convention)
+    headers.get("api-key").and_then(|v| v.to_str().ok())
 }

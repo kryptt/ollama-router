@@ -3,14 +3,18 @@ set -euo pipefail
 
 REGISTRY=registry.hr-home.xyz
 APP=ollama-router
-VERSION=0.2.0
+VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 
 IMG=$REGISTRY/$APP:$VERSION
-LATEST=$REGISTRY/$APP:latest
+
+if docker manifest inspect "$IMG" &>/dev/null; then
+  echo "ERROR: $IMG already exists in registry."
+  echo "Bump version in Cargo.toml before building."
+  exit 1
+fi
 
 docker buildx build . -t "$IMG"
-docker tag "$IMG" "$LATEST"
 docker push "$IMG"
-docker push "$LATEST"
 
-echo "Pushed $IMG and $LATEST"
+echo "Pushed $IMG"
+echo "Update fleet manifest: image: $IMG"

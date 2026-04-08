@@ -9,7 +9,6 @@ unsafe fn clear_env() {
         "OLLAMA_ROUTER_BACKENDS",
         "OLLAMA_ROUTER_DISCOVERY_INTERVAL",
         "OLLAMA_ROUTER_GRACE_MULTIPLIER",
-        "OLLAMA_ROUTER_MAX_BODY_SIZE",
         "OLLAMA_ROUTER_TOKENS_FILE",
         "OLLAMA_ROUTER_PUBLIC_PORT",
         "OLLAMA_ROUTER_INTERNAL_PORT",
@@ -29,7 +28,6 @@ fn defaults_are_sane() {
     assert_eq!(config.backends[1].url, "http://ollama-rocm.ai:11435");
     assert_eq!(config.discovery_interval_secs, 60);
     assert_eq!(config.grace_period_secs(), 180);
-    assert_eq!(config.max_body_size, 104_857_600);
     assert!(config.tokens_file.is_none());
     assert_eq!(config.public_addr.port(), 11434);
     assert_eq!(config.internal_addr.port(), 9090);
@@ -90,15 +88,6 @@ fn invalid_discovery_interval_fails() {
     unsafe { env::set_var("OLLAMA_ROUTER_DISCOVERY_INTERVAL", "abc") };
     let err = Config::from_env().unwrap_err();
     assert!(err.to_string().contains("must be a positive integer"));
-    unsafe { clear_env() };
-}
-
-#[test]
-fn custom_max_body_size() {
-    unsafe { clear_env() };
-    unsafe { env::set_var("OLLAMA_ROUTER_MAX_BODY_SIZE", "10485760") };
-    let config = Config::from_env().unwrap();
-    assert_eq!(config.max_body_size, 10_485_760);
     unsafe { clear_env() };
 }
 

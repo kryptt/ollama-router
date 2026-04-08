@@ -43,7 +43,6 @@ pub struct Config {
     pub backends: Vec<Backend>,
     pub discovery_interval_secs: u64,
     pub grace_multiplier: u64,
-    pub max_body_size: usize,
     pub tokens_file: Option<String>,
     pub public_addr: SocketAddr,
     pub internal_addr: SocketAddr,
@@ -68,7 +67,6 @@ impl Config {
 
         let discovery_interval_secs = parse_env_u64("OLLAMA_ROUTER_DISCOVERY_INTERVAL", 60)?;
         let grace_multiplier = parse_env_u64("OLLAMA_ROUTER_GRACE_MULTIPLIER", 3)?;
-        let max_body_size = parse_env_u64("OLLAMA_ROUTER_MAX_BODY_SIZE", 104_857_600)? as usize;
         let tokens_file = env::var("OLLAMA_ROUTER_TOKENS_FILE").ok();
         let public_port = parse_env_u64("OLLAMA_ROUTER_PUBLIC_PORT", 11434)? as u16;
         let internal_port = parse_env_u64("OLLAMA_ROUTER_INTERNAL_PORT", 9090)? as u16;
@@ -77,7 +75,6 @@ impl Config {
             backends,
             discovery_interval_secs,
             grace_multiplier,
-            max_body_size,
             tokens_file,
             public_addr: SocketAddr::from(([0, 0, 0, 0], public_port)),
             internal_addr: SocketAddr::from(([0, 0, 0, 0], internal_port)),
@@ -94,7 +91,6 @@ impl Config {
             backends,
             discovery_interval_secs: 60,
             grace_multiplier: 3,
-            max_body_size: 104_857_600,
             tokens_file: None,
             public_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             internal_addr: SocketAddr::from(([127, 0, 0, 1], 0)),

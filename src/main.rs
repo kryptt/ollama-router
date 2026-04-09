@@ -96,6 +96,7 @@ async fn main() {
         .route("/v1/chat/completions", post(model_route))
         .route("/v1/completions", post(model_route))
         .route("/v1/embeddings", post(model_route))
+        .route("/v1/messages", post(model_route))
         .route("/api/pull", post(blocked_route))
         .route("/api/delete", post(blocked_route))
         .route("/api/copy", post(blocked_route))

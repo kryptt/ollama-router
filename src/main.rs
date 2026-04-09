@@ -363,7 +363,8 @@ async fn auth_route(State(state): State<AppState>, headers: HeaderMap) -> Respon
     }
 }
 
-/// Extract token from `Authorization: Bearer <token>` or `api-key: <token>` header.
+/// Extract token from `Authorization: Bearer <token>`, `api-key: <token>`,
+/// or `x-api-key: <token>` header.
 fn extract_token(headers: &HeaderMap) -> Option<&str> {
     // Try Authorization: Bearer first
     if let Some(value) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
@@ -371,6 +372,9 @@ fn extract_token(headers: &HeaderMap) -> Option<&str> {
             return Some(&value[7..]);
         }
     }
-    // Fall back to api-key header (Qdrant convention)
-    headers.get("api-key").and_then(|v| v.to_str().ok())
+    // Fall back to api-key (Qdrant) or x-api-key (Anthropic) headers
+    headers
+        .get("api-key")
+        .or_else(|| headers.get("x-api-key"))
+        .and_then(|v| v.to_str().ok())
 }

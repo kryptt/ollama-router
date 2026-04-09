@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{OriginalUri, Path, State};
@@ -42,6 +42,8 @@ async fn main() {
     info!(
         backends = config.backends.len(),
         discovery_interval = config.discovery_interval_secs,
+        connect_timeout = config.connect_timeout_secs,
+        request_timeout = config.request_timeout_secs,
         public_addr = %config.public_addr,
         internal_addr = %config.internal_addr,
         "starting ollama-router"
@@ -53,6 +55,8 @@ async fn main() {
     let client = Arc::new(
         reqwest::Client::builder()
             .pool_max_idle_per_host(10)
+            .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+            .timeout(Duration::from_secs(config.request_timeout_secs))
             .build()
             .expect("failed to build HTTP client"),
     );

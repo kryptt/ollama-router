@@ -46,6 +46,8 @@ pub struct Config {
     pub tokens_file: Option<String>,
     pub public_addr: SocketAddr,
     pub internal_addr: SocketAddr,
+    pub connect_timeout_secs: u64,
+    pub request_timeout_secs: u64,
 }
 
 impl Config {
@@ -70,6 +72,8 @@ impl Config {
         let tokens_file = env::var("OLLAMA_ROUTER_TOKENS_FILE").ok();
         let public_port = parse_env_u64("OLLAMA_ROUTER_PUBLIC_PORT", 11434)? as u16;
         let internal_port = parse_env_u64("OLLAMA_ROUTER_INTERNAL_PORT", 9090)? as u16;
+        let connect_timeout_secs = parse_env_u64("OLLAMA_ROUTER_CONNECT_TIMEOUT", 10)?;
+        let request_timeout_secs = parse_env_u64("OLLAMA_ROUTER_REQUEST_TIMEOUT", 300)?;
 
         Ok(Config {
             backends,
@@ -78,6 +82,8 @@ impl Config {
             tokens_file,
             public_addr: SocketAddr::from(([0, 0, 0, 0], public_port)),
             internal_addr: SocketAddr::from(([0, 0, 0, 0], internal_port)),
+            connect_timeout_secs,
+            request_timeout_secs,
         })
     }
 
@@ -94,6 +100,8 @@ impl Config {
             tokens_file: None,
             public_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             internal_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            connect_timeout_secs: 10,
+            request_timeout_secs: 300,
         }
     }
 }

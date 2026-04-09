@@ -12,6 +12,8 @@ unsafe fn clear_env() {
         "OLLAMA_ROUTER_TOKENS_FILE",
         "OLLAMA_ROUTER_PUBLIC_PORT",
         "OLLAMA_ROUTER_INTERNAL_PORT",
+        "OLLAMA_ROUTER_CONNECT_TIMEOUT",
+        "OLLAMA_ROUTER_REQUEST_TIMEOUT",
     ] {
         unsafe { env::remove_var(key) };
     }
@@ -31,6 +33,8 @@ fn defaults_are_sane() {
     assert!(config.tokens_file.is_none());
     assert_eq!(config.public_addr.port(), 11434);
     assert_eq!(config.internal_addr.port(), 9090);
+    assert_eq!(config.connect_timeout_secs, 10);
+    assert_eq!(config.request_timeout_secs, 300);
 }
 
 #[test]
@@ -88,6 +92,17 @@ fn invalid_discovery_interval_fails() {
     unsafe { env::set_var("OLLAMA_ROUTER_DISCOVERY_INTERVAL", "abc") };
     let err = Config::from_env().unwrap_err();
     assert!(err.to_string().contains("must be a positive integer"));
+    unsafe { clear_env() };
+}
+
+#[test]
+fn custom_timeouts() {
+    unsafe { clear_env() };
+    unsafe { env::set_var("OLLAMA_ROUTER_CONNECT_TIMEOUT", "5") };
+    unsafe { env::set_var("OLLAMA_ROUTER_REQUEST_TIMEOUT", "600") };
+    let config = Config::from_env().unwrap();
+    assert_eq!(config.connect_timeout_secs, 5);
+    assert_eq!(config.request_timeout_secs, 600);
     unsafe { clear_env() };
 }
 

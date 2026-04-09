@@ -39,6 +39,14 @@ pub async fn execute(req: ProxyRequest<'_>) -> Response {
 
     let upstream_resp = match builder.body(reqwest_body).send().await {
         Ok(r) => r,
+        Err(e) if e.is_connect() => {
+            tracing::warn!(error = %e, "upstream connect failed");
+            return json_error(StatusCode::BAD_GATEWAY, "upstream connect failed", None);
+        }
+        Err(e) if e.is_timeout() => {
+            tracing::warn!(error = %e, "upstream request timed out");
+            return json_error(StatusCode::GATEWAY_TIMEOUT, "upstream request timed out", None);
+        }
         Err(e) => {
             tracing::warn!(error = %e, "upstream request failed");
             return json_error(StatusCode::BAD_GATEWAY, "upstream unavailable", None);

@@ -42,8 +42,11 @@ pub fn v1_model_response(reg: &Registry, model_id: &str) -> Response {
 }
 
 fn v1_model_object(m: &crate::registry::ModelInfo) -> serde_json::Value {
+    // Strip the default `:latest` tag so clients that request the bare model
+    // name (e.g. "glm-4.7-flash") see an exact ID match.
+    let id = m.name.strip_suffix(":latest").unwrap_or(&m.name);
     json!({
-        "id": m.name,
+        "id": id,
         "object": "model",
         "created": 0,
         "owned_by": "library",

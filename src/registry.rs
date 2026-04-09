@@ -333,10 +333,10 @@ mod tests {
             &mut reg,
             1,
             true,
-            vec![make_model("qwen3.5:latest"), make_model("qwen3.5:35b")],
+            vec![make_model("qwen3.5:latest"), make_model("glm-4.7-flash")],
         );
 
-        let id = reg.lookup("qwen3.5:35b").unwrap();
+        let id = reg.lookup("glm-4.7-flash").unwrap();
         assert_eq!(reg.backend(id).name, "rocm");
     }
 

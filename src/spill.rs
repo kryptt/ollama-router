@@ -334,8 +334,8 @@ mod tests {
 
     #[test]
     fn model_and_stream_false() {
-        let s = scan(br#"{"model": "qwen3.5:35b", "stream": false}"#);
-        assert_eq!(s.model(), Some("qwen3.5:35b"));
+        let s = scan(br#"{"model": "glm-4.7-flash", "stream": false}"#);
+        assert_eq!(s.model(), Some("glm-4.7-flash"));
         assert_eq!(s.stream_value(), Some(false));
     }
 

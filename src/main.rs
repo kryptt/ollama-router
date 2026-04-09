@@ -9,6 +9,7 @@ use axum::routing::{any, get, post};
 use axum::Router;
 use serde_json::json;
 use tokio::net::TcpListener;
+use tower_http::trace::TraceLayer;
 use tracing::info;
 
 use ollama_router::auth::TokenStore;
@@ -104,6 +105,7 @@ async fn main() {
         .route("/v1/models", get(v1_models_route))
         .route("/v1/models/{model_id}", get(v1_model_route))
         .fallback(any(passthrough_route))
+        .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
     let internal_router = Router::new()

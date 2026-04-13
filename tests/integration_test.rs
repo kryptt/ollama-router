@@ -1,9 +1,9 @@
 use std::time::Duration;
 
+use axum::Router;
 use axum::body::Bytes;
 use axum::http::StatusCode;
 use axum::routing::{any, get, post};
-use axum::Router;
 use tokio::net::TcpListener;
 
 use ollama_router::auth::TokenStore;
@@ -31,9 +31,7 @@ async fn start_mock_backend(
         )
         .route(
             "/api/chat",
-            post(|body: Bytes| async move {
-                (StatusCode::OK, format!("echoed: {}", body.len()))
-            }),
+            post(|body: Bytes| async move { (StatusCode::OK, format!("echoed: {}", body.len())) }),
         )
         .route(
             "/api/version",

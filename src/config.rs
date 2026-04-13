@@ -138,7 +138,10 @@ impl fmt::Display for ConfigError {
                 write!(f, "invalid backend entry: '{entry}' (expected name=url)")
             }
             Self::NoBackends => {
-                write!(f, "OLLAMA_ROUTER_BACKENDS must contain at least one backend")
+                write!(
+                    f,
+                    "OLLAMA_ROUTER_BACKENDS must contain at least one backend"
+                )
             }
             Self::InvalidValue { key, value } => {
                 write!(f, "{key} must be a positive integer, got '{value}'")

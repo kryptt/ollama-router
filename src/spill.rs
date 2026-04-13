@@ -102,7 +102,9 @@ enum State {
     /// whether this string could be `"model"` or `"stream"`.
     QuoteOpen,
     /// Inside a JSON string we are not interested in — skip to close-quote.
-    SkipString { escaped: bool },
+    SkipString {
+        escaped: bool,
+    },
 
     // ---- matching "model" key ----
     /// Saw `"m`, matching remaining chars of `odel"`.
@@ -112,7 +114,9 @@ enum State {
     /// Saw `:`, skipping whitespace before value `"`.
     ModelQuote,
     /// Inside model value string, accumulating into `buf`.
-    ModelValue { escaped: bool },
+    ModelValue {
+        escaped: bool,
+    },
 
     // ---- matching "stream" key ----
     /// Saw `"s`, matching remaining chars of `tream"`.
@@ -127,7 +131,7 @@ enum State {
 }
 
 // Lookup tables for the suffixes we match after the opening `"` + first char.
-const MODEL_SUFFIX: &[u8] = b"odel\"";   // after "m
+const MODEL_SUFFIX: &[u8] = b"odel\""; // after "m
 const STREAM_SUFFIX: &[u8] = b"tream\""; // after "s
 
 impl Scanner {
@@ -226,7 +230,9 @@ impl Scanner {
                     State::ModelValue { escaped: true }
                 }
                 b'"' => {
-                    self.model = String::from_utf8(self.buf.clone()).ok().filter(|s| !s.is_empty());
+                    self.model = String::from_utf8(self.buf.clone())
+                        .ok()
+                        .filter(|s| !s.is_empty());
                     State::Idle
                 }
                 _ => {

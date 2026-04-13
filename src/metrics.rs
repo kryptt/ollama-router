@@ -29,7 +29,11 @@ impl Metrics {
         let mut registry = Registry::default();
 
         let requests_total = Family::default();
-        registry.register("ollama_router_requests", "Total routed requests", requests_total.clone());
+        registry.register(
+            "ollama_router_requests",
+            "Total routed requests",
+            requests_total.clone(),
+        );
 
         fn make_duration_histogram() -> Histogram {
             Histogram::new(DURATION_BUCKETS.iter().copied())

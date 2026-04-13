@@ -1,12 +1,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::{OriginalUri, Path, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
-use axum::Router;
 use serde_json::json;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
@@ -165,7 +165,9 @@ async fn model_route(
 ) -> Response {
     let spilled = match spill::spill_and_detect(body).await {
         Ok(Some(s)) => s,
-        Ok(None) => return proxy::bad_request("request body must contain a non-empty 'model' field"),
+        Ok(None) => {
+            return proxy::bad_request("request body must contain a non-empty 'model' field");
+        }
         Err(e) => {
             tracing::warn!(error = %e, "failed to spill request body");
             return proxy::bad_gateway("failed to read request body");
@@ -313,10 +315,7 @@ async fn v1_models_route(State(state): State<AppState>) -> Response {
     models::v1_models_response(&reg)
 }
 
-async fn v1_model_route(
-    State(state): State<AppState>,
-    Path(model_id): Path<String>,
-) -> Response {
+async fn v1_model_route(State(state): State<AppState>, Path(model_id): Path<String>) -> Response {
     let reg = state.registry.read().await;
     models::v1_model_response(&reg, &model_id)
 }

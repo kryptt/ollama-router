@@ -311,7 +311,12 @@ mod tests {
     #[test]
     fn lookup_exact_match() {
         let mut reg = Registry::new(&test_config());
-        set_backend_models(&mut reg, 0, true, vec![make_model("fixt/home-3b-v3:latest")]);
+        set_backend_models(
+            &mut reg,
+            0,
+            true,
+            vec![make_model("fixt/home-3b-v3:latest")],
+        );
 
         let id = reg.lookup("fixt/home-3b-v3:latest").unwrap();
         assert_eq!(reg.backend(id).name, "cuda");

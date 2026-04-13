@@ -233,12 +233,8 @@ pub async fn preflight_is_loaded(
     let hit = body.models.iter().any(|m| {
         m.name == model
             || m.model == model
-            || m.name
-                .split_once(':')
-                .is_some_and(|(p, _)| p == model)
-            || m.model
-                .split_once(':')
-                .is_some_and(|(p, _)| p == model)
+            || m.name.split_once(':').is_some_and(|(p, _)| p == model)
+            || m.model.split_once(':').is_some_and(|(p, _)| p == model)
     });
 
     Ok(hit)
@@ -483,7 +479,10 @@ mod tests {
     fn ollama_chat_heartbeat_is_valid_ndjson_with_empty_content() {
         let bytes = StreamProtocol::OllamaChat.heartbeat("llama3");
         let s = std::str::from_utf8(&bytes).unwrap();
-        assert!(s.ends_with('\n'), "ndjson chunks must be newline-terminated");
+        assert!(
+            s.ends_with('\n'),
+            "ndjson chunks must be newline-terminated"
+        );
         let json: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
         assert_eq!(json["model"], "llama3");
         assert_eq!(json["done"], false);
@@ -532,8 +531,8 @@ mod tests {
 
     // ---- async tests -----------------------------------------------------
 
-    use axum::routing::{get, post};
     use axum::Router;
+    use axum::routing::{get, post};
     use http_body_util::BodyExt;
     use tokio::net::TcpListener;
 

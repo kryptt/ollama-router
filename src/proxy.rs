@@ -34,7 +34,10 @@ pub async fn execute(req: ProxyRequest<'_>) -> Response {
     }
 
     // Convert axum Body stream → reqwest streaming body.
-    let body_stream = req.body.into_data_stream().map(|r| r.map_err(std::io::Error::other));
+    let body_stream = req
+        .body
+        .into_data_stream()
+        .map(|r| r.map_err(std::io::Error::other));
     let reqwest_body = reqwest::Body::wrap_stream(body_stream);
 
     let upstream_resp = match builder.body(reqwest_body).send().await {
@@ -45,7 +48,11 @@ pub async fn execute(req: ProxyRequest<'_>) -> Response {
         }
         Err(e) if e.is_timeout() => {
             tracing::warn!(error = %e, "upstream request timed out");
-            return json_error(StatusCode::GATEWAY_TIMEOUT, "upstream request timed out", None);
+            return json_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream request timed out",
+                None,
+            );
         }
         Err(e) => {
             tracing::warn!(error = %e, "upstream request failed");

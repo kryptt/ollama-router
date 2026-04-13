@@ -23,7 +23,10 @@ pub fn v1_models_response(reg: &Registry) -> Response {
 pub fn v1_model_response(reg: &Registry, model_id: &str) -> Response {
     // Try exact match against reachable models first, then prefix.
     let found = reg.reachable_models().into_iter().find(|m| {
-        m.name == model_id || m.name.split_once(':').is_some_and(|(prefix, _)| prefix == model_id)
+        m.name == model_id
+            || m.name
+                .split_once(':')
+                .is_some_and(|(prefix, _)| prefix == model_id)
     });
 
     match found {

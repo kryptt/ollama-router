@@ -14,6 +14,7 @@ use tracing::info;
 
 use ollama_router::auth::TokenStore;
 use ollama_router::config::Config;
+use ollama_router::heartbeat::{self, HeartbeatConfig, StreamProtocol};
 use ollama_router::metrics::{self, Metrics};
 use ollama_router::models;
 use ollama_router::proxy;
@@ -27,6 +28,7 @@ struct AppState {
     metrics: Arc<Metrics>,
     client: Arc<reqwest::Client>,
     token_store: Arc<TokenStore>,
+    heartbeat: HeartbeatConfig,
 }
 
 #[tokio::main]
@@ -45,6 +47,9 @@ async fn main() {
         discovery_interval = config.discovery_interval_secs,
         connect_timeout = config.connect_timeout_secs,
         request_timeout = config.request_timeout_secs,
+        loading_heartbeat = config.loading_heartbeat_secs,
+        preflight_timeout = config.preflight_timeout_secs,
+        loading_max_wait = config.loading_max_wait_secs,
         public_addr = %config.public_addr,
         internal_addr = %config.internal_addr,
         "starting ollama-router"
@@ -62,11 +67,18 @@ async fn main() {
             .expect("failed to build HTTP client"),
     );
 
+    let heartbeat_cfg = HeartbeatConfig::from_secs(
+        config.loading_heartbeat_secs,
+        config.preflight_timeout_secs,
+        config.loading_max_wait_secs,
+    );
+
     let state = AppState {
         registry: Arc::clone(&registry),
         metrics: Arc::clone(&metrics),
         client,
         token_store: Arc::clone(&token_store),
+        heartbeat: heartbeat_cfg,
     };
 
     tokio::spawn({
@@ -176,16 +188,49 @@ async fn model_route(
 
     let start = Instant::now();
 
-    let response = proxy::execute(proxy::ProxyRequest {
-        client: &state.client,
-        backend_url: &backend_url,
-        path: uri.path(),
-        query: uri.query(),
-        method: method.clone(),
-        headers: &headers,
-        body: spilled.body,
-    })
-    .await;
+    // Decide between hot-path proxy and heartbeat-wrapped proxy.
+    //
+    // Heartbeat path only makes sense for streaming chat/completion requests
+    // against a backend that isn't currently hosting the model in memory.
+    // Anything else (non-streaming, embeddings, tags, etc.) just proxies
+    // directly — those requests don't suffer from idle-chunk timeouts.
+    let use_heartbeat = spilled.stream
+        && StreamProtocol::from_path(uri.path()).is_some()
+        && !preflight_model_loaded(&state, &backend_url, &spilled.model).await;
+
+    let response = if use_heartbeat {
+        let protocol = StreamProtocol::from_path(uri.path()).expect("checked above");
+        tracing::info!(
+            model = %spilled.model,
+            backend = %backend_name,
+            path = uri.path(),
+            "heartbeat path engaged (model not hot)"
+        );
+        heartbeat::execute(heartbeat::HeartbeatRequest {
+            client: &state.client,
+            backend_url: &backend_url,
+            path: uri.path(),
+            query: uri.query(),
+            method: method.clone(),
+            headers: &headers,
+            body: spilled.body,
+            protocol,
+            model: spilled.model.clone(),
+            config: state.heartbeat,
+        })
+        .await
+    } else {
+        proxy::execute(proxy::ProxyRequest {
+            client: &state.client,
+            backend_url: &backend_url,
+            path: uri.path(),
+            query: uri.query(),
+            method: method.clone(),
+            headers: &headers,
+            body: spilled.body,
+        })
+        .await
+    };
 
     let duration = start.elapsed().as_secs_f64();
     let status_code = response.status().as_u16();
@@ -213,6 +258,37 @@ async fn model_route(
         .observe(duration);
 
     response
+}
+
+/// Return `true` if `/api/ps` on `backend_url` confirms the model is loaded,
+/// or if the probe fails in a way that suggests we should *not* take the
+/// heartbeat path (preflight error → let normal proxy surface the problem).
+///
+/// The semantics are asymmetric on purpose: the heartbeat path commits to a
+/// `200 OK` response before upstream replies, so we only take it when we
+/// have positive evidence that the model is still loading.
+async fn preflight_model_loaded(state: &AppState, backend_url: &str, model: &str) -> bool {
+    match heartbeat::preflight_is_loaded(
+        &state.client,
+        backend_url,
+        model,
+        state.heartbeat.preflight_timeout,
+    )
+    .await
+    {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                model = %model,
+                backend_url = %backend_url,
+                "preflight failed — skipping heartbeat path"
+            );
+            // Treat preflight failure as "loaded" so we don't engage the
+            // heartbeat path. Normal proxy will surface the real error.
+            true
+        }
+    }
 }
 
 async fn blocked_route(State(state): State<AppState>, OriginalUri(uri): OriginalUri) -> Response {

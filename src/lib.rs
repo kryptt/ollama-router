@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod config;
+pub mod heartbeat;
 pub mod metrics;
 pub mod models;
 pub mod proxy;

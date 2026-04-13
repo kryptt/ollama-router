@@ -48,6 +48,15 @@ pub struct Config {
     pub internal_addr: SocketAddr,
     pub connect_timeout_secs: u64,
     pub request_timeout_secs: u64,
+    /// How often to emit a heartbeat chunk while waiting for a cold model to
+    /// produce its first token. Also the delay before the first heartbeat.
+    pub loading_heartbeat_secs: u64,
+    /// Timeout on the `/api/ps` preflight probe. If it times out, we fall
+    /// through to the normal proxy path.
+    pub preflight_timeout_secs: u64,
+    /// Maximum time to wait for upstream to produce its first real byte
+    /// before giving up and emitting an in-band error.
+    pub loading_max_wait_secs: u64,
 }
 
 impl Config {
@@ -74,6 +83,9 @@ impl Config {
         let internal_port = parse_env_u64("OLLAMA_ROUTER_INTERNAL_PORT", 9090)? as u16;
         let connect_timeout_secs = parse_env_u64("OLLAMA_ROUTER_CONNECT_TIMEOUT", 10)?;
         let request_timeout_secs = parse_env_u64("OLLAMA_ROUTER_REQUEST_TIMEOUT", 300)?;
+        let loading_heartbeat_secs = parse_env_u64("OLLAMA_ROUTER_LOADING_HEARTBEAT", 15)?;
+        let preflight_timeout_secs = parse_env_u64("OLLAMA_ROUTER_PREFLIGHT_TIMEOUT", 10)?;
+        let loading_max_wait_secs = parse_env_u64("OLLAMA_ROUTER_LOADING_MAX_WAIT", 300)?;
 
         Ok(Config {
             backends,
@@ -84,6 +96,9 @@ impl Config {
             internal_addr: SocketAddr::from(([0, 0, 0, 0], internal_port)),
             connect_timeout_secs,
             request_timeout_secs,
+            loading_heartbeat_secs,
+            preflight_timeout_secs,
+            loading_max_wait_secs,
         })
     }
 
@@ -102,6 +117,9 @@ impl Config {
             internal_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             connect_timeout_secs: 10,
             request_timeout_secs: 300,
+            loading_heartbeat_secs: 15,
+            preflight_timeout_secs: 10,
+            loading_max_wait_secs: 300,
         }
     }
 }

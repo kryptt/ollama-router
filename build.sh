@@ -2,10 +2,14 @@
 set -euo pipefail
 
 REGISTRY=registry.hr-home.xyz
+OWNER=kryptt
 APP=ollama-router
 VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 
-IMG=$REGISTRY/$APP:$VERSION
+# Local-dev push target. Namespaced under $OWNER to mirror the GHCR path
+# (ghcr.io/$OWNER/$APP) and the pull-through cache path
+# (ghcr.hr-home.xyz/$OWNER/$APP) used for production deploys.
+IMG=$REGISTRY/$OWNER/$APP:$VERSION
 
 if docker manifest inspect "$IMG" &>/dev/null; then
   echo "ERROR: $IMG already exists in registry."

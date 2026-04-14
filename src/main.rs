@@ -442,10 +442,11 @@ async fn auth_route(State(state): State<AppState>, headers: HeaderMap) -> Respon
 /// or `x-api-key: <token>` header.
 fn extract_token(headers: &HeaderMap) -> Option<&str> {
     // Try Authorization: Bearer first
-    if let Some(value) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        if value.len() > 7 && value[..7].eq_ignore_ascii_case("bearer ") {
-            return Some(&value[7..]);
-        }
+    if let Some(value) = headers.get("authorization").and_then(|v| v.to_str().ok())
+        && value.len() > 7
+        && value[..7].eq_ignore_ascii_case("bearer ")
+    {
+        return Some(&value[7..]);
     }
     // Fall back to api-key (Qdrant) or x-api-key (Anthropic) headers
     headers

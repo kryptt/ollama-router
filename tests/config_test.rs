@@ -1,9 +1,12 @@
 use std::env;
+use std::sync::Mutex;
 
 use ollama_router::config::Config;
 
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
 // SAFETY: env::set_var/remove_var are unsafe in edition 2024 because they are
-// not thread-safe. These tests must run with --test-threads=1.
+// not thread-safe. Each test holds ENV_LOCK to serialize access.
 unsafe fn clear_env() {
     for key in [
         "OLLAMA_ROUTER_BACKENDS",
@@ -21,6 +24,7 @@ unsafe fn clear_env() {
 
 #[test]
 fn defaults_are_sane() {
+    let _lock = ENV_LOCK.lock().unwrap();
     unsafe { clear_env() };
     let config = Config::from_env().unwrap();
     assert_eq!(config.backends.len(), 2);
@@ -39,6 +43,7 @@ fn defaults_are_sane() {
 
 #[test]
 fn custom_backends_parsed() {
+    let _lock = ENV_LOCK.lock().unwrap();
     unsafe { clear_env() };
     unsafe { env::set_var("OLLAMA_ROUTER_BACKENDS", "a=http://a:1234,b=http://b:5678") };
     let config = Config::from_env().unwrap();
@@ -52,6 +57,7 @@ fn custom_backends_parsed() {
 
 #[test]
 fn trailing_slash_stripped() {
+    let _lock = ENV_LOCK.lock().unwrap();
     unsafe { clear_env() };
     unsafe { env::set_var("OLLAMA_ROUTER_BACKENDS", "x=http://host:1234/") };
     let config = Config::from_env().unwrap();
@@ -61,6 +67,7 @@ fn trailing_slash_stripped() {
 
 #[test]
 fn empty_backends_fails() {
+    let _lock = ENV_LOCK.lock().unwrap();
     unsafe { clear_env() };
     unsafe { env::set_var("OLLAMA_ROUTER_BACKENDS", "") };
     assert!(Config::from_env().is_err());
@@ -69,6 +76,7 @@ fn empty_backends_fails() {
 
 #[test]
 fn malformed_backend_entry_fails() {
+    let _lock = ENV_LOCK.lock().unwrap();
     unsafe { clear_env() };
     unsafe { env::set_var("OLLAMA_ROUTER_BACKENDS", "no-equals-sign") };
     let err = Config::from_env().unwrap_err();
@@ -78,6 +86,7 @@ fn malformed_backend_entry_fails() {
 
 #[test]
 fn custom_discovery_interval() {
+    let _lock = ENV_LOCK.lock().unwrap();
     unsafe { clear_env() };
     unsafe { env::set_var("OLLAMA_ROUTER_DISCOVERY_INTERVAL", "30") };
     let config = Config::from_env().unwrap();
@@ -88,6 +97,7 @@ fn custom_discovery_interval() {
 
 #[test]
 fn invalid_discovery_interval_fails() {
+    let _lock = ENV_LOCK.lock().unwrap();
     unsafe { clear_env() };
     unsafe { env::set_var("OLLAMA_ROUTER_DISCOVERY_INTERVAL", "abc") };
     let err = Config::from_env().unwrap_err();
@@ -97,6 +107,7 @@ fn invalid_discovery_interval_fails() {
 
 #[test]
 fn custom_timeouts() {
+    let _lock = ENV_LOCK.lock().unwrap();
     unsafe { clear_env() };
     unsafe { env::set_var("OLLAMA_ROUTER_CONNECT_TIMEOUT", "5") };
     unsafe { env::set_var("OLLAMA_ROUTER_REQUEST_TIMEOUT", "600") };
@@ -108,6 +119,7 @@ fn custom_timeouts() {
 
 #[test]
 fn tokens_file_set_from_env() {
+    let _lock = ENV_LOCK.lock().unwrap();
     unsafe { clear_env() };
     unsafe { env::set_var("OLLAMA_ROUTER_TOKENS_FILE", "/config/tokens") };
     let config = Config::from_env().unwrap();

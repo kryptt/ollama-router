@@ -389,7 +389,7 @@ async fn status_route(State(state): State<AppState>) -> Response {
         })
         .collect();
 
-    let model_count = reg.available_model_names().len();
+    let model_count = reg.reachable_models().len();
 
     json_status(
         StatusCode::OK,

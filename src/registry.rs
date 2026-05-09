@@ -43,6 +43,18 @@ struct TagsResponse {
     models: Option<Vec<ModelInfo>>,
 }
 
+#[derive(Deserialize)]
+struct V1ModelsResponse {
+    data: Option<Vec<V1Model>>,
+}
+
+#[derive(Deserialize)]
+struct V1Model {
+    id: String,
+    #[serde(flatten)]
+    extra: serde_json::Value,
+}
+
 /// Read-only snapshot of a backend, returned to callers.
 pub struct BackendView<'a> {
     pub name: &'a str,
@@ -197,6 +209,59 @@ enum FetchResult {
     Err,
 }
 
+/// Try Ollama `/api/tags` first, then fall back to OpenAI `/v1/models`.
+async fn fetch_models(client: &Client, name: &str, url: &str) -> FetchResult {
+    // Try Ollama /api/tags
+    let tags_url = format!("{url}/api/tags");
+    match client.get(&tags_url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            return match resp.json::<TagsResponse>().await {
+                Ok(tags) => FetchResult::Ok(tags.models.unwrap_or_default()),
+                Err(e) => {
+                    warn!(backend = %name, error = %e, "failed to parse /api/tags");
+                    FetchResult::Err
+                }
+            };
+        }
+        Ok(_) => {} // non-success — try OpenAI fallback
+        Err(e) => {
+            warn!(backend = %name, error = %e, "failed to reach backend");
+            return FetchResult::Err;
+        }
+    }
+
+    // Fallback: OpenAI /v1/models
+    let v1_url = format!("{url}/v1/models");
+    match client.get(&v1_url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<V1ModelsResponse>().await {
+            Ok(v1) => {
+                let models = v1
+                    .data
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|m| ModelInfo {
+                        name: m.id,
+                        extra: m.extra,
+                    })
+                    .collect();
+                FetchResult::Ok(models)
+            }
+            Err(e) => {
+                warn!(backend = %name, error = %e, "failed to parse /v1/models");
+                FetchResult::Err
+            }
+        },
+        Ok(resp) => {
+            warn!(backend = %name, status = %resp.status(), "unhealthy backend (tried /api/tags and /v1/models)");
+            FetchResult::Err
+        }
+        Err(e) => {
+            warn!(backend = %name, error = %e, "failed to reach backend");
+            FetchResult::Err
+        }
+    }
+}
+
 async fn run_discovery(
     client: &Client,
     registry: &SharedRegistry,
@@ -207,24 +272,7 @@ async fn run_discovery(
     // Backend URLs come from Config (immutable), so no lock needed.
     let mut fetch_results = Vec::with_capacity(config.backends.len());
     for backend in &config.backends {
-        let url = format!("{}/api/tags", backend.url);
-        let result = match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.json::<TagsResponse>().await {
-                Ok(tags) => FetchResult::Ok(tags.models.unwrap_or_default()),
-                Err(e) => {
-                    warn!(backend = %backend.name, error = %e, "failed to parse /api/tags");
-                    FetchResult::Err
-                }
-            },
-            Ok(resp) => {
-                warn!(backend = %backend.name, status = %resp.status(), "unhealthy /api/tags response");
-                FetchResult::Err
-            }
-            Err(e) => {
-                warn!(backend = %backend.name, error = %e, "failed to reach backend");
-                FetchResult::Err
-            }
-        };
+        let result = fetch_models(client, &backend.name, &backend.url).await;
         fetch_results.push(result);
     }
 

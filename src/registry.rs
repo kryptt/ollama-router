@@ -216,7 +216,13 @@ async fn fetch_models(client: &Client, name: &str, url: &str) -> FetchResult {
     match client.get(&tags_url).send().await {
         Ok(resp) if resp.status().is_success() => {
             return match resp.json::<TagsResponse>().await {
-                Ok(tags) => FetchResult::Ok(tags.models.unwrap_or_default()),
+                Ok(tags) => {
+                    let mut models = tags.models.unwrap_or_default();
+                    for m in &mut models {
+                        sanitize_model_entry(m);
+                    }
+                    FetchResult::Ok(models)
+                }
                 Err(e) => {
                     warn!(backend = %name, error = %e, "failed to parse /api/tags");
                     FetchResult::Err
@@ -239,9 +245,13 @@ async fn fetch_models(client: &Client, name: &str, url: &str) -> FetchResult {
                     .data
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|m| ModelInfo {
-                        name: m.id,
-                        extra: m.extra,
+                    .map(|m| {
+                        let mut info = ModelInfo {
+                            name: m.id,
+                            extra: m.extra,
+                        };
+                        sanitize_model_entry(&mut info);
+                        info
                     })
                     .collect();
                 FetchResult::Ok(models)
@@ -259,6 +269,37 @@ async fn fetch_models(client: &Client, name: &str, url: &str) -> FetchResult {
             warn!(backend = %name, error = %e, "failed to reach backend");
             FetchResult::Err
         }
+    }
+}
+
+/// Normalise the fields strict ollama-API clients (e.g. Home Assistant's
+/// pydantic-based `ollama.AsyncClient`) require to be well-typed.
+///
+/// llama.cpp's ollama-compatibility `/api/tags` emits empty strings for
+/// `modified_at` and `size` even though pydantic models them as `datetime`
+/// and a byte-size integer respectively. An empty string crashes the
+/// client's `ListResponse` validator and the whole `/api/tags` request
+/// fails (HA refuses to set up its ollama integration entirely — one
+/// malformed model takes the whole list down).
+///
+/// We can't fix llama.cpp here, but we can paper over the bad fields
+/// with values that parse cleanly while still being clearly synthetic:
+/// epoch for `modified_at`, `0` for `size`. Real ollama backends emit
+/// well-formed values, so the in-place rewrite is a no-op for them.
+fn sanitize_model_entry(m: &mut ModelInfo) {
+    let Some(obj) = m.extra.as_object_mut() else {
+        return;
+    };
+    let is_blank = |v: &serde_json::Value| matches!(v.as_str(), Some("")) || v.is_null();
+
+    if obj.get("modified_at").is_none_or(is_blank) {
+        obj.insert(
+            "modified_at".to_string(),
+            serde_json::Value::String("1970-01-01T00:00:00Z".to_string()),
+        );
+    }
+    if obj.get("size").is_none_or(is_blank) {
+        obj.insert("size".to_string(), serde_json::json!(0));
     }
 }
 
@@ -497,5 +538,76 @@ mod tests {
     fn any_healthy_none_when_all_down() {
         let reg = Registry::new(&test_config());
         assert!(reg.any_healthy().is_none());
+    }
+
+    // sanitize_model_entry: ensures pydantic-strict clients (HA's ollama
+    // integration) can parse the merged /api/tags even when an upstream
+    // backend (llama.cpp's compat layer) returns empty strings for fields
+    // pydantic expects to be datetime/byte-size.
+
+    #[test]
+    fn sanitize_replaces_empty_modified_at() {
+        let mut m = ModelInfo {
+            name: "x".to_string(),
+            extra: serde_json::json!({"modified_at": "", "size": 123u64}),
+        };
+        super::sanitize_model_entry(&mut m);
+        assert_eq!(
+            m.extra.get("modified_at").and_then(|v| v.as_str()),
+            Some("1970-01-01T00:00:00Z")
+        );
+        assert_eq!(m.extra.get("size").and_then(|v| v.as_u64()), Some(123));
+    }
+
+    #[test]
+    fn sanitize_replaces_empty_size() {
+        let mut m = ModelInfo {
+            name: "x".to_string(),
+            extra: serde_json::json!({"modified_at": "2026-01-01T00:00:00Z", "size": ""}),
+        };
+        super::sanitize_model_entry(&mut m);
+        assert_eq!(m.extra.get("size").and_then(|v| v.as_u64()), Some(0));
+    }
+
+    #[test]
+    fn sanitize_fills_missing_fields() {
+        let mut m = ModelInfo {
+            name: "x".to_string(),
+            extra: serde_json::json!({}),
+        };
+        super::sanitize_model_entry(&mut m);
+        assert!(m.extra.get("modified_at").is_some());
+        assert_eq!(m.extra.get("size").and_then(|v| v.as_u64()), Some(0));
+    }
+
+    #[test]
+    fn sanitize_leaves_well_formed_entry_alone() {
+        let original = serde_json::json!({
+            "modified_at": "2026-05-19T12:34:56Z",
+            "size": 9_608_350_718u64,
+            "digest": "abc123",
+        });
+        let mut m = ModelInfo {
+            name: "gemma:2b".to_string(),
+            extra: original.clone(),
+        };
+        super::sanitize_model_entry(&mut m);
+        assert_eq!(m.extra, original);
+    }
+
+    #[test]
+    fn sanitize_noop_when_extra_is_not_an_object() {
+        // serde(flatten) over a primitive value never appears in practice
+        // (TagsResponse deserialise would fail first), but guard the
+        // function against panicking if it ever did.
+        let mut m = ModelInfo {
+            name: "x".to_string(),
+            extra: serde_json::Value::String("not-an-object".to_string()),
+        };
+        super::sanitize_model_entry(&mut m);
+        assert_eq!(
+            m.extra,
+            serde_json::Value::String("not-an-object".to_string())
+        );
     }
 }

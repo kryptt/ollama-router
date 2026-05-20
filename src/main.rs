@@ -164,7 +164,17 @@ async fn model_route(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let spilled = match spill::spill_and_detect(body).await {
+    // Default `stream` flag when the request body omits the field. Ollama
+    // defaults to streaming on `/api/*`; OpenAI/Anthropic default to
+    // non-streaming on `/v1/*`. Picking the wrong default causes
+    // non-streaming clients to receive SSE heartbeat bytes prepended to
+    // their JSON body (see title_generation breakage in hermes 0.x).
+    let default_stream = !matches!(
+        uri.path(),
+        "/v1/chat/completions" | "/v1/completions" | "/v1/messages" | "/v1/embeddings"
+    );
+
+    let spilled = match spill::spill_and_detect(body, default_stream).await {
         Ok(Some(s)) => s,
         Ok(None) => {
             return proxy::bad_request("request body must contain a non-empty 'model' field");

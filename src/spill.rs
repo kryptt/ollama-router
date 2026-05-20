@@ -10,7 +10,9 @@ use tokio_util::io::ReaderStream;
 /// Parsed routing fields extracted from the spilled request body.
 pub struct SpillResult {
     pub model: String,
-    /// Ollama defaults `stream` to `true` when the field is absent.
+    /// Effective stream flag. Falls back to the `default_stream` passed
+    /// to `spill_and_detect` when the JSON body omits the field — that
+    /// default differs by wire protocol (Ollama=true, OpenAI=false).
     pub stream: bool,
     /// A streaming body that replays the spilled prefix from disk, then
     /// continues with any remaining chunks from the original request.
@@ -22,8 +24,17 @@ pub struct SpillResult {
 /// model is detected (or the body ends), return a zero-copy replay stream
 /// that concatenates the on-disk prefix with the still-arriving tail.
 ///
+/// `default_stream` is the value used when the body has no `stream` field:
+/// pass `true` for Ollama-protocol paths (`/api/chat`, `/api/generate`),
+/// `false` for OpenAI- and Anthropic-protocol paths (`/v1/*`). Mismatching
+/// the default causes non-streaming clients to receive SSE heartbeats
+/// prepended to what they expect to be a single JSON body.
+///
 /// Returns `Ok(None)` when the body contains no usable `model` field.
-pub async fn spill_and_detect(body: Body) -> Result<Option<SpillResult>, io::Error> {
+pub async fn spill_and_detect(
+    body: Body,
+    default_stream: bool,
+) -> Result<Option<SpillResult>, io::Error> {
     let mut stream = body.into_data_stream();
     let std_file = tempfile::tempfile()?;
     let mut file = tokio::fs::File::from_std(std_file);
@@ -52,7 +63,7 @@ pub async fn spill_and_detect(body: Body) -> Result<Option<SpillResult>, io::Err
         Some(m) => m.to_owned(),
         None => return Ok(None),
     };
-    let stream_flag = scanner.stream_value().unwrap_or(true);
+    let stream_flag = scanner.stream_value().unwrap_or(default_stream);
 
     // Phase 2 — rewind the file and build a combined stream:
     //   [disk replay] ++ [remaining body chunks]
@@ -436,7 +447,7 @@ mod tests {
     async fn spill_small_body() {
         let json = br#"{"model": "test-model", "stream": false, "messages": []}"#;
         let body = Body::from(json.to_vec());
-        let result = spill_and_detect(body).await.unwrap().unwrap();
+        let result = spill_and_detect(body, true).await.unwrap().unwrap();
         assert_eq!(result.model, "test-model");
         assert!(!result.stream);
 
@@ -448,7 +459,7 @@ mod tests {
     #[tokio::test]
     async fn spill_no_model_returns_none() {
         let body = Body::from(br#"{"prompt": "hello"}"#.to_vec());
-        assert!(spill_and_detect(body).await.unwrap().is_none());
+        assert!(spill_and_detect(body, true).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -461,7 +472,7 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let body = Body::from_stream(stream);
 
-        let result = spill_and_detect(body).await.unwrap().unwrap();
+        let result = spill_and_detect(body, true).await.unwrap().unwrap();
         assert_eq!(result.model, "chunked");
         assert!(result.stream);
 
@@ -484,7 +495,7 @@ mod tests {
         let stream = futures_util::stream::iter(chunks);
         let body = Body::from_stream(stream);
 
-        let result = spill_and_detect(body).await.unwrap().unwrap();
+        let result = spill_and_detect(body, true).await.unwrap().unwrap();
         assert_eq!(result.model, "early");
 
         let collected = collect_body(result.body).await;
@@ -502,18 +513,34 @@ mod tests {
         // defaulting to stream=true.
         let json = br#"{"model": "llmvision/glimpse-v1:latest", "messages": [{"role": "user", "content": "describe"}], "stream": false}"#;
         let body = Body::from(json.to_vec());
-        let result = spill_and_detect(body).await.unwrap().unwrap();
+        let result = spill_and_detect(body, true).await.unwrap().unwrap();
         assert_eq!(result.model, "llmvision/glimpse-v1:latest");
         assert!(!result.stream, "stream should be false, not default true");
     }
 
     #[tokio::test]
-    async fn spill_stream_absent_defaults_true() {
+    async fn spill_stream_absent_takes_ollama_default() {
+        // Ollama-protocol paths (/api/chat, /api/generate) default to
+        // stream=true when the field is absent.
         let json = br#"{"model": "test", "messages": []}"#;
         let body = Body::from(json.to_vec());
-        let result = spill_and_detect(body).await.unwrap().unwrap();
+        let result = spill_and_detect(body, true).await.unwrap().unwrap();
         assert_eq!(result.model, "test");
-        assert!(result.stream, "absent stream should default to true");
+        assert!(result.stream);
+    }
+
+    #[tokio::test]
+    async fn spill_stream_absent_takes_openai_default() {
+        // OpenAI-protocol paths (/v1/chat/completions, /v1/completions,
+        // /v1/messages) default to stream=false when the field is absent.
+        // Regression: hermes title_generator omits the field on
+        // non-streaming requests; the old fixed default of true engaged
+        // the SSE heartbeat path and corrupted the response.
+        let json = br#"{"model": "test", "messages": []}"#;
+        let body = Body::from(json.to_vec());
+        let result = spill_and_detect(body, false).await.unwrap().unwrap();
+        assert_eq!(result.model, "test");
+        assert!(!result.stream);
     }
 
     /// Helper: collect a Body into bytes.

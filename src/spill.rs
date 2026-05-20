@@ -36,7 +36,7 @@ pub async fn spill_and_detect(body: Body) -> Result<Option<SpillResult>, io::Err
             Some(Ok(chunk)) => {
                 file.write_all(&chunk).await?;
                 scanner.feed(&chunk);
-                if scanner.model().is_some() {
+                if scanner.model().is_some() && scanner.stream_value().is_some() {
                     break;
                 }
             }
@@ -492,6 +492,28 @@ mod tests {
         expected.extend(tail.as_bytes());
         expected.extend(suffix);
         assert_eq!(collected, expected);
+    }
+
+    #[tokio::test]
+    async fn spill_model_before_stream_false() {
+        // Regression: LLMVision puts "model" before "stream": false with a
+        // large messages array in between.  The old break condition exited as
+        // soon as model was found, missing the stream field entirely and
+        // defaulting to stream=true.
+        let json = br#"{"model": "llmvision/glimpse-v1:latest", "messages": [{"role": "user", "content": "describe"}], "stream": false}"#;
+        let body = Body::from(json.to_vec());
+        let result = spill_and_detect(body).await.unwrap().unwrap();
+        assert_eq!(result.model, "llmvision/glimpse-v1:latest");
+        assert!(!result.stream, "stream should be false, not default true");
+    }
+
+    #[tokio::test]
+    async fn spill_stream_absent_defaults_true() {
+        let json = br#"{"model": "test", "messages": []}"#;
+        let body = Body::from(json.to_vec());
+        let result = spill_and_detect(body).await.unwrap().unwrap();
+        assert_eq!(result.model, "test");
+        assert!(result.stream, "absent stream should default to true");
     }
 
     /// Helper: collect a Body into bytes.

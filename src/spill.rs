@@ -30,7 +30,14 @@ pub async fn spill_and_detect(body: Body) -> Result<Option<SpillResult>, io::Err
     let mut scanner = Scanner::new();
     let mut body_done = false;
 
-    // Phase 1 — spill to disk while scanning for the model field.
+    // After model is found, keep scanning up to this many additional bytes
+    // for the "stream" field before giving up and defaulting.  Must be large
+    // enough to cover vision payloads where base64 image data sits between
+    // "model" and "stream" (typically 500KB–2MB).
+    const STREAM_SCAN_BUDGET: usize = 4 * 1024 * 1024;
+    let mut remaining_budget: Option<usize> = None;
+
+    // Phase 1 — spill to disk while scanning for routing fields.
     loop {
         match stream.next().await {
             Some(Ok(chunk)) => {
@@ -38,6 +45,13 @@ pub async fn spill_and_detect(body: Body) -> Result<Option<SpillResult>, io::Err
                 scanner.feed(&chunk);
                 if scanner.model().is_some() && scanner.stream_value().is_some() {
                     break;
+                }
+                if scanner.model().is_some() {
+                    let budget = remaining_budget.get_or_insert(STREAM_SCAN_BUDGET);
+                    *budget = budget.saturating_sub(chunk.len());
+                    if *budget == 0 {
+                        break;
+                    }
                 }
             }
             Some(Err(e)) => return Err(io::Error::other(e)),
@@ -514,6 +528,48 @@ mod tests {
         let result = spill_and_detect(body).await.unwrap().unwrap();
         assert_eq!(result.model, "test");
         assert!(result.stream, "absent stream should default to true");
+    }
+
+    #[tokio::test]
+    async fn spill_stream_absent_large_body_stops_scanning() {
+        // When stream is absent and the body is much larger than the scan
+        // budget, we should stop scanning and default to stream=true without
+        // buffering the entire payload.
+        let prefix = br#"{"model": "big", "messages": [{"role": "user", "content": ""#;
+        let padding = "x".repeat(8 * 1024 * 1024); // 8 MiB >> 4 MiB budget
+        let suffix = br#""}]}"#;
+
+        let mut full = prefix.to_vec();
+        full.extend(padding.as_bytes());
+        full.extend(suffix);
+
+        let body = Body::from(full.clone());
+        let result = spill_and_detect(body).await.unwrap().unwrap();
+        assert_eq!(result.model, "big");
+        assert!(result.stream, "absent stream should default to true");
+
+        let collected = collect_body(result.body).await;
+        assert_eq!(collected, full);
+    }
+
+    #[tokio::test]
+    async fn spill_stream_false_within_budget() {
+        // "stream": false appears within the 16 KiB scan budget after model.
+        let prefix = br#"{"model": "vis", "messages": [{"role": "user", "content": ""#;
+        let padding = "y".repeat(2 * 1024 * 1024); // 2 MiB < 4 MiB budget
+        let suffix = br#""}], "stream": false}"#;
+
+        let mut full = prefix.to_vec();
+        full.extend(padding.as_bytes());
+        full.extend(suffix);
+
+        let body = Body::from(full.clone());
+        let result = spill_and_detect(body).await.unwrap().unwrap();
+        assert_eq!(result.model, "vis");
+        assert!(
+            !result.stream,
+            "stream:false should be detected within budget"
+        );
     }
 
     /// Helper: collect a Body into bytes.

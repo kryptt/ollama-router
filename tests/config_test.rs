@@ -17,9 +17,70 @@ unsafe fn clear_env() {
         "OLLAMA_ROUTER_INTERNAL_PORT",
         "OLLAMA_ROUTER_CONNECT_TIMEOUT",
         "OLLAMA_ROUTER_REQUEST_TIMEOUT",
+        "OLLAMA_ROUTER_ESCALATE",
     ] {
         unsafe { env::remove_var(key) };
     }
+}
+
+#[test]
+fn escalation_unset_means_empty() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    unsafe { clear_env() };
+    let config = Config::from_env().unwrap();
+    assert!(config.escalation_rules.is_empty());
+    unsafe { clear_env() };
+}
+
+#[test]
+fn escalation_parsed_from_env() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    unsafe { clear_env() };
+    unsafe {
+        env::set_var(
+            "OLLAMA_ROUTER_ESCALATE",
+            "qwen3.6-medium:35000:qwen3.6-high,qwen3.6-high:120000:qwen3.6-ultra",
+        )
+    };
+    let config = Config::from_env().unwrap();
+    assert_eq!(config.escalation_rules.len(), 2);
+    assert_eq!(config.escalation_rules[0].from_model, "qwen3.6-medium");
+    assert_eq!(config.escalation_rules[0].max_input_tokens, 35_000);
+    assert_eq!(config.escalation_rules[0].to_model, "qwen3.6-high");
+    assert_eq!(config.escalation_rules[1].from_model, "qwen3.6-high");
+    assert_eq!(config.escalation_rules[1].max_input_tokens, 120_000);
+    assert_eq!(config.escalation_rules[1].to_model, "qwen3.6-ultra");
+    unsafe { clear_env() };
+}
+
+#[test]
+fn escalation_empty_string_is_empty() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    unsafe { clear_env() };
+    unsafe { env::set_var("OLLAMA_ROUTER_ESCALATE", "") };
+    let config = Config::from_env().unwrap();
+    assert!(config.escalation_rules.is_empty());
+    unsafe { clear_env() };
+}
+
+#[test]
+fn escalation_malformed_rule_fails() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    unsafe { clear_env() };
+    unsafe { env::set_var("OLLAMA_ROUTER_ESCALATE", "qwen3.6-medium:nope:qwen3.6-high") };
+    let err = Config::from_env().unwrap_err();
+    assert!(err.to_string().contains("invalid escalation rule"));
+    unsafe { clear_env() };
+}
+
+#[test]
+fn escalation_zero_threshold_fails() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    unsafe { clear_env() };
+    unsafe { env::set_var("OLLAMA_ROUTER_ESCALATE", "qwen3.6-medium:0:qwen3.6-high") };
+    let err = Config::from_env().unwrap_err();
+    assert!(err.to_string().contains("invalid escalation rule"));
+    unsafe { clear_env() };
 }
 
 #[test]

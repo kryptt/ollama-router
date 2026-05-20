@@ -10,6 +10,41 @@ pub struct Backend {
     pub url: String,
 }
 
+/// A "if a request for `from_model` looks bigger than this model's
+/// per-slot context, transparently rewrite it to `to_model`" rule.
+///
+/// Chains: rules are evaluated iteratively, so a single very-long request
+/// for `qwen3.6-medium` can be re-routed through `qwen3.6-high` to
+/// `qwen3.6-ultra` if both thresholds are exceeded.
+#[derive(Debug, Clone)]
+pub struct EscalationRule {
+    pub from_model: String,
+    pub max_input_tokens: usize,
+    pub to_model: String,
+}
+
+impl EscalationRule {
+    /// Parse a `from:max_input_tokens:to` triple. All three fields must be
+    /// non-empty; the middle field must be a positive integer.
+    fn parse(entry: &str) -> Result<Self, ConfigError> {
+        let parts: Vec<&str> = entry.trim().split(':').collect();
+        if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+            return Err(ConfigError::InvalidEscalation(entry.to_string()));
+        }
+        let max_input_tokens: usize = parts[1]
+            .parse()
+            .map_err(|_| ConfigError::InvalidEscalation(entry.to_string()))?;
+        if max_input_tokens == 0 {
+            return Err(ConfigError::InvalidEscalation(entry.to_string()));
+        }
+        Ok(EscalationRule {
+            from_model: parts[0].to_string(),
+            max_input_tokens,
+            to_model: parts[2].to_string(),
+        })
+    }
+}
+
 impl Backend {
     /// Parse a `name=url` pair. Rejects empty names or URLs.
     fn parse(entry: &str) -> Result<Self, ConfigError> {
@@ -57,6 +92,8 @@ pub struct Config {
     /// Maximum time to wait for upstream to produce its first real byte
     /// before giving up and emitting an in-band error.
     pub loading_max_wait_secs: u64,
+    /// Per-model escalation rules. Empty = no escalation (default).
+    pub escalation_rules: Vec<EscalationRule>,
 }
 
 impl Config {
@@ -87,6 +124,15 @@ impl Config {
         let preflight_timeout_secs = parse_env_u64("OLLAMA_ROUTER_PREFLIGHT_TIMEOUT", 10)?;
         let loading_max_wait_secs = parse_env_u64("OLLAMA_ROUTER_LOADING_MAX_WAIT", 300)?;
 
+        let escalation_rules = match env::var("OLLAMA_ROUTER_ESCALATE") {
+            Ok(s) if !s.trim().is_empty() => s
+                .split(',')
+                .filter(|e| !e.trim().is_empty())
+                .map(EscalationRule::parse)
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => Vec::new(),
+        };
+
         Ok(Config {
             backends,
             discovery_interval_secs,
@@ -99,6 +145,7 @@ impl Config {
             loading_heartbeat_secs,
             preflight_timeout_secs,
             loading_max_wait_secs,
+            escalation_rules,
         })
     }
 
@@ -120,6 +167,7 @@ impl Config {
             loading_heartbeat_secs: 15,
             preflight_timeout_secs: 10,
             loading_max_wait_secs: 300,
+            escalation_rules: Vec::new(),
         }
     }
 }
@@ -129,6 +177,7 @@ pub enum ConfigError {
     InvalidBackend(String),
     NoBackends,
     InvalidValue { key: &'static str, value: String },
+    InvalidEscalation(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -145,6 +194,12 @@ impl fmt::Display for ConfigError {
             }
             Self::InvalidValue { key, value } => {
                 write!(f, "{key} must be a positive integer, got '{value}'")
+            }
+            Self::InvalidEscalation(entry) => {
+                write!(
+                    f,
+                    "invalid escalation rule: '{entry}' (expected from_model:max_input_tokens:to_model with positive integer threshold)"
+                )
             }
         }
     }

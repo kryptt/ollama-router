@@ -13,7 +13,7 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 
 use ollama_router::auth::TokenStore;
-use ollama_router::config::Config;
+use ollama_router::config::{Config, EscalationRule};
 use ollama_router::heartbeat::{self, HeartbeatConfig, StreamProtocol};
 use ollama_router::metrics::{self, Metrics};
 use ollama_router::models;
@@ -29,6 +29,7 @@ struct AppState {
     client: Arc<reqwest::Client>,
     token_store: Arc<TokenStore>,
     heartbeat: HeartbeatConfig,
+    escalation_rules: Arc<Vec<EscalationRule>>,
 }
 
 #[tokio::main]
@@ -73,12 +74,26 @@ async fn main() {
         config.loading_max_wait_secs,
     );
 
+    let escalation_rules = Arc::new(config.escalation_rules.clone());
+    if !escalation_rules.is_empty() {
+        info!(rules = escalation_rules.len(), "model escalation enabled");
+        for r in escalation_rules.iter() {
+            info!(
+                from = %r.from_model,
+                threshold_tokens = r.max_input_tokens,
+                to = %r.to_model,
+                "escalation rule",
+            );
+        }
+    }
+
     let state = AppState {
         registry: Arc::clone(&registry),
         metrics: Arc::clone(&metrics),
         client,
         token_store: Arc::clone(&token_store),
         heartbeat: heartbeat_cfg,
+        escalation_rules,
     };
 
     tokio::spawn({
@@ -174,7 +189,7 @@ async fn model_route(
         "/v1/chat/completions" | "/v1/completions" | "/v1/messages" | "/v1/embeddings"
     );
 
-    let spilled = match spill::spill_and_detect(body, default_stream).await {
+    let mut spilled = match spill::spill_and_detect(body, default_stream).await {
         Ok(Some(s)) => s,
         Ok(None) => {
             return proxy::bad_request("request body must contain a non-empty 'model' field");
@@ -184,6 +199,24 @@ async fn model_route(
             return proxy::bad_gateway("failed to read request body");
         }
     };
+
+    // Apply long-turn escalation rules. Uses Content-Length / bytes / 3 as
+    // a cheap upper-bound token estimate. Chained: a single very-long
+    // request can hop through multiple rules (e.g. medium → high → ultra).
+    if !state.escalation_rules.is_empty()
+        && let Some(estimated_tokens) = estimate_input_tokens(&headers)
+        && let Some(escalated) =
+            apply_escalation(&spilled.model, estimated_tokens, &state.escalation_rules)
+        && escalated != spilled.model
+    {
+        tracing::info!(
+            from = %spilled.model,
+            to = %escalated,
+            estimated_tokens,
+            "escalating model due to estimated input size",
+        );
+        spilled.model = escalated;
+    }
 
     let reg = state.registry.read().await;
     let backend_id = match reg.lookup(&spilled.model) {
@@ -468,4 +501,126 @@ fn extract_token(headers: &HeaderMap) -> Option<&str> {
         .get("api-key")
         .or_else(|| headers.get("x-api-key"))
         .and_then(|v| v.to_str().ok())
+}
+
+/// Cheap upper-bound estimate of input tokens from the request body size.
+///
+/// Reads `Content-Length`. Returns `None` when the header is missing or
+/// unparseable (chunked transfer encoding, malformed value) — escalation
+/// then conservatively does not fire and the request hits its originally
+/// requested model.
+///
+/// Heuristic: bytes / 3. For English-dominated JSON chat bodies a typical
+/// token is ~3.5-4 bytes, so dividing by 3 over-estimates slightly — the
+/// right direction since the cost of escalating sooner is a swap, while
+/// the cost of escalating too late is a hard 400 from the upstream.
+fn estimate_input_tokens(headers: &HeaderMap) -> Option<usize> {
+    let raw = headers.get(axum::http::header::CONTENT_LENGTH)?;
+    let s = raw.to_str().ok()?;
+    let bytes: usize = s.parse().ok()?;
+    Some(bytes / 3)
+}
+
+/// Walk the escalation chain starting from `model`. Each iteration finds
+/// a rule with `from_model == current` whose threshold is exceeded by
+/// `estimated_tokens`; the rule's `to_model` becomes the new `current`.
+/// Loop terminates when no further rule applies. Returns `None` when no
+/// escalation happens (i.e. caller can use the original model).
+fn apply_escalation(
+    model: &str,
+    estimated_tokens: usize,
+    rules: &[EscalationRule],
+) -> Option<String> {
+    let mut current = model.to_string();
+    let mut hops = 0;
+    // Bound the hops to defend against an accidentally cyclic config.
+    while hops < rules.len() {
+        match rules
+            .iter()
+            .find(|r| r.from_model == current && estimated_tokens > r.max_input_tokens)
+        {
+            Some(rule) => {
+                current = rule.to_model.clone();
+                hops += 1;
+            }
+            None => break,
+        }
+    }
+    if current == model {
+        None
+    } else {
+        Some(current)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(from: &str, max: usize, to: &str) -> EscalationRule {
+        EscalationRule {
+            from_model: from.to_string(),
+            max_input_tokens: max,
+            to_model: to.to_string(),
+        }
+    }
+
+    #[test]
+    fn escalation_no_rules_is_noop() {
+        assert_eq!(apply_escalation("qwen3.6-medium", 100_000, &[]), None);
+    }
+
+    #[test]
+    fn escalation_below_threshold_is_noop() {
+        let rules = vec![rule("qwen3.6-medium", 35_000, "qwen3.6-high")];
+        assert_eq!(apply_escalation("qwen3.6-medium", 1_000, &rules), None);
+    }
+
+    #[test]
+    fn escalation_above_threshold_rewrites() {
+        let rules = vec![rule("qwen3.6-medium", 35_000, "qwen3.6-high")];
+        assert_eq!(
+            apply_escalation("qwen3.6-medium", 50_000, &rules),
+            Some("qwen3.6-high".to_string())
+        );
+    }
+
+    #[test]
+    fn escalation_chains_through_multiple_hops() {
+        // medium → high → ultra in one decision.
+        let rules = vec![
+            rule("qwen3.6-medium", 35_000, "qwen3.6-high"),
+            rule("qwen3.6-high", 120_000, "qwen3.6-ultra"),
+        ];
+        assert_eq!(
+            apply_escalation("qwen3.6-medium", 200_000, &rules),
+            Some("qwen3.6-ultra".to_string())
+        );
+    }
+
+    #[test]
+    fn escalation_chain_stops_when_target_threshold_not_exceeded() {
+        let rules = vec![
+            rule("qwen3.6-medium", 35_000, "qwen3.6-high"),
+            rule("qwen3.6-high", 120_000, "qwen3.6-ultra"),
+        ];
+        assert_eq!(
+            apply_escalation("qwen3.6-medium", 50_000, &rules),
+            Some("qwen3.6-high".to_string())
+        );
+    }
+
+    #[test]
+    fn escalation_ignores_unrelated_models() {
+        let rules = vec![rule("qwen3.6-medium", 35_000, "qwen3.6-high")];
+        assert_eq!(apply_escalation("gpt-oss:latest", 100_000, &rules), None);
+    }
+
+    #[test]
+    fn escalation_terminates_on_cyclic_config() {
+        // Defensive: shouldn't loop forever if someone configures a cycle.
+        let rules = vec![rule("a", 10, "b"), rule("b", 10, "c"), rule("c", 10, "a")];
+        // Hops are bounded by rules.len(); we only assert it returns.
+        let _ = apply_escalation("a", 100, &rules);
+    }
 }

@@ -301,6 +301,12 @@ fn sanitize_model_entry(m: &mut ModelInfo) {
     if obj.get("size").is_none_or(is_blank) {
         obj.insert("size".to_string(), serde_json::json!(0));
     }
+    if !obj.contains_key("model") {
+        obj.insert(
+            "model".to_string(),
+            serde_json::Value::String(m.name.clone()),
+        );
+    }
 }
 
 async fn run_discovery(
@@ -583,6 +589,7 @@ mod tests {
     #[test]
     fn sanitize_leaves_well_formed_entry_alone() {
         let original = serde_json::json!({
+            "model": "gemma:2b",
             "modified_at": "2026-05-19T12:34:56Z",
             "size": 9_608_350_718u64,
             "digest": "abc123",

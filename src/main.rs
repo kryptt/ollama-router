@@ -115,6 +115,7 @@ async fn main() {
         .route("/api/create", post(blocked_route))
         .route("/api/push", post(blocked_route))
         .route("/api/tags", get(tags_route))
+        .route("/api/ps", get(api_ps_route))
         .route("/v1/models", get(v1_models_route))
         .route("/v1/models/{model_id}", get(v1_model_route))
         .fallback(any(passthrough_route))
@@ -308,6 +309,10 @@ async fn blocked_route(State(state): State<AppState>, OriginalUri(uri): Original
 async fn tags_route(State(state): State<AppState>) -> Response {
     let reg = state.registry.read().await;
     models::api_tags_response(&reg)
+}
+
+async fn api_ps_route(State(state): State<AppState>) -> Response {
+    models::api_ps_response(&state.registry, &state.client).await
 }
 
 async fn v1_models_route(State(state): State<AppState>) -> Response {

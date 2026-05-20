@@ -584,6 +584,31 @@ mod tests {
         super::sanitize_model_entry(&mut m);
         assert!(m.extra.get("modified_at").is_some());
         assert_eq!(m.extra.get("size").and_then(|v| v.as_u64()), Some(0));
+        // Regression for HA's `KeyError: 'model'` (commit 0141020): when
+        // `/api/tags` from a non-Ollama backend (llama.cpp openai-compat
+        // server, llama-swap) omits `model`, sanitize must back-fill it
+        // from `name`. Without this assertion, deleting the back-fill
+        // branch still passes the test suite.
+        assert_eq!(
+            m.extra.get("model").and_then(|v| v.as_str()),
+            Some("x"),
+            "sanitize must back-fill `model` from `name` when absent",
+        );
+    }
+
+    #[test]
+    fn sanitize_does_not_overwrite_present_model_field() {
+        // Sibling invariant: if the backend already provided a `model`
+        // field (even one that disagrees with `name`), sanitize leaves
+        // it alone. This is the contract for the no-op-on-well-formed
+        // path that `sanitize_leaves_well_formed_entry_alone` exercises,
+        // pinned explicitly so refactors don't silently change behaviour.
+        let mut m = ModelInfo {
+            name: "x".to_string(),
+            extra: serde_json::json!({"model": "y"}),
+        };
+        super::sanitize_model_entry(&mut m);
+        assert_eq!(m.extra.get("model").and_then(|v| v.as_str()), Some("y"));
     }
 
     #[test]

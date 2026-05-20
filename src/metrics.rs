@@ -15,6 +15,19 @@ pub struct Metrics {
     pub request_duration: Family<DurationLabels, Histogram>,
     pub blocked_requests: Family<RouteLabels, Counter>,
     pub unknown_model_requests: Counter,
+    /// Successful long-turn escalations: a request originally for
+    /// `from` was rewritten to `to` because the estimated input tokens
+    /// exceeded `from`'s configured threshold and `to` is currently
+    /// reachable.
+    pub escalations: Family<EscalationLabels, Counter>,
+    /// Escalations that were configured but not applied. `reason` is
+    /// one of:
+    /// - `no_content_length`: client used chunked transfer / HTTP/2
+    ///   streaming, so we couldn't estimate input size.
+    /// - `target_not_found`: escalation target was not in the registry
+    ///   at lookup time (typo, decommissioned backend, or pre-discovery
+    ///   startup window).
+    pub escalations_skipped: Family<EscalationSkipLabels, Counter>,
     registry: Registry,
 }
 
@@ -60,11 +73,27 @@ impl Metrics {
             unknown_model_requests.clone(),
         );
 
+        let escalations = Family::default();
+        registry.register(
+            "ollama_router_escalations",
+            "Long-turn escalation rewrites applied (per from→to pair)",
+            escalations.clone(),
+        );
+
+        let escalations_skipped = Family::default();
+        registry.register(
+            "ollama_router_escalations_skipped",
+            "Escalations skipped because preconditions weren't met",
+            escalations_skipped.clone(),
+        );
+
         Metrics {
             requests_total,
             request_duration,
             blocked_requests,
             unknown_model_requests,
+            escalations,
+            escalations_skipped,
             registry,
         }
     }
@@ -98,4 +127,15 @@ pub struct DurationLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct RouteLabels {
     pub route: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct EscalationLabels {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct EscalationSkipLabels {
+    pub reason: String,
 }

@@ -6,4 +6,5 @@ pub mod models;
 pub mod proxy;
 pub mod registry;
 pub mod response;
+pub mod routes;
 pub mod spill;

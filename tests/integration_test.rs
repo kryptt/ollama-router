@@ -9,6 +9,7 @@ use tokio::net::TcpListener;
 use ollama_router::auth::TokenStore;
 use ollama_router::config::{Backend, Config};
 use ollama_router::registry;
+use ollama_router::routes::{ROUTED_PATHS, default_stream_for_path};
 
 async fn start_mock_backend(
     models: Vec<&str>,
@@ -179,4 +180,99 @@ async fn token_store_missing_file_fails_closed() {
     // Path configured but file missing → auth enabled, all rejected
     assert!(store.is_enabled());
     assert!(!store.validate("anything").await);
+}
+
+// ─── Routes contract (item #7 from the 2026-05-20 review) ────────────────────
+//
+// These integration tests prove that the single-source-of-truth contract in
+// `ollama_router::routes` actually holds at the axum layer. The unit tests
+// in `src/routes.rs` cover the *data*; these cover the *wiring*.
+
+/// Build a stand-in router that mounts every `ROUTED_PATHS` entry to a
+/// handler that just echoes its path. This is the same loop `main.rs`
+/// uses (`for entry in ROUTED_PATHS { router.route(entry.path, ...) }`),
+/// so if a path string ever stops being acceptable to axum, this test
+/// fails before the production binary panics at startup.
+fn build_routed_paths_only_router() -> Router {
+    let mut router = Router::new();
+    for entry in ROUTED_PATHS {
+        let path = entry.path;
+        router = router.route(
+            path,
+            post(move || async move { (StatusCode::OK, format!("routed: {path}")) }),
+        );
+    }
+    router.fallback(any(|| async { StatusCode::NOT_FOUND }))
+}
+
+#[tokio::test]
+async fn every_routed_path_actually_routes_through_axum() {
+    let app = build_routed_paths_only_router();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+    for entry in ROUTED_PATHS {
+        let url = format!("http://{}{}", addr, entry.path);
+        let resp = client.post(&url).body("{}").send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "ROUTED_PATHS entry {} did not route through axum (got {})",
+            entry.path,
+            resp.status(),
+        );
+        let body = resp.text().await.unwrap();
+        assert_eq!(body, format!("routed: {}", entry.path));
+    }
+}
+
+#[tokio::test]
+async fn paths_not_in_routed_paths_get_404() {
+    // Sanity: the fallback wired above must catch anything not declared
+    // in ROUTED_PATHS. If a future change makes the router permissive
+    // (e.g. wildcard match that swallows everything), this fails.
+    let app = build_routed_paths_only_router();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+    for unknown in &[
+        "/some/future/path",
+        "/v1/audio/transcriptions", // OpenAI Whisper — not in ROUTED_PATHS
+        "/api/version",             // valid Ollama endpoint, not in our model_route set
+        "/",
+    ] {
+        let url = format!("http://{addr}{unknown}");
+        let resp = client.post(&url).body("{}").send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "expected {unknown} to 404 (not in ROUTED_PATHS), got {}",
+            resp.status(),
+        );
+    }
+}
+
+#[test]
+fn routes_default_stream_matches_path_protocol() {
+    // End-to-end contract: every /v1/* path is OpenAI/Anthropic (default
+    // stream=false); every /api/* path is Ollama (default stream=true).
+    // This is the f4d6a13 regression class — pinning here so any future
+    // path addition either matches the invariant or visibly fails CI.
+    for entry in ROUTED_PATHS {
+        let expected = !entry.path.starts_with("/v1/");
+        assert_eq!(
+            default_stream_for_path(entry.path),
+            expected,
+            "{} violates the /v1/ vs /api/ default-stream convention",
+            entry.path,
+        );
+    }
 }

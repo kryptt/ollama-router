@@ -317,6 +317,16 @@ async fn model_route(
         None => {
             state.metrics.unknown_model_requests.inc();
             let available = reg.available_model_names();
+            // Emit the requested model name as a structured field so
+            // operators can grep Loki for which clients are sending
+            // bogus model names. The metric itself stays label-free
+            // to avoid cardinality blow-up if a misbehaving client
+            // sprays unique names.
+            tracing::warn!(
+                model = %lookup_model,
+                available = ?available,
+                "unknown model requested",
+            );
             return proxy::model_not_found(lookup_model, &available);
         }
     };

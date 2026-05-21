@@ -29,6 +29,7 @@
 //! in-band in the committed protocol instead of silently heartbeating
 //! into the void.
 
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -261,12 +262,27 @@ impl std::fmt::Display for PreflightError {
 // Heartbeat proxy
 // ---------------------------------------------------------------------------
 
+/// Wraps an upstream byte stream into a translated byte stream. Used by
+/// the heartbeat path to splice protocol translation (OpenAI SSE → Ollama
+/// NDJSON) into the response without changing the heartbeat semantics.
+pub type BodyTranslator = Box<
+    dyn FnOnce(
+            Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+        )
+            -> Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>>
+        + Send,
+>;
+
 /// Request parameters for the heartbeat proxy. Mirrors `proxy::ProxyRequest`
 /// plus the protocol classification and timing knobs.
 pub struct HeartbeatRequest<'a> {
     pub client: &'a reqwest::Client,
     pub backend_url: &'a str,
     pub path: &'a str,
+    /// When `Some`, used as the backend-side path. The client-facing
+    /// `path` still drives the heartbeat protocol — only the upstream
+    /// URL changes. Used by protocol translation.
+    pub override_path: Option<&'a str>,
     pub query: Option<&'a str>,
     pub method: Method,
     pub headers: &'a HeaderMap,
@@ -274,6 +290,9 @@ pub struct HeartbeatRequest<'a> {
     pub protocol: StreamProtocol,
     pub model: String,
     pub config: HeartbeatConfig,
+    /// Wraps the upstream byte stream after headers arrive. `None` keeps
+    /// the upstream bytes pass-through.
+    pub translate: Option<BodyTranslator>,
 }
 
 /// Forward a streaming request to the backend with keepalive bytes filling
@@ -283,7 +302,8 @@ pub struct HeartbeatRequest<'a> {
 /// heartbeat is emitted. From that point, any upstream failure is encoded
 /// in-band using `StreamProtocol::error_event`.
 pub async fn execute(req: HeartbeatRequest<'_>) -> Response {
-    let mut url = format!("{}{}", req.backend_url, req.path);
+    let upstream_path = req.override_path.unwrap_or(req.path);
+    let mut url = format!("{}{}", req.backend_url, upstream_path);
     if let Some(q) = req.query {
         url.push('?');
         url.push_str(q);
@@ -311,9 +331,10 @@ pub async fn execute(req: HeartbeatRequest<'_>) -> Response {
     let cfg = req.config;
     let protocol = req.protocol;
     let model = req.model.clone();
+    let translate = req.translate;
 
     tokio::spawn(async move {
-        run_heartbeat_task(send_future, tx, protocol, model, cfg).await;
+        run_heartbeat_task(send_future, tx, protocol, model, cfg, translate).await;
     });
 
     let stream = ReceiverStream::new(rx);
@@ -332,6 +353,7 @@ async fn run_heartbeat_task<F>(
     protocol: StreamProtocol,
     model: String,
     cfg: HeartbeatConfig,
+    translate: Option<BodyTranslator>,
 ) where
     F: std::future::Future<Output = reqwest::Result<reqwest::Response>>,
 {
@@ -397,7 +419,21 @@ async fn run_heartbeat_task<F>(
     );
 
     // Phase 2 — pipe body, still heartbeating until the first real byte.
-    let mut body_stream = resp.bytes_stream();
+    //
+    // If a body translator is configured (e.g. OpenAI SSE → Ollama NDJSON
+    // for protocol translation), wrap the upstream stream through it
+    // before entering the forwarding loop. The translator is responsible
+    // for buffering across chunk boundaries and emitting any final frames
+    // it needs (e.g. the `done:true` line) when upstream signals EOF.
+    let raw: Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>> =
+        Box::pin(
+            resp.bytes_stream()
+                .map(|r| r.map_err(std::io::Error::other)),
+        );
+    let mut body_stream = match translate {
+        Some(t) => t(raw),
+        None => raw,
+    };
     let mut first_byte_seen = false;
     loop {
         tokio::select! {
@@ -414,7 +450,7 @@ async fn run_heartbeat_task<F>(
                         if tx.send(Ok(b)).await.is_err() { return; }
                     }
                     Some(Err(e)) => {
-                        let _ = tx.send(Err(std::io::Error::other(e))).await;
+                        let _ = tx.send(Err(e)).await;
                         return;
                     }
                     None => return,
@@ -649,6 +685,7 @@ mod tests {
             client: &client,
             backend_url: &url,
             path: "/api/chat",
+            override_path: None,
             query: None,
             method: Method::POST,
             headers: &headers,
@@ -660,6 +697,7 @@ mod tests {
                 preflight_timeout: Duration::from_secs(10),
                 max_wait: Duration::from_secs(10),
             },
+            translate: None,
         };
 
         let resp = execute(req).await;
@@ -706,6 +744,7 @@ mod tests {
             client: &client,
             backend_url: &url,
             path: "/api/chat",
+            override_path: None,
             query: None,
             method: Method::POST,
             headers: &headers,
@@ -717,6 +756,7 @@ mod tests {
                 preflight_timeout: Duration::from_secs(5),
                 max_wait: Duration::from_secs(5),
             },
+            translate: None,
         };
 
         let resp = execute(req).await;
@@ -753,6 +793,7 @@ mod tests {
             client: &client,
             backend_url: &url,
             path: "/api/chat",
+            override_path: None,
             query: None,
             method: Method::POST,
             headers: &headers,
@@ -764,6 +805,7 @@ mod tests {
                 preflight_timeout: Duration::from_secs(5),
                 max_wait: Duration::from_millis(300),
             },
+            translate: None,
         };
 
         let resp = execute(req).await;

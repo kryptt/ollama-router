@@ -7,6 +7,7 @@ use axum::extract::{OriginalUri, Path, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
+use futures_util::StreamExt;
 use serde_json::json;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
@@ -18,10 +19,11 @@ use ollama_router::heartbeat::{self, HeartbeatConfig, StreamProtocol};
 use ollama_router::metrics::{self, Metrics};
 use ollama_router::models;
 use ollama_router::proxy;
-use ollama_router::registry::{self, SharedRegistry};
+use ollama_router::registry::{self, BackendProtocol, SharedRegistry};
 use ollama_router::response::json_status;
 use ollama_router::routes::{self, ROUTED_PATHS};
 use ollama_router::spill;
+use ollama_router::translate;
 
 #[derive(Clone)]
 struct AppState {
@@ -333,7 +335,42 @@ async fn model_route(
     let view = reg.backend(backend_id);
     let backend_url = view.url.to_string();
     let backend_name = view.name.to_string();
+    let backend_protocol = view.protocol;
     drop(reg);
+
+    // Protocol translation: client speaks Ollama-native /api/chat but the
+    // chosen backend only speaks OpenAI /v1/*. We rewrite the upstream URL
+    // and the request body in-flight, then reshape the response back to
+    // Ollama on the way out. Scope is /api/chat only for this iteration;
+    // /api/generate, /api/embed, etc. follow later.
+    let needs_translation =
+        uri.path() == "/api/chat" && backend_protocol == BackendProtocol::OpenAi;
+
+    if needs_translation {
+        tracing::info!(
+            model = %spilled.model,
+            backend = %backend_name,
+            "translating /api/chat → /v1/chat/completions"
+        );
+        state.metrics.protocol_translations.inc();
+
+        // Buffer the request body and translate it.
+        let body_bytes = match collect_body_to_bytes(spilled.body).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to buffer request body for translation");
+                return proxy::bad_gateway("failed to read request body");
+            }
+        };
+        let translated = match translate::ollama_chat_to_openai_request(&body_bytes) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to translate /api/chat body");
+                return proxy::bad_request("body is not valid JSON");
+            }
+        };
+        spilled.body = Body::from(translated);
+    }
 
     let start = Instant::now();
 
@@ -347,6 +384,12 @@ async fn model_route(
         && StreamProtocol::from_path(uri.path()).is_some()
         && !preflight_model_loaded(&state, &backend_url, &spilled.model).await;
 
+    let upstream_path: Option<&str> = if needs_translation {
+        Some("/v1/chat/completions")
+    } else {
+        None
+    };
+
     let response = if use_heartbeat {
         let protocol = StreamProtocol::from_path(uri.path()).expect("checked above");
         tracing::info!(
@@ -355,10 +398,19 @@ async fn model_route(
             path = uri.path(),
             "heartbeat path engaged (model not hot)"
         );
+        let translator: Option<heartbeat::BodyTranslator> = if needs_translation {
+            let model = spilled.model.clone();
+            Some(Box::new(move |s| {
+                translate::translate_streaming_response(s, model)
+            }))
+        } else {
+            None
+        };
         heartbeat::execute(heartbeat::HeartbeatRequest {
             client: &state.client,
             backend_url: &backend_url,
             path: uri.path(),
+            override_path: upstream_path,
             query: uri.query(),
             method: method.clone(),
             headers: &headers,
@@ -366,19 +418,27 @@ async fn model_route(
             protocol,
             model: spilled.model.clone(),
             config: state.heartbeat,
+            translate: translator,
         })
         .await
     } else {
-        proxy::execute(proxy::ProxyRequest {
+        let raw = proxy::execute(proxy::ProxyRequest {
             client: &state.client,
             backend_url: &backend_url,
             path: uri.path(),
+            override_path: upstream_path,
             query: uri.query(),
             method: method.clone(),
             headers: &headers,
             body: spilled.body,
         })
-        .await
+        .await;
+
+        if needs_translation {
+            translate_proxy_response(raw, spilled.stream, spilled.model.clone()).await
+        } else {
+            raw
+        }
     };
 
     let duration = start.elapsed().as_secs_f64();
@@ -497,6 +557,7 @@ async fn passthrough_route(
         client: &state.client,
         backend_url: &backend_url,
         path: uri.path(),
+        override_path: None,
         query: uri.query(),
         method,
         headers: &headers,
@@ -611,6 +672,68 @@ fn extract_token(headers: &HeaderMap) -> Option<&str> {
         .get("api-key")
         .or_else(|| headers.get("x-api-key"))
         .and_then(|v| v.to_str().ok())
+}
+
+/// Collect an `axum::body::Body` into a single `Vec<u8>`. Used to buffer
+/// /api/chat request bodies before protocol translation rewrites them.
+async fn collect_body_to_bytes(body: Body) -> Result<Vec<u8>, axum::Error> {
+    use http_body_util::BodyExt;
+    let bytes = body.collect().await?.to_bytes();
+    Ok(bytes.to_vec())
+}
+
+/// Wrap a `proxy::execute` response in protocol translation. For a
+/// non-streaming request, buffer the whole body and convert via
+/// `translate::openai_chat_to_ollama_response`; for a streaming request,
+/// wrap the body stream with `translate::translate_streaming_response`.
+/// Status code and a hand-picked subset of headers are preserved.
+async fn translate_proxy_response(resp: Response, streaming: bool, model: String) -> Response {
+    let status = resp.status();
+    // Only successful responses get translated. Upstream error bodies are
+    // already a JSON `{"error": ...}` shape that Ollama clients tolerate;
+    // translating them would risk papering over the failure.
+    if !status.is_success() {
+        return resp;
+    }
+
+    if streaming {
+        let stream = resp
+            .into_body()
+            .into_data_stream()
+            .map(|r| r.map_err(std::io::Error::other));
+        let translated = translate::translate_streaming_response(stream, model);
+        let mut new_resp = Response::new(Body::from_stream(translated));
+        *new_resp.status_mut() = status;
+        new_resp.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-ndjson"),
+        );
+        new_resp
+    } else {
+        use http_body_util::BodyExt;
+        let bytes = match resp.into_body().collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to buffer translated response body");
+                return proxy::bad_gateway("failed to read upstream response");
+            }
+        };
+        match translate::openai_chat_to_ollama_response(&bytes, &model) {
+            Ok(out) => {
+                let mut new_resp = Response::new(Body::from(out));
+                *new_resp.status_mut() = status;
+                new_resp.headers_mut().insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                new_resp
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to translate non-streaming response");
+                proxy::bad_gateway("failed to translate upstream response")
+            }
+        }
+    }
 }
 
 /// Cheap upper-bound estimate of input tokens from the request body size.

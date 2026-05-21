@@ -13,12 +13,24 @@ use crate::config::Config;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BackendId(usize);
 
+/// Wire protocol spoken by a backend. Set by discovery from whichever
+/// listing endpoint succeeded; defaults to `Ollama` until the first cycle
+/// proves otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendProtocol {
+    /// Backend speaks Ollama-native /api/* (and usually /v1/* too).
+    Ollama,
+    /// Backend only speaks /v1/* (e.g. llama.cpp's llama-server, llama-swap).
+    OpenAi,
+}
+
 /// Per-backend mutable state, updated by the discovery loop.
 #[derive(Debug)]
 struct BackendState {
     name: String,
     url: String,
     healthy: bool,
+    protocol: BackendProtocol,
     models: Vec<ModelInfo>,
     last_seen: Option<Instant>,
     grace_deadline: Option<Instant>,
@@ -60,6 +72,7 @@ pub struct BackendView<'a> {
     pub name: &'a str,
     pub url: &'a str,
     pub healthy: bool,
+    pub protocol: BackendProtocol,
     pub models: &'a [ModelInfo],
     pub in_grace_period: bool,
 }
@@ -83,6 +96,7 @@ impl Registry {
                 name: b.name.clone(),
                 url: b.url.clone(),
                 healthy: false,
+                protocol: BackendProtocol::Ollama,
                 models: Vec::new(),
                 last_seen: None,
                 grace_deadline: None,
@@ -117,6 +131,7 @@ impl Registry {
             name: &b.name,
             url: &b.url,
             healthy: b.healthy,
+            protocol: b.protocol,
             models: &b.models,
             in_grace_period: b.grace_deadline.is_some(),
         }
@@ -128,6 +143,7 @@ impl Registry {
             name: &b.name,
             url: &b.url,
             healthy: b.healthy,
+            protocol: b.protocol,
             models: &b.models,
             in_grace_period: b.grace_deadline.is_some(),
         })
@@ -205,11 +221,17 @@ pub async fn discovery_loop(registry: SharedRegistry, config: Config) {
 
 /// Fetch results from backends, keyed by index.
 enum FetchResult {
-    Ok(Vec<ModelInfo>),
+    Ok {
+        protocol: BackendProtocol,
+        models: Vec<ModelInfo>,
+    },
     Err,
 }
 
 /// Try Ollama `/api/tags` first, then fall back to OpenAI `/v1/models`.
+/// The successful endpoint determines `protocol`: an `/api/tags` 200 means
+/// the backend speaks Ollama-native; only `/v1/models` succeeding marks it
+/// as OpenAI-only.
 async fn fetch_models(client: &Client, name: &str, url: &str) -> FetchResult {
     // Try Ollama /api/tags
     let tags_url = format!("{url}/api/tags");
@@ -221,7 +243,10 @@ async fn fetch_models(client: &Client, name: &str, url: &str) -> FetchResult {
                     for m in &mut models {
                         sanitize_model_entry(m);
                     }
-                    FetchResult::Ok(models)
+                    FetchResult::Ok {
+                        protocol: BackendProtocol::Ollama,
+                        models,
+                    }
                 }
                 Err(e) => {
                     warn!(backend = %name, error = %e, "failed to parse /api/tags");
@@ -254,7 +279,10 @@ async fn fetch_models(client: &Client, name: &str, url: &str) -> FetchResult {
                         info
                     })
                     .collect();
-                FetchResult::Ok(models)
+                FetchResult::Ok {
+                    protocol: BackendProtocol::OpenAi,
+                    models,
+                }
             }
             Err(e) => {
                 warn!(backend = %name, error = %e, "failed to parse /v1/models");
@@ -329,11 +357,15 @@ async fn run_discovery(
 
     for (backend, result) in reg.backends.iter_mut().zip(fetch_results) {
         match result {
-            FetchResult::Ok(models) => {
+            FetchResult::Ok { protocol, models } => {
                 if !backend.healthy {
-                    info!(backend = %backend.name, models = models.len(), "backend recovered");
+                    info!(backend = %backend.name, models = models.len(), protocol = ?protocol, "backend recovered");
+                }
+                if backend.protocol != protocol {
+                    info!(backend = %backend.name, from = ?backend.protocol, to = ?protocol, "backend protocol updated");
                 }
                 backend.healthy = true;
+                backend.protocol = protocol;
                 backend.models = models;
                 backend.last_seen = Some(now);
                 backend.grace_deadline = None;

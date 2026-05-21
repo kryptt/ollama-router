@@ -28,6 +28,10 @@ pub struct Metrics {
     ///   at lookup time (typo, decommissioned backend, or pre-discovery
     ///   startup window).
     pub escalations_skipped: Family<EscalationSkipLabels, Counter>,
+    /// Requests that were translated between protocol dialects (e.g.
+    /// `/api/chat` from a client → `/v1/chat/completions` to a backend
+    /// that only speaks OpenAI). Label-free on purpose — cardinality.
+    pub protocol_translations: Counter,
     registry: Registry,
 }
 
@@ -87,6 +91,13 @@ impl Metrics {
             escalations_skipped.clone(),
         );
 
+        let protocol_translations = Counter::default();
+        registry.register(
+            "ollama_router_protocol_translations",
+            "Requests translated between protocol dialects (e.g. /api/chat → /v1/chat/completions)",
+            protocol_translations.clone(),
+        );
+
         Metrics {
             requests_total,
             request_duration,
@@ -94,6 +105,7 @@ impl Metrics {
             unknown_model_requests,
             escalations,
             escalations_skipped,
+            protocol_translations,
             registry,
         }
     }

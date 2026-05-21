@@ -10,6 +10,10 @@ pub struct ProxyRequest<'a> {
     pub client: &'a reqwest::Client,
     pub backend_url: &'a str,
     pub path: &'a str,
+    /// When `Some`, used as the backend-side path instead of `path`. Set
+    /// when protocol translation rewrites `/api/chat` → `/v1/chat/completions`
+    /// without changing what the client sees on its end.
+    pub override_path: Option<&'a str>,
     pub query: Option<&'a str>,
     pub method: Method,
     pub headers: &'a HeaderMap,
@@ -18,7 +22,8 @@ pub struct ProxyRequest<'a> {
 
 /// Forward a request to the backend and stream the response back.
 pub async fn execute(req: ProxyRequest<'_>) -> Response {
-    let mut url = format!("{}{}", req.backend_url, req.path);
+    let upstream_path = req.override_path.unwrap_or(req.path);
+    let mut url = format!("{}{}", req.backend_url, upstream_path);
     if let Some(q) = req.query {
         url.push('?');
         url.push_str(q);

@@ -382,7 +382,7 @@ async fn model_route(
     // directly — those requests don't suffer from idle-chunk timeouts.
     let use_heartbeat = spilled.stream
         && StreamProtocol::from_path(uri.path()).is_some()
-        && !preflight_model_loaded(&state, &backend_url, &spilled.model).await;
+        && !preflight_model_loaded(&state, &backend_url, &backend_name, &spilled.model).await;
 
     let upstream_path: Option<&str> = if needs_translation {
         Some("/v1/chat/completions")
@@ -483,10 +483,17 @@ async fn model_route(
 /// The semantics are asymmetric on purpose: the heartbeat path commits to a
 /// `200 OK` response before upstream replies, so we only take it when we
 /// have positive evidence that the model is still loading.
-async fn preflight_model_loaded(state: &AppState, backend_url: &str, model: &str) -> bool {
+async fn preflight_model_loaded(
+    state: &AppState,
+    backend_url: &str,
+    backend_name: &str,
+    model: &str,
+) -> bool {
+    let kind = models::classify(backend_name);
     match heartbeat::preflight_is_loaded(
         &state.client,
         backend_url,
+        kind,
         model,
         state.heartbeat.preflight_timeout,
     )

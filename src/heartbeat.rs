@@ -187,12 +187,38 @@ const FIXED_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 
 /// Ask a backend whether a model is currently loaded in memory.
 ///
+/// Dispatches on `BackendKind`:
+/// - `Ollama` — calls `/api/ps`; matches `name`/`model` (with prefix fallback).
+/// - `LlamaSwap` — calls `/running`; matches an entry whose `model` is the
+///   requested one and `state == "ready"`. A `state` of "starting" means a
+///   tier-swap is in progress, which is exactly the cold-load case the
+///   heartbeat path was designed for, so report not-loaded.
+/// - `AlwaysResident` — returns `Ok(true)` without a probe; the backend
+///   holds every model it advertises (e.g. a long-running `llama-server`).
+///
 /// Returns:
-/// - `Ok(true)`  — model is in the `/api/ps` response; no heartbeat needed.
+/// - `Ok(true)`  — model is hot; no heartbeat needed.
 /// - `Ok(false)` — probe succeeded and model is absent; heartbeat path is safe.
 /// - `Err(_)`    — probe failed (timeout, connect error, parse error). Caller
 ///   should fall through to normal proxying and let it surface the failure.
 pub async fn preflight_is_loaded(
+    client: &Client,
+    backend_url: &str,
+    kind: crate::models::BackendKind,
+    model: &str,
+    timeout: Duration,
+) -> Result<bool, PreflightError> {
+    use crate::models::BackendKind;
+    match kind {
+        BackendKind::Ollama => preflight_ollama_ps(client, backend_url, model, timeout).await,
+        BackendKind::LlamaSwap => {
+            preflight_llama_swap_running(client, backend_url, model, timeout).await
+        }
+        BackendKind::AlwaysResident => Ok(true),
+    }
+}
+
+async fn preflight_ollama_ps(
     client: &Client,
     backend_url: &str,
     model: &str,
@@ -237,6 +263,50 @@ pub async fn preflight_is_loaded(
             || m.name.split_once(':').is_some_and(|(p, _)| p == model)
             || m.model.split_once(':').is_some_and(|(p, _)| p == model)
     });
+
+    Ok(hit)
+}
+
+async fn preflight_llama_swap_running(
+    client: &Client,
+    backend_url: &str,
+    model: &str,
+    timeout: Duration,
+) -> Result<bool, PreflightError> {
+    #[derive(serde::Deserialize)]
+    struct RunningResponse {
+        #[serde(default)]
+        running: Vec<RunningEntry>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RunningEntry {
+        #[serde(default)]
+        model: String,
+        #[serde(default)]
+        state: String,
+    }
+
+    let url = format!("{backend_url}/running");
+    let resp = client
+        .get(&url)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| PreflightError::Request(e.to_string()))?;
+
+    if !resp.status().is_success() {
+        return Err(PreflightError::Status(resp.status().as_u16()));
+    }
+
+    let body: RunningResponse = resp
+        .json()
+        .await
+        .map_err(|e| PreflightError::Parse(e.to_string()))?;
+
+    let hit = body
+        .running
+        .iter()
+        .any(|r| r.model == model && r.state == "ready");
 
     Ok(hit)
 }
@@ -598,9 +668,15 @@ mod tests {
     async fn preflight_detects_loaded_model() {
         let url = spawn_ps_server(vec!["llama3:latest"]).await;
         let client = reqwest::Client::new();
-        let loaded = preflight_is_loaded(&client, &url, "llama3:latest", Duration::from_secs(2))
-            .await
-            .unwrap();
+        let loaded = preflight_is_loaded(
+            &client,
+            &url,
+            crate::models::BackendKind::Ollama,
+            "llama3:latest",
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
         assert!(loaded);
     }
 
@@ -608,9 +684,15 @@ mod tests {
     async fn preflight_detects_prefix_match() {
         let url = spawn_ps_server(vec!["llama3:latest"]).await;
         let client = reqwest::Client::new();
-        let loaded = preflight_is_loaded(&client, &url, "llama3", Duration::from_secs(2))
-            .await
-            .unwrap();
+        let loaded = preflight_is_loaded(
+            &client,
+            &url,
+            crate::models::BackendKind::Ollama,
+            "llama3",
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
         assert!(loaded);
     }
 
@@ -618,9 +700,15 @@ mod tests {
     async fn preflight_returns_false_when_model_absent() {
         let url = spawn_ps_server(vec!["other:latest"]).await;
         let client = reqwest::Client::new();
-        let loaded = preflight_is_loaded(&client, &url, "llama3", Duration::from_secs(2))
-            .await
-            .unwrap();
+        let loaded = preflight_is_loaded(
+            &client,
+            &url,
+            crate::models::BackendKind::Ollama,
+            "llama3",
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
         assert!(!loaded);
     }
 
@@ -628,9 +716,15 @@ mod tests {
     async fn preflight_empty_ps_returns_false() {
         let url = spawn_ps_server(vec![]).await;
         let client = reqwest::Client::new();
-        let loaded = preflight_is_loaded(&client, &url, "llama3", Duration::from_secs(2))
-            .await
-            .unwrap();
+        let loaded = preflight_is_loaded(
+            &client,
+            &url,
+            crate::models::BackendKind::Ollama,
+            "llama3",
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
         assert!(!loaded);
     }
 
@@ -640,11 +734,119 @@ mod tests {
         let err = preflight_is_loaded(
             &client,
             "http://127.0.0.1:1",
+            crate::models::BackendKind::Ollama,
             "llama3",
             Duration::from_millis(200),
         )
         .await;
         assert!(err.is_err());
+    }
+
+    /// Mock llama-swap /running endpoint. Each entry becomes a running
+    /// item with the given model and state. Other fields are omitted —
+    /// only `model` and `state` participate in the preflight decision.
+    async fn spawn_running_server(entries: Vec<(&str, &str)>) -> String {
+        use serde_json::json;
+        let body = json!({
+            "running": entries.iter().map(|(m, s)| json!({"model": m, "state": s}))
+                .collect::<Vec<_>>(),
+        });
+        let payload = serde_json::to_string(&body).unwrap();
+        let app = Router::new().route(
+            "/running",
+            get(move || {
+                let p = payload.clone();
+                async move { (StatusCode::OK, p) }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn preflight_llama_swap_ready_model_is_loaded() {
+        let url = spawn_running_server(vec![("qwen3.6-medium", "ready")]).await;
+        let client = reqwest::Client::new();
+        let loaded = preflight_is_loaded(
+            &client,
+            &url,
+            crate::models::BackendKind::LlamaSwap,
+            "qwen3.6-medium",
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(loaded);
+    }
+
+    #[tokio::test]
+    async fn preflight_llama_swap_starting_model_is_not_loaded() {
+        // A tier-swap in progress: state != "ready" — heartbeat should engage.
+        let url = spawn_running_server(vec![("qwen3.6-high", "starting")]).await;
+        let client = reqwest::Client::new();
+        let loaded = preflight_is_loaded(
+            &client,
+            &url,
+            crate::models::BackendKind::LlamaSwap,
+            "qwen3.6-high",
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(!loaded);
+    }
+
+    #[tokio::test]
+    async fn preflight_llama_swap_different_model_is_not_loaded() {
+        let url = spawn_running_server(vec![("qwen3.6-low", "ready")]).await;
+        let client = reqwest::Client::new();
+        let loaded = preflight_is_loaded(
+            &client,
+            &url,
+            crate::models::BackendKind::LlamaSwap,
+            "qwen3.6-medium",
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(!loaded);
+    }
+
+    #[tokio::test]
+    async fn preflight_llama_swap_empty_running_is_not_loaded() {
+        let url = spawn_running_server(vec![]).await;
+        let client = reqwest::Client::new();
+        let loaded = preflight_is_loaded(
+            &client,
+            &url,
+            crate::models::BackendKind::LlamaSwap,
+            "qwen3.6-medium",
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(!loaded);
+    }
+
+    #[tokio::test]
+    async fn preflight_always_resident_is_always_loaded() {
+        // No probe is sent — point at an unreachable URL and verify we
+        // still return Ok(true).
+        let client = reqwest::Client::new();
+        let loaded = preflight_is_loaded(
+            &client,
+            "http://127.0.0.1:1",
+            crate::models::BackendKind::AlwaysResident,
+            "ternary-bonsai-8b",
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+        assert!(loaded);
     }
 
     /// Spawn a mock chat endpoint that delays `delay` before emitting body.

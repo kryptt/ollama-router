@@ -123,13 +123,13 @@ pub async fn api_ps_response(registry: &SharedRegistry, client: &Client) -> Resp
 /// configured name. Encoded here rather than as per-backend config because
 /// the three backend families are small, named, and unlikely to grow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackendKind {
+pub enum BackendKind {
     Ollama,
     LlamaSwap,
     AlwaysResident,
 }
 
-fn classify(name: &str) -> BackendKind {
+pub fn classify(name: &str) -> BackendKind {
     // Match the literal name first, then a `<kind>-<suffix>` form so future
     // sharded deployments (`llama-swap-rocm`, `llama-edge-anine`, …) classify
     // correctly without code changes.

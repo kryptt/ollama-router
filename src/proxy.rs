@@ -33,7 +33,12 @@ pub async fn execute(req: ProxyRequest<'_>) -> Response {
 
     for (key, value) in req.headers.iter() {
         match key.as_str() {
-            "host" | "connection" | "transfer-encoding" | "keep-alive" | "upgrade" => continue,
+            // content-length is dropped so reqwest computes it from the
+            // outgoing body. The client's value is wrong whenever we
+            // translate the body (e.g. /api/chat → /v1/chat/completions)
+            // and reqwest aborts the request on length mismatch.
+            "host" | "connection" | "transfer-encoding" | "keep-alive" | "upgrade"
+            | "content-length" => continue,
             _ => builder = builder.header(key.clone(), value.clone()),
         }
     }

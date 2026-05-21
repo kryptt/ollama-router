@@ -312,7 +312,9 @@ pub async fn execute(req: HeartbeatRequest<'_>) -> Response {
     let mut builder = req.client.request(req.method, &url);
     for (key, value) in req.headers.iter() {
         match key.as_str() {
-            "host" | "connection" | "transfer-encoding" | "keep-alive" | "upgrade" => continue,
+            // See proxy.rs for why content-length is dropped.
+            "host" | "connection" | "transfer-encoding" | "keep-alive" | "upgrade"
+            | "content-length" => continue,
             _ => builder = builder.header(key.clone(), value.clone()),
         }
     }

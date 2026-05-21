@@ -187,6 +187,10 @@ struct RunningResponse {
 struct RunningEntry {
     #[serde(default)]
     model: String,
+    /// Full llama-server invocation. We parse `--ctx-size` and `--parallel`
+    /// out of it to synthesise a per-slot `context_length` for clients.
+    #[serde(default)]
+    cmd: String,
 }
 
 async fn fetch_llama_swap_running(client: &Client, b: &BackendSnapshot) -> Vec<Value> {
@@ -212,20 +216,36 @@ async fn fetch_llama_swap_running(client: &Client, b: &BackendSnapshot) -> Vec<V
     body.running
         .into_iter()
         .filter(|r| !r.model.is_empty())
-        .map(|r| ps_entry(&r.model, &b.models))
+        .map(|r| {
+            let context_length = per_slot_context_length(&r.cmd);
+            ps_entry(&r.model, &b.models, context_length)
+        })
         .collect()
 }
 
 fn synthesise_all_loaded(b: &BackendSnapshot) -> Vec<Value> {
     b.models
         .iter()
-        .map(|m| ps_entry(&m.name, &b.models))
+        .map(|m| ps_entry(&m.name, &b.models, None))
         .collect()
 }
 
 /// Build one `/api/ps` entry: `{name, model}` plus whatever size/digest/
 /// details/modified_at the discovery cache has on file for this model.
-fn ps_entry(model_name: &str, registry_models: &[ModelInfo]) -> Value {
+///
+/// Two synthesised fields fill gaps the upstream doesn't report:
+///
+/// - `expires_at` — always now + 1 h. llama-swap/llama-edge don't carry a
+///   real TTL the way Ollama's loaded-model unload timer does; surfacing a
+///   value lets clients code uniformly against the field.
+/// - `context_length` — when the caller can compute it (llama-swap parses
+///   it out of the `--ctx-size`/`--parallel` flags on the live child),
+///   passed in. AlwaysResident backends don't expose enough to compute
+///   one, so they get nothing here.
+///
+/// Existing keys from the discovery cache (registry_models[*].extra) win
+/// over synthesised defaults: `or_insert` is one-shot per key.
+fn ps_entry(model_name: &str, registry_models: &[ModelInfo], context_length: Option<u64>) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("name".into(), Value::String(model_name.to_string()));
     obj.insert("model".into(), Value::String(model_name.to_string()));
@@ -236,7 +256,57 @@ fn ps_entry(model_name: &str, registry_models: &[ModelInfo]) -> Value {
             obj.entry(k.clone()).or_insert(v.clone());
         }
     }
+    if let Some(cl) = context_length {
+        obj.entry("context_length").or_insert(Value::from(cl));
+    }
+    obj.entry("expires_at")
+        .or_insert_with(|| Value::String(synthesised_expires_at(EXPIRES_AT_HORIZON_SECS)));
     Value::Object(obj)
+}
+
+/// Synthesised `expires_at` horizon for backends without a real TTL.
+const EXPIRES_AT_HORIZON_SECS: i64 = 3600;
+
+fn synthesised_expires_at(seconds_from_now: i64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    crate::translate::format_rfc3339_utc(now + seconds_from_now)
+}
+
+/// Parse a llama-server invocation string and return the per-slot context
+/// budget (`--ctx-size` divided by `--parallel`, defaulting parallel to 1).
+/// Returns `None` when `--ctx-size` is absent or unparseable, so the caller
+/// can omit the field entirely rather than reporting a bogus 0.
+///
+/// Handles both space- and `=`-separated forms (`--ctx-size 4096` and
+/// `--ctx-size=4096`); llama.cpp accepts both.
+fn per_slot_context_length(cmd: &str) -> Option<u64> {
+    let (ctx_size, parallel) = parse_llama_server_flags(cmd);
+    let ctx = ctx_size?;
+    let par = parallel.unwrap_or(1).max(1);
+    Some(ctx / par)
+}
+
+fn parse_llama_server_flags(cmd: &str) -> (Option<u64>, Option<u64>) {
+    let mut ctx_size = None;
+    let mut parallel = None;
+    let mut tokens = cmd.split_whitespace();
+    while let Some(tok) = tokens.next() {
+        if tok == "--ctx-size" || tok == "-c" {
+            ctx_size = tokens.next().and_then(|s| s.parse().ok());
+        } else if tok == "--parallel" || tok == "-np" {
+            parallel = tokens.next().and_then(|s| s.parse().ok());
+        } else if let Some(v) = tok.strip_prefix("--ctx-size=") {
+            ctx_size = v.parse().ok();
+        } else if let Some(v) = tok.strip_prefix("--parallel=") {
+            parallel = v.parse().ok();
+        }
+    }
+    (ctx_size, parallel)
 }
 
 #[cfg(test)]
@@ -264,7 +334,7 @@ mod tests {
                 "details": {"family": "qwen"}
             }),
         }];
-        let entry = ps_entry("qwen3.6:latest", &models);
+        let entry = ps_entry("qwen3.6:latest", &models, None);
         assert_eq!(entry["name"], "qwen3.6:latest");
         assert_eq!(entry["model"], "qwen3.6:latest");
         assert_eq!(entry["size"], 21_000_000_000_u64);
@@ -274,12 +344,46 @@ mod tests {
 
     #[test]
     fn ps_entry_handles_missing_discovery_metadata() {
-        let entry = ps_entry("unknown:latest", &[]);
+        let entry = ps_entry("unknown:latest", &[], None);
         assert_eq!(entry["name"], "unknown:latest");
         assert_eq!(entry["model"], "unknown:latest");
-        // No extras — but the object stays valid JSON with just name + model.
+        // name + model + synthesised expires_at, no context_length.
         let obj = entry.as_object().unwrap();
-        assert_eq!(obj.len(), 2);
+        assert_eq!(obj.len(), 3);
+        assert!(obj.contains_key("expires_at"));
+    }
+
+    #[test]
+    fn ps_entry_includes_context_length_when_provided() {
+        let entry = ps_entry("qwen3.6-medium", &[], Some(43_690));
+        assert_eq!(entry["context_length"], 43_690);
+    }
+
+    #[test]
+    fn ps_entry_omits_context_length_when_absent() {
+        let entry = ps_entry("ternary-bonsai-8b", &[], None);
+        assert!(!entry.as_object().unwrap().contains_key("context_length"));
+    }
+
+    #[test]
+    fn ps_entry_synthesises_expires_at_one_hour_out() {
+        let entry = ps_entry("qwen3.6-medium", &[], None);
+        let expires_at = entry["expires_at"].as_str().unwrap();
+        // RFC 3339, ends with Z.
+        assert!(expires_at.ends_with('Z'));
+        assert_eq!(expires_at.len(), 20); // "YYYY-MM-DDTHH:MM:SSZ"
+    }
+
+    #[test]
+    fn ps_entry_real_expires_at_from_registry_wins() {
+        // If discovery already carries an expires_at (real Ollama upstream),
+        // we don't clobber it with the synthesised one.
+        let models = vec![ModelInfo {
+            name: "qwen3.6:latest".into(),
+            extra: json!({"expires_at": "2030-01-01T00:00:00Z"}),
+        }];
+        let entry = ps_entry("qwen3.6:latest", &models, None);
+        assert_eq!(entry["expires_at"], "2030-01-01T00:00:00Z");
     }
 
     #[test]
@@ -304,5 +408,53 @@ mod tests {
         assert_eq!(entries[0]["name"], "ternary-bonsai-8b:latest");
         assert_eq!(entries[0]["size"], 4_000_000_000_u64);
         assert_eq!(entries[1]["name"], "tinyllama:latest");
+    }
+
+    #[test]
+    fn parse_cmd_extracts_space_separated_flags() {
+        let cmd = "llama-server --model /m --ctx-size 262144 --parallel 6 --jinja";
+        assert_eq!(parse_llama_server_flags(cmd), (Some(262_144), Some(6)));
+    }
+
+    #[test]
+    fn parse_cmd_extracts_equals_separated_flags() {
+        let cmd = "llama-server --ctx-size=4096 --parallel=2";
+        assert_eq!(parse_llama_server_flags(cmd), (Some(4_096), Some(2)));
+    }
+
+    #[test]
+    fn parse_cmd_handles_short_flags() {
+        let cmd = "llama-server -c 8192 -np 4";
+        assert_eq!(parse_llama_server_flags(cmd), (Some(8_192), Some(4)));
+    }
+
+    #[test]
+    fn parse_cmd_tolerates_newlines() {
+        // llama-swap's /running response embeds newlines in `cmd`.
+        let cmd = "llama-server\n--model /m\n--ctx-size 262144\n--parallel 6\n--jinja\n";
+        assert_eq!(parse_llama_server_flags(cmd), (Some(262_144), Some(6)));
+    }
+
+    #[test]
+    fn per_slot_context_divides_by_parallel() {
+        let cmd = "llama-server --ctx-size 262144 --parallel 6";
+        assert_eq!(per_slot_context_length(cmd), Some(43_690));
+    }
+
+    #[test]
+    fn per_slot_context_defaults_parallel_to_one() {
+        let cmd = "llama-server --ctx-size 32768";
+        assert_eq!(per_slot_context_length(cmd), Some(32_768));
+    }
+
+    #[test]
+    fn per_slot_context_none_without_ctx_size() {
+        let cmd = "llama-server --parallel 4";
+        assert_eq!(per_slot_context_length(cmd), None);
+    }
+
+    #[test]
+    fn per_slot_context_none_on_empty_cmd() {
+        assert_eq!(per_slot_context_length(""), None);
     }
 }

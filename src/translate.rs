@@ -336,7 +336,7 @@ fn current_timestamp() -> String {
 /// Format seconds-since-epoch as `YYYY-MM-DDTHH:MM:SSZ`. Cheap civil-time
 /// arithmetic; no leap seconds, all UTC. Good enough for a synthetic
 /// `created_at` that clients only use as a parseable timestamp.
-fn format_rfc3339_utc(secs: i64) -> String {
+pub fn format_rfc3339_utc(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let secs_of_day = secs.rem_euclid(86_400);
     let hour = secs_of_day / 3600;

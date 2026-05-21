@@ -343,8 +343,22 @@ async fn model_route(
     // and the request body in-flight, then reshape the response back to
     // Ollama on the way out. Scope is /api/chat only for this iteration;
     // /api/generate, /api/embed, etc. follow later.
-    let needs_translation =
-        uri.path() == "/api/chat" && backend_protocol == BackendProtocol::OpenAi;
+    //
+    // Triggered by EITHER:
+    // (a) the discovery probe saw /v1/models but not /api/tags, so we
+    //     know the backend has no Ollama API surface; OR
+    // (b) the backend is named like a known OpenAI-only family
+    //     (llama-swap, llama-edge). llama.cpp's llama-server includes an
+    //     ollama-compat shim that answers /api/tags but its /api/chat
+    //     hangs forever — discovery thinks it's Ollama-protocol but it
+    //     can't actually handle the chat path.
+    let backend_kind = models::classify(&backend_name);
+    let needs_translation = uri.path() == "/api/chat"
+        && (backend_protocol == BackendProtocol::OpenAi
+            || matches!(
+                backend_kind,
+                models::BackendKind::LlamaSwap | models::BackendKind::AlwaysResident
+            ));
 
     if needs_translation {
         tracing::info!(

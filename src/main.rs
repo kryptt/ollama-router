@@ -450,7 +450,8 @@ async fn model_route(
             headers: &headers,
             body: spilled.body,
         })
-        .await;
+        .await
+        .unwrap_or_else(proxy::ProxyError::into_response);
 
         if needs_translation {
             translate_proxy_response(raw, spilled.stream, spilled.model.clone()).await
@@ -589,6 +590,7 @@ async fn passthrough_route(
         body,
     })
     .await
+    .unwrap_or_else(proxy::ProxyError::into_response)
 }
 
 // ---------------------------------------------------------------------------

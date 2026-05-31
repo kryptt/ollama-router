@@ -244,7 +244,7 @@ async fn preflight_ollama_ps(
         .timeout(timeout)
         .send()
         .await
-        .map_err(|e| PreflightError::Request(e.to_string()))?;
+        .map_err(PreflightError::from_send_error)?;
 
     if !resp.status().is_success() {
         return Err(PreflightError::Status(resp.status().as_u16()));
@@ -280,7 +280,7 @@ async fn preflight_llama_swap_running(
         .timeout(timeout)
         .send()
         .await
-        .map_err(|e| PreflightError::Request(e.to_string()))?;
+        .map_err(PreflightError::from_send_error)?;
 
     if !resp.status().is_success() {
         return Err(PreflightError::Status(resp.status().as_u16()));
@@ -301,14 +301,38 @@ async fn preflight_llama_swap_running(
 
 #[derive(Debug)]
 pub enum PreflightError {
+    /// Could not establish a connection to the probe endpoint.
+    Connect(String),
+    /// Connected, but the probe request timed out.
+    Timeout(String),
+    /// Any other transport error issuing the probe.
     Request(String),
+    /// Probe returned a non-success HTTP status.
     Status(u16),
+    /// Probe body could not be parsed.
     Parse(String),
+}
+
+impl PreflightError {
+    /// Classify a `reqwest` send error the same way `proxy::ProxyError` does,
+    /// so the Unit 3 breaker can treat preflight and proxy transport failures
+    /// uniformly instead of re-parsing a flattened string.
+    fn from_send_error(e: reqwest::Error) -> Self {
+        if e.is_connect() {
+            Self::Connect(e.to_string())
+        } else if e.is_timeout() {
+            Self::Timeout(e.to_string())
+        } else {
+            Self::Request(e.to_string())
+        }
+    }
 }
 
 impl std::fmt::Display for PreflightError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Connect(s) => write!(f, "connect: {s}"),
+            Self::Timeout(s) => write!(f, "timeout: {s}"),
             Self::Request(s) => write!(f, "request: {s}"),
             Self::Status(c) => write!(f, "status {c}"),
             Self::Parse(s) => write!(f, "parse: {s}"),
@@ -361,28 +385,16 @@ pub struct HeartbeatRequest<'a> {
 /// in-band using `StreamProtocol::error_event`.
 pub async fn execute(req: HeartbeatRequest<'_>) -> Response {
     let upstream_path = req.override_path.unwrap_or(req.path);
-    let mut url = format!("{}{}", req.backend_url, upstream_path);
-    if let Some(q) = req.query {
-        url.push('?');
-        url.push_str(q);
-    }
-
-    let mut builder = req.client.request(req.method, &url);
-    for (key, value) in req.headers.iter() {
-        match key.as_str() {
-            // See proxy.rs for why content-length is dropped.
-            "host" | "connection" | "transfer-encoding" | "keep-alive" | "upgrade"
-            | "content-length" => continue,
-            _ => builder = builder.header(key.clone(), value.clone()),
-        }
-    }
-
-    let body_stream = req
-        .body
-        .into_data_stream()
-        .map(|r| r.map_err(std::io::Error::other));
-    let reqwest_body = reqwest::Body::wrap_stream(body_stream);
-    let send_future = builder.body(reqwest_body).send();
+    let builder = crate::proxy::build_upstream_request(
+        req.client,
+        req.method,
+        req.backend_url,
+        upstream_path,
+        req.query,
+        req.headers,
+        req.body,
+    );
+    let send_future = builder.send();
 
     // Channel buffer of 16 is plenty — a heartbeat every 15s and an
     // upstream producing tokens at 100 tok/s max both fit comfortably.

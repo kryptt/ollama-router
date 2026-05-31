@@ -186,7 +186,7 @@ graph TB
   U6 --> U7
 ```
 
-- [ ] **Unit 1: Config — retry/backoff/breaker + cache knobs**
+- [x] **Unit 1: Config — retry/backoff/breaker + cache knobs**
 
 **Goal:** Env-driven config for the new mechanisms.
 **Requirements:** R3 (cache-config values support R10, owned by Unit 4)

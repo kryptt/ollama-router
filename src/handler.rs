@@ -660,6 +660,33 @@ fn apply_escalation(
 mod tests {
     use super::*;
 
+    /// Construct a minimal `AppState` for in-process handler tests — no TCP
+    /// server, no real backends. Proves the I4 seam: handlers are callable
+    /// directly now that they live in the library.
+    fn test_state() -> AppState {
+        use crate::config::{Backend, Config};
+        let config = Config::from_backends(vec![Backend::for_test("b", "http://127.0.0.1:1")]);
+        AppState {
+            registry: crate::registry::new_shared(&config),
+            metrics: Arc::new(Metrics::new()),
+            client: Arc::new(reqwest::Client::new()),
+            token_store: Arc::new(TokenStore::new(None)),
+            heartbeat: HeartbeatConfig::from_secs(15, 10, 300),
+            escalation_rules: Arc::new(Vec::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn health_route_reports_awaiting_first_discovery() {
+        use http_body_util::BodyExt;
+        // Before the first discovery cycle completes, readiness is 503.
+        let resp = health_route(State(test_state())).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["reason"], "awaiting first discovery");
+    }
+
     fn rule(from: &str, max: usize, to: &str) -> EscalationRule {
         EscalationRule {
             from_model: from.to_string(),

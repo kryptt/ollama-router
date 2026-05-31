@@ -29,6 +29,7 @@ pub struct ProxyRequest<'a> {
 /// drives retry/backoff decisions. The `String` is the original error display,
 /// kept for logging and breaker diagnostics.
 #[derive(Debug)]
+#[must_use = "a transport failure must be handled or converted via into_response()"]
 pub enum ProxyError {
     /// Could not establish a connection (refused, DNS, TLS, …).
     Connect(String),
@@ -195,19 +196,68 @@ mod tests {
         assert_eq!(bad_request("invalid").status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn proxy_error_maps_to_pre_refactor_status_and_body() {
+        use http_body_util::BodyExt;
+
+        async fn parts(resp: Response) -> (StatusCode, String) {
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            (status, v["error"].as_str().unwrap().to_string())
+        }
+
+        // The status AND body strings are load-bearing — Ollama clients parse
+        // the `error` field. Connect and Transport both map to 502, so the
+        // body messages must stay distinct.
+        let (status, msg) = parts(ProxyError::Connect("e".into()).into_response()).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(msg, "upstream connect failed");
+
+        let (status, msg) = parts(ProxyError::Timeout("e".into()).into_response()).await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(msg, "upstream request timed out");
+
+        let (status, msg) = parts(ProxyError::Transport("e".into()).into_response()).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(msg, "upstream unavailable");
+    }
+
     #[test]
-    fn proxy_error_maps_to_pre_refactor_statuses() {
+    fn build_upstream_request_strips_hop_by_hop_and_joins_query() {
+        use axum::http::HeaderValue;
+
+        let client = reqwest::Client::new();
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", HeaderValue::from_static("100"));
+        headers.insert("host", HeaderValue::from_static("example.com"));
+        headers.insert("connection", HeaderValue::from_static("keep-alive"));
+        headers.insert("authorization", HeaderValue::from_static("Bearer x"));
+        headers.insert("x-custom", HeaderValue::from_static("foo"));
+
+        let req = build_upstream_request(
+            &client,
+            Method::POST,
+            "http://backend:1234",
+            "/v1/chat/completions",
+            Some("q=1"),
+            &headers,
+            Body::empty(),
+        )
+        .build()
+        .expect("request should build");
+
         assert_eq!(
-            ProxyError::Connect("e".into()).into_response().status(),
-            StatusCode::BAD_GATEWAY
+            req.url().as_str(),
+            "http://backend:1234/v1/chat/completions?q=1"
         );
-        assert_eq!(
-            ProxyError::Timeout("e".into()).into_response().status(),
-            StatusCode::GATEWAY_TIMEOUT
-        );
-        assert_eq!(
-            ProxyError::Transport("e".into()).into_response().status(),
-            StatusCode::BAD_GATEWAY
-        );
+        let h = req.headers();
+        // Hop-by-hop headers are stripped...
+        assert!(h.get("content-length").is_none(), "content-length stripped");
+        assert!(h.get("host").is_none(), "host stripped");
+        assert!(h.get("connection").is_none(), "connection stripped");
+        // ...application headers pass through.
+        assert_eq!(h.get("authorization").unwrap(), "Bearer x");
+        assert_eq!(h.get("x-custom").unwrap(), "foo");
     }
 }

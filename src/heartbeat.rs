@@ -787,7 +787,30 @@ mod tests {
             Duration::from_millis(200),
         )
         .await;
-        assert!(err.is_err());
+        // A refused connection classifies as Connect (not collapsed into a
+        // generic Request error), so the Unit 3 breaker can act on the kind.
+        assert!(
+            matches!(err, Err(PreflightError::Connect(_))),
+            "expected Connect, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn preflight_error_display_per_variant() {
+        assert_eq!(
+            PreflightError::Connect("x".into()).to_string(),
+            "connect: x"
+        );
+        assert_eq!(
+            PreflightError::Timeout("x".into()).to_string(),
+            "timeout: x"
+        );
+        assert_eq!(
+            PreflightError::Request("x".into()).to_string(),
+            "request: x"
+        );
+        assert_eq!(PreflightError::Status(503).to_string(), "status 503");
+        assert_eq!(PreflightError::Parse("x".into()).to_string(), "parse: x");
     }
 
     /// Mock llama-swap /running endpoint. Each entry becomes a running

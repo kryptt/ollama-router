@@ -220,6 +220,7 @@ pub async fn model_route(
 
     let response = if use_heartbeat {
         let protocol = StreamProtocol::from_path(uri.path()).expect("checked above");
+        state.metrics.heartbeat_engaged.inc();
         tracing::info!(
             model = %spilled.model,
             backend = %backend_name,
@@ -250,7 +251,7 @@ pub async fn model_route(
         })
         .await
     } else {
-        let raw = proxy::execute(proxy::ProxyRequest {
+        let raw = match proxy::execute(proxy::ProxyRequest {
             client: &state.client,
             backend_url: &backend_url,
             path: uri.path(),
@@ -261,7 +262,19 @@ pub async fn model_route(
             body: spilled.body,
         })
         .await
-        .unwrap_or_else(proxy::ProxyError::into_response);
+        {
+            Ok(r) => r,
+            Err(e) => {
+                state
+                    .metrics
+                    .upstream_errors
+                    .get_or_create(&metrics::UpstreamErrorLabels {
+                        kind: e.kind_str().to_string(),
+                    })
+                    .inc();
+                e.into_response()
+            }
+        };
 
         if needs_translation {
             translate_proxy_response(raw, spilled.stream, spilled.model.clone()).await
@@ -395,7 +408,7 @@ pub async fn passthrough_route(
     let backend_url = reg.backend(backend_id).url.to_string();
     drop(reg);
 
-    proxy::execute(proxy::ProxyRequest {
+    match proxy::execute(proxy::ProxyRequest {
         client: &state.client,
         backend_url: &backend_url,
         path: uri.path(),
@@ -406,7 +419,19 @@ pub async fn passthrough_route(
         body,
     })
     .await
-    .unwrap_or_else(proxy::ProxyError::into_response)
+    {
+        Ok(r) => r,
+        Err(e) => {
+            state
+                .metrics
+                .upstream_errors
+                .get_or_create(&metrics::UpstreamErrorLabels {
+                    kind: e.kind_str().to_string(),
+                })
+                .inc();
+            e.into_response()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -464,6 +489,30 @@ pub async fn status_route(State(state): State<AppState>) -> Response {
 }
 
 pub async fn metrics_route(State(state): State<AppState>) -> Response {
+    // Refresh registry-derived gauges from the current snapshot so they're
+    // fresh at scrape time without coupling the discovery loop to metrics.
+    {
+        let reg = state.registry.read().await;
+        let reachable = reg
+            .all_backends()
+            .filter(|b| b.healthy || b.in_grace_period)
+            .count();
+        let healthy = reg.all_backends().filter(|b| b.healthy).count();
+        let ready = reg.is_discovery_done() && reachable > 0;
+        state.metrics.ready.set(ready as i64);
+        state.metrics.backends_reachable.set(reachable as i64);
+        state.metrics.backends_healthy.set(healthy as i64);
+        for b in reg.all_backends() {
+            state
+                .metrics
+                .backend_up
+                .get_or_create(&metrics::BackendLabels {
+                    backend: b.name.to_string(),
+                })
+                .set(b.healthy as i64);
+        }
+    }
+
     match state.metrics.encode() {
         Ok(buf) => (
             StatusCode::OK,
@@ -685,6 +734,32 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["reason"], "awaiting first discovery");
+    }
+
+    #[tokio::test]
+    async fn metrics_route_exposes_self_health_gauges() {
+        use http_body_util::BodyExt;
+        let resp = metrics_route(State(test_state())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        // The self-health series are registered and refreshed at scrape time.
+        for name in [
+            "ollama_router_start_time_seconds",
+            "ollama_router_ready",
+            "ollama_router_backends_reachable",
+            "ollama_router_backends_healthy",
+            "ollama_router_upstream_errors",
+            "ollama_router_heartbeat_engaged",
+        ] {
+            assert!(text.contains(name), "missing metric: {name}\n{text}");
+        }
+        // Pre-discovery, the router is not ready and nothing is reachable.
+        assert!(text.contains("ollama_router_ready 0"), "{text}");
+        assert!(
+            text.contains("ollama_router_backends_reachable 0"),
+            "{text}"
+        );
     }
 
     fn rule(from: &str, max: usize, to: &str) -> EscalationRule {

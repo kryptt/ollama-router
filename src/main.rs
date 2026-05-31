@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::routing::{any, get, post};
@@ -41,6 +41,12 @@ async fn main() {
 
     let registry = registry::new_shared(&config);
     let metrics = Arc::new(Metrics::new());
+    metrics.start_time_seconds.set(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+    );
     let token_store = Arc::new(TokenStore::new(config.tokens_file.as_deref()));
     let client = Arc::new(
         reqwest::Client::builder()

@@ -40,6 +40,15 @@ pub enum ProxyError {
 }
 
 impl ProxyError {
+    /// Stable label for metrics/tracing: `connect` / `timeout` / `transport`.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            ProxyError::Connect(_) => "connect",
+            ProxyError::Timeout(_) => "timeout",
+            ProxyError::Transport(_) => "transport",
+        }
+    }
+
     /// The client-facing 5xx response for this failure when it is *not*
     /// retried. Preserves the pre-refactor status/body mapping exactly.
     pub fn into_response(self) -> Response {

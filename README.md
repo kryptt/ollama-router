@@ -3,30 +3,52 @@
 A Rust HTTP proxy that fronts one or more Ollama / OpenAI / Anthropic-
 compatible inference endpoints behind a single OpenAI-compatible API.
 
-- **Per-model dispatch.** Discover models on every configured backend
-  (`/api/tags` with `/v1/models` fallback) and route each request to the
-  backend that hosts the requested model. Aggregated `/v1/models`,
-  `/api/tags`, and `/api/ps` views unify the cluster from the client's
-  perspective.
-- **Cold-load heartbeat.** Preflight `/api/ps` and inject protocol-correct
-  keepalive bytes (NDJSON empty chunks for Ollama, SSE comments for
-  OpenAI / Anthropic) while a model is loading, so downstream agents
-  with idle timeouts don't kill cold requests.
-- **Long-turn escalation.** Optionally rewrite the model field
-  transparently when an incoming request is too large for the requested
-  model's per-slot context, sending it to a configured higher-context
-  sibling instead. See `OLLAMA_ROUTER_ESCALATE` below.
-- **Multi-protocol awareness.** Proxies `/v1/chat/completions`,
-  `/v1/completions`, `/v1/messages` (Anthropic), `/v1/embeddings`,
-  `/api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`,
-  `/api/show`, picking the correct `stream`-default per protocol.
-- **Spill-to-tmpfile** for large request bodies (avoids OOM on long
-  contexts).
-- **Optional bearer-token auth** with hot-reloadable token file.
-- **Prometheus metrics** for request rate, upstream latency, heartbeat
-  injections, and escalation events.
-- **Graceful shutdown** on SIGTERM / Ctrl-C — in-flight streams drain
-  before the process exits.
+- **Per-model dispatch.** Discovers the models on every configured backend
+  (`/api/tags`, falling back to `/v1/models`) on an interval and routes each
+  request to the backend hosting the requested model — exact name first, then
+  `:`-tag prefix, first-writer-wins across the backend list. A configurable
+  **grace period** keeps a briefly-unreachable backend's models routable
+  through transient blips instead of 404-ing mid-incident.
+- **Unified cluster views.** Aggregated `/v1/models`, `/api/tags`, and
+  `/api/ps` present the whole fleet as one endpoint. `/api/ps` synthesises
+  `context_length` (parsed from the llama-server command line) and `expires_at`
+  for non-Ollama backends so clients see a consistent Ollama-shaped response.
+- **Ollama ↔ OpenAI protocol translation.** A client can speak Ollama-native
+  `/api/chat` to a backend that only exposes OpenAI `/v1/chat/completions`: the
+  request body, streaming SSE responses, and non-streaming responses are
+  reshaped in-flight in both directions, transparently to the client. (Scope
+  today: `/api/chat`; other paths proxy unchanged.)
+- **Cold-load heartbeat.** Preflights the backend (Ollama `/api/ps`,
+  llama-swap `/running`, or "always-resident" backends) and, while a model is
+  still loading, injects protocol-correct keepalive bytes — empty NDJSON chunks
+  for Ollama, SSE comments for OpenAI / Anthropic — so downstream agents with
+  idle-chunk timeouts don't abort a cold request. A failure *after* the 200 OK
+  is surfaced as an in-band error event rather than a silent hang.
+- **Long-turn escalation.** Optionally rewrites the model field when an
+  incoming request is too large for the requested model's per-slot context,
+  routing it to a configured higher-context sibling. Rules chain and are
+  cycle-safe. See `OLLAMA_ROUTER_ESCALATE` below.
+- **Strict-client compatibility.** Normalises malformed `/api/tags` fields
+  (empty `modified_at` / `size`) that otherwise crash pydantic-based clients
+  such as Home Assistant's Ollama integration — one bad model no longer takes
+  down the whole list.
+- **Multi-API surface.** `/v1/chat/completions`, `/v1/completions`,
+  `/v1/messages` (Anthropic), `/v1/embeddings`, `/api/chat`, `/api/generate`,
+  `/api/embed`, `/api/embeddings`, `/api/show` — each with the correct
+  `stream` default per protocol. Mutating endpoints (`/api/pull`, `/api/push`,
+  …) are blocked; unknown paths pass through to a healthy backend.
+- **Spill-to-tmpfile** of request bodies, so model/stream detection and large
+  contexts don't pin the whole payload in heap.
+- **Optional bearer-token auth** with a hot-reloaded token file and an `/auth`
+  endpoint for Traefik / NGINX `forwardAuth` middleware.
+- **Prometheus metrics** — request rate (by model/backend/status/method),
+  upstream latency, protocol translations, escalations (and skips), blocked
+  and unknown-model requests; plus **self-health series** for diagnosing the
+  router itself: `start_time_seconds` (a sawtooth here = pod churn), `ready`,
+  `backends_reachable` / `backends_healthy` / per-backend `backend_up`,
+  `upstream_errors{kind=connect|timeout|transport}`, and `heartbeat_engaged`.
+- **Graceful shutdown** on SIGTERM / Ctrl-C — in-flight streams drain before
+  the process exits, so rolling updates don't RST live responses.
 
 ## Build
 
@@ -132,6 +154,28 @@ Internal router (`OLLAMA_ROUTER_INTERNAL_PORT`):
 | `GET /status` | JSON dump of every backend's current health, models, and grace state. |
 | `GET /metrics` | Prometheus text-format exposition. |
 | `ANY /auth` | Token-validation endpoint for Traefik / NGINX `forwardAuth` middleware. |
+
+## Roadmap
+
+The resilience and embedding-cache environment variables above
+(`OLLAMA_ROUTER_MAX_RETRIES`, the `…_BREAKER_*` / `…_BACKEND_MAX_INFLIGHT`
+knobs, and the `…_CACHE_*` knobs) are **parsed and validated today but not yet
+active** — the machinery that consumes them is in progress. The internal
+plumbing it builds on has already landed: `proxy::execute` returns a typed
+outcome (connect / timeout / transport vs. response), the registry can
+enumerate the healthy backends serving a model, and handlers live in a library
+module with a clean injection point.
+
+Planned, in priority order:
+
+- **Hide backend flakiness from clients** — bounded retry-with-backoff plus a
+  per-backend circuit breaker / in-flight cap that sheds load as honest
+  `503 + Retry-After` instead of relaying transient upstream 5xxs that abort a
+  client's whole multi-minute job.
+- **Embedding cache** — a memory-bounded, model-versioned cache for repeated
+  small embedding requests, flushed on backend rediscovery (off by default).
+
+See `docs/plans/` for the design and rationale.
 
 ## Tests
 

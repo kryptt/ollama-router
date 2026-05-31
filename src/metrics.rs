@@ -1,6 +1,7 @@
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
 
@@ -32,6 +33,29 @@ pub struct Metrics {
     /// `/api/chat` from a client → `/v1/chat/completions` to a backend
     /// that only speaks OpenAI). Label-free on purpose — cardinality.
     pub protocol_translations: Counter,
+
+    // --- Self-health (set at startup / refreshed at scrape time) ---
+    /// Process start time as a Unix timestamp (seconds). A sawtooth that
+    /// resets on a short interval is the fingerprint of pod churn — the exact
+    /// signal that would have surfaced the macvlan-watchdog kill loop.
+    pub start_time_seconds: Gauge,
+    /// 1 when the router is ready to serve (first discovery done AND at least
+    /// one backend reachable), else 0. Refreshed on each `/metrics` scrape.
+    pub ready: Gauge,
+    /// Backends currently reachable (healthy or within grace). Refreshed on scrape.
+    pub backends_reachable: Gauge,
+    /// Backends currently healthy (strictly up). Refreshed on scrape.
+    pub backends_healthy: Gauge,
+    /// Per-backend up/down (1/0). Refreshed on scrape.
+    pub backend_up: Family<BackendLabels, Gauge>,
+
+    /// Transport-level upstream failures by kind (connect / timeout /
+    /// transport) — i.e. cases where no response was obtained at all. Upstream
+    /// 5xx responses are counted by `requests_total{status_code}` instead.
+    pub upstream_errors: Family<UpstreamErrorLabels, Counter>,
+    /// Times the cold-load heartbeat path was engaged (model not resident at
+    /// request start). High rates here correlate with restart/warmup windows.
+    pub heartbeat_engaged: Counter,
     registry: Registry,
 }
 
@@ -98,6 +122,55 @@ impl Metrics {
             protocol_translations.clone(),
         );
 
+        let start_time_seconds = Gauge::default();
+        registry.register(
+            "ollama_router_start_time_seconds",
+            "Process start time (Unix seconds); resets on restart",
+            start_time_seconds.clone(),
+        );
+
+        let ready = Gauge::default();
+        registry.register(
+            "ollama_router_ready",
+            "1 if discovery is done and at least one backend is reachable, else 0",
+            ready.clone(),
+        );
+
+        let backends_reachable = Gauge::default();
+        registry.register(
+            "ollama_router_backends_reachable",
+            "Backends currently reachable (healthy or within grace)",
+            backends_reachable.clone(),
+        );
+
+        let backends_healthy = Gauge::default();
+        registry.register(
+            "ollama_router_backends_healthy",
+            "Backends currently healthy (strictly up)",
+            backends_healthy.clone(),
+        );
+
+        let backend_up = Family::default();
+        registry.register(
+            "ollama_router_backend_up",
+            "Per-backend health (1 up, 0 down)",
+            backend_up.clone(),
+        );
+
+        let upstream_errors = Family::default();
+        registry.register(
+            "ollama_router_upstream_errors",
+            "Transport-level upstream failures by kind (no response obtained)",
+            upstream_errors.clone(),
+        );
+
+        let heartbeat_engaged = Counter::default();
+        registry.register(
+            "ollama_router_heartbeat_engaged",
+            "Times the cold-load heartbeat path was engaged",
+            heartbeat_engaged.clone(),
+        );
+
         Metrics {
             requests_total,
             request_duration,
@@ -106,6 +179,13 @@ impl Metrics {
             escalations,
             escalations_skipped,
             protocol_translations,
+            start_time_seconds,
+            ready,
+            backends_reachable,
+            backends_healthy,
+            backend_up,
+            upstream_errors,
+            heartbeat_engaged,
             registry,
         }
     }
@@ -150,4 +230,14 @@ pub struct EscalationLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct EscalationSkipLabels {
     pub reason: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct BackendLabels {
+    pub backend: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct UpstreamErrorLabels {
+    pub kind: String,
 }

@@ -215,7 +215,7 @@ Mirror existing `parse_env_u64` + `Default`.
 default (matches `parse_env_u64`).
 **Verification:** `cargo test` config parse; fields reachable in `AppState`.
 
-- [ ] **Unit 2: Registry — healthy_backends_for(model)**
+- [x] **Unit 2: Registry — healthy_backends_for(model)**
 
 **Goal:** Enumerate healthy backends serving a model (for the rare multi-homed
 case), primary first.

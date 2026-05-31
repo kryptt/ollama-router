@@ -40,6 +40,15 @@ impl BackendState {
     fn is_reachable(&self) -> bool {
         self.healthy || self.grace_deadline.is_some()
     }
+
+    /// True when this backend carries `model` by exact name or by `:`-prefix.
+    /// Mirrors the key generation in `rebuild_model_map`, so it agrees with
+    /// what `lookup` would resolve.
+    fn serves(&self, model: &str) -> bool {
+        self.models
+            .iter()
+            .any(|m| m.name == model || m.name.split_once(':').map(|(p, _)| p) == Some(model))
+    }
 }
 
 /// Model metadata from Ollama's `/api/tags` response.
@@ -113,6 +122,29 @@ impl Registry {
     /// Look up a model by exact name, then by prefix (before `:`) if no exact match.
     pub fn lookup(&self, model: &str) -> Option<BackendId> {
         self.model_map.get(model).copied()
+    }
+
+    /// All **healthy** backends serving `model`, in routing-priority order
+    /// (config declaration order). This puts the `lookup` primary first
+    /// whenever it is healthy — the model_map's first-writer pick is, by
+    /// construction, the earliest reachable serving backend, so when it is
+    /// healthy it is also the earliest healthy one.
+    ///
+    /// Backends that are unhealthy — **including those merely in their grace
+    /// period** — are excluded. This is the failover-candidate set, so a
+    /// backend we currently believe is unreachable must not appear in it.
+    /// An empty result is the signal (for Unit 3) to shed load as honest
+    /// backpressure rather than hammer a down backend.
+    ///
+    /// For single-homed models this returns exactly one backend; the
+    /// multi-homed case is rare (the motivating embedder is single-homed).
+    pub fn healthy_backends_for(&self, model: &str) -> Vec<BackendId> {
+        self.backends
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.healthy && b.serves(model))
+            .map(|(idx, _)| BackendId(idx))
+            .collect()
     }
 
     /// Return the first healthy backend for model-less request proxying.
@@ -482,6 +514,79 @@ mod tests {
         let mut reg = Registry::new(&test_config());
         set_backend_models(&mut reg, 0, true, vec![make_model("model:v1")]);
         assert!(reg.lookup("nonexistent").is_none());
+    }
+
+    #[test]
+    fn healthy_backends_for_single_homed_returns_one() {
+        let mut reg = Registry::new(&test_config());
+        set_backend_models(&mut reg, 0, true, vec![make_model("jina-embed:v1")]);
+
+        let ids = reg.healthy_backends_for("jina-embed:v1");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(reg.backend(ids[0]).name, "cuda");
+
+        // Prefix form resolves to the same single backend.
+        let by_prefix = reg.healthy_backends_for("jina-embed");
+        assert_eq!(by_prefix.len(), 1);
+        assert_eq!(reg.backend(by_prefix[0]).name, "cuda");
+    }
+
+    #[test]
+    fn healthy_backends_for_multi_homed_lists_primary_first() {
+        let mut reg = Registry::new(&test_config());
+        set_backend_models(&mut reg, 0, true, vec![make_model("shared:v1")]);
+        set_backend_models(&mut reg, 1, true, vec![make_model("shared:v1")]);
+
+        let names: Vec<&str> = reg
+            .healthy_backends_for("shared:v1")
+            .iter()
+            .map(|&id| reg.backend(id).name)
+            .collect();
+        // cuda is first in config order and is the lookup primary.
+        assert_eq!(names, vec!["cuda", "rocm"]);
+        assert_eq!(reg.backend(reg.lookup("shared:v1").unwrap()).name, "cuda");
+    }
+
+    #[test]
+    fn healthy_backends_for_excludes_unhealthy_serving_backend() {
+        let mut reg = Registry::new(&test_config());
+        // cuda serves the model but is hard-down (no grace); rocm is healthy.
+        reg.backends[0].healthy = false;
+        reg.backends[0].grace_deadline = None;
+        reg.backends[0].models = vec![make_model("m:v1")];
+        set_backend_models(&mut reg, 1, true, vec![make_model("m:v1")]);
+
+        let ids = reg.healthy_backends_for("m:v1");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(reg.backend(ids[0]).name, "rocm");
+    }
+
+    #[test]
+    fn healthy_backends_for_excludes_grace_period_backend() {
+        let mut reg = Registry::new(&test_config());
+        // cuda is in its grace period: still routable via `lookup`, but NOT a
+        // healthy failover candidate.
+        reg.backends[0].healthy = false;
+        reg.backends[0].grace_deadline = Some(Instant::now() + Duration::from_secs(60));
+        reg.backends[0].models = vec![make_model("m:v1")];
+        set_backend_models(&mut reg, 1, true, vec![make_model("m:v1")]);
+
+        // lookup still finds the graced backend (first reachable)...
+        assert_eq!(reg.backend(reg.lookup("m:v1").unwrap()).name, "cuda");
+        // ...but healthy_backends_for excludes it.
+        let names: Vec<&str> = reg
+            .healthy_backends_for("m:v1")
+            .iter()
+            .map(|&id| reg.backend(id).name)
+            .collect();
+        assert_eq!(names, vec!["rocm"]);
+    }
+
+    #[test]
+    fn healthy_backends_for_absent_model_is_empty() {
+        let mut reg = Registry::new(&test_config());
+        set_backend_models(&mut reg, 0, true, vec![make_model("present:v1")]);
+        assert!(reg.healthy_backends_for("absent").is_empty());
     }
 
     #[test]

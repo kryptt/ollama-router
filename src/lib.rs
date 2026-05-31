@@ -9,4 +9,5 @@ pub mod registry;
 pub mod response;
 pub mod routes;
 pub mod spill;
+pub mod telemetry;
 pub mod translate;

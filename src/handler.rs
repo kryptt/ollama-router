@@ -38,6 +38,17 @@ pub struct AppState {
     pub escalation_rules: Arc<Vec<EscalationRule>>,
 }
 
+#[tracing::instrument(
+    name = "model_route",
+    skip_all,
+    fields(
+        http.request.method = %method,
+        url.path = %uri.path(),
+        model = tracing::field::Empty,
+        backend = tracing::field::Empty,
+        http.response.status_code = tracing::field::Empty,
+    )
+)]
 pub async fn model_route(
     State(state): State<AppState>,
     method: Method,
@@ -151,6 +162,10 @@ pub async fn model_route(
     let backend_name = view.name.to_string();
     let backend_protocol = view.protocol;
     drop(reg);
+
+    let span = tracing::Span::current();
+    span.record("model", spilled.model.as_str());
+    span.record("backend", backend_name.as_str());
 
     // Protocol translation: client speaks Ollama-native /api/chat but the
     // chosen backend only speaks OpenAI /v1/*. We rewrite the upstream URL
@@ -285,6 +300,7 @@ pub async fn model_route(
 
     let duration = start.elapsed().as_secs_f64();
     let status_code = response.status().as_u16();
+    span.record("http.response.status_code", status_code);
 
     // The `stream` label means "this request will actually stream the
     // response back" — i.e. spilled.stream AND the path's protocol
@@ -393,6 +409,11 @@ pub async fn v1_model_route(
     models::v1_model_response(&reg, &model_id)
 }
 
+#[tracing::instrument(
+    name = "passthrough_route",
+    skip_all,
+    fields(http.request.method = %method, url.path = %uri.path())
+)]
 pub async fn passthrough_route(
     State(state): State<AppState>,
     method: Method,

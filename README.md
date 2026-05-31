@@ -47,6 +47,11 @@ compatible inference endpoints behind a single OpenAI-compatible API.
   router itself: `start_time_seconds` (a sawtooth here = pod churn), `ready`,
   `backends_reachable` / `backends_healthy` / per-backend `backend_up`,
   `upstream_errors{kind=connect|timeout|transport}`, and `heartbeat_engaged`.
+- **OpenTelemetry tracing (opt-in).** When `OTEL_EXPORTER_OTLP_ENDPOINT` is
+  set, per-request spans (`model_route` / `passthrough_route`, with `model`,
+  `backend`, and status attributes) are batch-exported over OTLP/HTTP to Tempo
+  (directly or via a Grafana Alloy collector). Unset = log-only; no collector
+  needed for local runs. Reuses the existing reqwest/rustls stack (no gRPC).
 - **Graceful shutdown** on SIGTERM / Ctrl-C — in-flight streams drain before
   the process exits, so rolling updates don't RST live responses.
 
@@ -131,6 +136,13 @@ release):
 | `OLLAMA_ROUTER_CACHE_MAX_BYTES` | `67108864` | Total byte budget for the cache across all entries (64 MiB). |
 | `OLLAMA_ROUTER_CACHE_MAX_ENTRY_BYTES` | `1048576` | Skip caching any single body larger than this, in bytes (1 MiB); avoids buffering multi-MB bulk embeds. `0` = no per-entry cap. When non-zero, must not exceed `OLLAMA_ROUTER_CACHE_MAX_BYTES`. |
 | `OLLAMA_ROUTER_CACHE_TTL` | `3600` | Time-to-live (seconds) for a cached embedding. |
+
+Tracing (optional — unset disables OTLP export, leaving structured logs only):
+
+| Var | Default | Purpose |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | (unset, tracing off) | OTLP/HTTP base endpoint, e.g. `http://tempo.monitor.svc:4318` or a node-local Alloy. Setting it enables per-request span export. Standard `OTEL_EXPORTER_OTLP_*` and `OTEL_TRACES_SAMPLER*` vars are honored by the exporter. |
+| `OTEL_SERVICE_NAME` | `ollama-router` | `service.name` resource attribute on exported spans. |
 
 ## Endpoints
 

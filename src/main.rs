@@ -17,12 +17,30 @@ use ollama_router::routes::ROUTED_PATHS;
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ollama_router=info".into()),
-        )
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "ollama_router=info".into());
+
+    // OTLP span export is opt-in (OTEL_EXPORTER_OTLP_ENDPOINT). When unset,
+    // `otel_layer` is None and the router runs log-only. An Option<Layer>
+    // composes cleanly either way.
+    let version = env!("CARGO_PKG_VERSION");
+    let (otel_layer, tracer_provider) = match ollama_router::telemetry::otlp_layer(version) {
+        Some((layer, provider)) => (Some(layer), Some(provider)),
+        None => (None, None),
+    };
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(otel_layer)
         .init();
+
+    if tracer_provider.is_some() {
+        info!("OTLP tracing enabled");
+    }
 
     let config = Config::from_env().expect("invalid configuration");
 
@@ -182,6 +200,14 @@ async fn main() {
     if let Err(e) = r2 {
         tracing::error!(error = %e, "internal server error");
     }
+
+    // Flush any buffered spans to the collector before exit.
+    if let Some(provider) = tracer_provider
+        && let Err(e) = provider.shutdown()
+    {
+        tracing::warn!(error = %e, "OTLP tracer shutdown/flush failed");
+    }
+
     info!("server stopped");
 }
 

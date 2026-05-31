@@ -30,19 +30,22 @@
 //! into the void.
 
 use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use reqwest::Client;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
+
+use crate::translate::FIXED_TIMESTAMP;
 
 // ---------------------------------------------------------------------------
 // Public configuration
@@ -175,11 +178,9 @@ impl StreamProtocol {
     }
 }
 
-/// A valid RFC 3339 timestamp. The field is required by Ollama clients
-/// (Python's `ollama` package parses it as `datetime`) but heartbeat
-/// chunks are cosmetic — clients use it for nothing that matters here,
-/// so a fixed value avoids pulling in a date crate.
-const FIXED_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
+// `FIXED_TIMESTAMP` is the shared epoch sentinel from `crate::translate`
+// (imported above): the `created_at` field Ollama clients require but never
+// meaningfully read.
 
 // ---------------------------------------------------------------------------
 // Preflight probe
@@ -273,19 +274,6 @@ async fn preflight_llama_swap_running(
     model: &str,
     timeout: Duration,
 ) -> Result<bool, PreflightError> {
-    #[derive(serde::Deserialize)]
-    struct RunningResponse {
-        #[serde(default)]
-        running: Vec<RunningEntry>,
-    }
-    #[derive(serde::Deserialize)]
-    struct RunningEntry {
-        #[serde(default)]
-        model: String,
-        #[serde(default)]
-        state: String,
-    }
-
     let url = format!("{backend_url}/running");
     let resp = client
         .get(&url)
@@ -298,7 +286,7 @@ async fn preflight_llama_swap_running(
         return Err(PreflightError::Status(resp.status().as_u16()));
     }
 
-    let body: RunningResponse = resp
+    let body: crate::models::RunningResponse = resp
         .json()
         .await
         .map_err(|e| PreflightError::Parse(e.to_string()))?;
@@ -405,11 +393,18 @@ pub async fn execute(req: HeartbeatRequest<'_>) -> Response {
     let model = req.model.clone();
     let translate = req.translate;
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         run_heartbeat_task(send_future, tx, protocol, model, cfg, translate).await;
     });
 
-    let stream = ReceiverStream::new(rx);
+    // Abort the task when the downstream body is dropped (client disconnect
+    // or normal completion). Without this, a mid-stream upstream stall after
+    // the client has gone would keep the task polling — holding the upstream
+    // connection until the next byte or the request timeout.
+    let stream = AbortOnDrop {
+        inner: ReceiverStream::new(rx),
+        handle: task.abort_handle(),
+    };
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
@@ -417,6 +412,30 @@ pub async fn execute(req: HeartbeatRequest<'_>) -> Response {
         HeaderValue::from_static(protocol.content_type()),
     );
     response
+}
+
+/// Stream wrapper that aborts a detached task when the stream is dropped.
+/// Used to tie the spawned heartbeat task's lifetime to the downstream
+/// response body, so a client disconnect tears down the upstream connection
+/// instead of leaving the task polling a stalled upstream.
+struct AbortOnDrop<S> {
+    inner: S,
+    handle: tokio::task::AbortHandle,
+}
+
+impl<S: Stream + Unpin> Stream for AbortOnDrop<S> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl<S> Drop for AbortOnDrop<S> {
+    fn drop(&mut self) {
+        // No-op if the task already finished.
+        self.handle.abort();
+    }
 }
 
 async fn run_heartbeat_task<F>(
@@ -548,6 +567,23 @@ async fn run_heartbeat_task<F>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn abort_on_drop_cancels_the_wrapped_task() {
+        // A task that never completes on its own — only an abort ends it.
+        let task = tokio::spawn(async { std::future::pending::<()>().await });
+        let wrapper = AbortOnDrop {
+            inner: futures_util::stream::empty::<u8>(),
+            handle: task.abort_handle(),
+        };
+        assert!(!task.is_finished(), "task should still be running");
+
+        drop(wrapper);
+
+        // The drop schedules the abort; awaiting the handle observes it.
+        let err = task.await.unwrap_err();
+        assert!(err.is_cancelled(), "task should have been aborted on drop");
+    }
 
     #[test]
     fn classify_chat_paths() {

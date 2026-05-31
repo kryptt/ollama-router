@@ -323,7 +323,7 @@ fn sanitize_model_entry(m: &mut ModelInfo) {
     if obj.get("modified_at").is_none_or(is_blank) {
         obj.insert(
             "modified_at".to_string(),
-            serde_json::Value::String("1970-01-01T00:00:00Z".to_string()),
+            serde_json::Value::String(crate::translate::FIXED_TIMESTAMP.to_string()),
         );
     }
     if obj.get("size").is_none_or(is_blank) {
@@ -343,13 +343,18 @@ async fn run_discovery(
     config: &Config,
     grace_duration: Duration,
 ) {
-    // Phase 1: Fetch from all backends WITHOUT holding any lock.
-    // Backend URLs come from Config (immutable), so no lock needed.
-    let mut fetch_results = Vec::with_capacity(config.backends.len());
-    for backend in &config.backends {
-        let result = fetch_models(client, &backend.name, &backend.url).await;
-        fetch_results.push(result);
-    }
+    // Phase 1: Fetch from all backends concurrently, WITHOUT holding any
+    // lock. Backend URLs come from Config (immutable), so no lock needed.
+    // join_all preserves order, so results still zip with `reg.backends`.
+    // Concurrency matters: a slow/dead backend's per-probe timeout would
+    // otherwise serialise, making a cycle take N × timeout.
+    let fetch_results = futures_util::future::join_all(
+        config
+            .backends
+            .iter()
+            .map(|backend| fetch_models(client, &backend.name, &backend.url)),
+    )
+    .await;
 
     // Phase 2: Apply results under write lock (no I/O, microseconds).
     let mut reg = registry.write().await;

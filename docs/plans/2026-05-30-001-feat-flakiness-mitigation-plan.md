@@ -179,12 +179,26 @@ request → handler (model_route / passthrough_route)
 graph TB
   U1[Unit 1: config: retry/backoff/breaker/cache] --> U3[Unit 3: backpressure + bounded retry]
   U2[Unit 2: registry healthy_backends_for] --> U3
+  U25[Unit 2.5: proxy retry-readiness refactor] --> U3
   U1 --> U4[Unit 4: memory-safe model-versioned cache]
   U3 --> U7[Unit 7: version + test]
   U4 --> U7
   U5[Unit 5: lifecycle audit] --> U6[Unit 6: drop macvlan + zero-gap rollout]
   U6 --> U7
 ```
+
+> **Pre-work landed (2026-05-31, post-architectural-review).** Independent
+> cleanups verified and shipped ahead of the plan, so Unit 3 starts on solid
+> ground: (a) discovery now probes backends concurrently (`join_all`) instead
+> of serially; (b) the `FIXED_TIMESTAMP` epoch sentinel is deduped to one
+> `pub(crate)` home in `translate`; (c) llama-swap's `/running` struct is
+> unified (`models::RunningResponse`, shared with `heartbeat`); (d) the
+> heartbeat task is now aborted on body-drop (`AbortOnDrop`) so a client
+> disconnect tears down the upstream connection; (e) the token-reload loop is
+> wired to the shutdown `Notify`. The architectural review also confirmed
+> `classify`-by-name is a deliberate design (not debt), and that the per-request
+> tempfile is tmpfs/page-cache backed (not a disk-I/O bottleneck) — only its
+> *replayability* matters, captured in Unit 2.5 below.
 
 - [x] **Unit 1: Config — retry/backoff/breaker + cache knobs**
 
@@ -217,16 +231,58 @@ case), primary first.
   absent model → empty.
 **Verification:** returns 1 for embedders; ordering/filtering correct.
 
+- [ ] **Unit 2.5: Proxy retry-readiness refactor** *(prerequisite for Unit 3; from the 2026-05-31 architectural review)*
+
+**Goal:** Reshape the proxy layer so Unit 3's retry loop + circuit breaker drop
+in cleanly, instead of fighting the current structure or re-duplicating logic.
+Behaviour-preserving — no client-visible change, no new config consumed.
+**Requirements:** enables R1, R3, R4, R5 (no new requirements of its own)
+**Dependencies:** none (independent of Unit 2)
+**Files:** `src/proxy.rs`, `src/heartbeat.rs`, `src/spill.rs`, `src/main.rs`,
+new `src/handler.rs` (move out of `main.rs`); tests in-file.
+**Approach (four verified items, K1–K4):**
+- **K1 — typed outcome.** Change `proxy::execute` to return
+  `Result<Response, ProxyError>` where `ProxyError` distinguishes
+  connect-refused / timeout / upstream-5xx / (translation-failure) instead of
+  flattening them into pre-built 502/504 JSON. The retry loop and breaker
+  classify on `ProxyError`; the call site converts to a `Response` once. This
+  is the keystone — the rest of Unit 3 is awkward without it.
+- **K2 — shared request builder.** Extract `build_upstream_request(...)` (URL
+  join + hop-by-hop header strip + body-stream wrap) now duplicated **byte-for-
+  byte** in `proxy::execute` (proxy.rs:34-51) and `heartbeat::execute`
+  (heartbeat.rs:382-396). One home so the retry shim and heartbeat stay in sync.
+- **K3 — replayable body.** The spilled body is currently *moved* into
+  `ReaderStream` once (spill.rs:73), so it can't be re-read. Make the on-disk
+  prefix re-seekable per attempt (re-open/clone the temp file handle, or buffer
+  small bodies in memory and re-create the stream) so retry can replay the
+  request. Add the in-memory fast path here too (small bodies skip the temp
+  file). *(The temp file itself is tmpfs/page-cache backed — this is about
+  replay correctness, not disk-I/O perf.)*
+- **K4 — preflight error fidelity.** `PreflightError::{Request,Parse}` stringify
+  their inner error at construction (heartbeat.rs); keep the structured kind so
+  the breaker can distinguish connect vs timeout vs parse on the preflight path.
+- **I4 — testable seam.** Move `AppState` + `model_route` / `passthrough_route`
+  and their helpers out of `main.rs` into `src/handler.rs` (export `pub`), so
+  the retry wrapper has a unit-testable home and `main.rs` becomes thin wiring.
+**Test scenarios:** existing suite stays green (behaviour-preserving);
+`ProxyError` variants unit-tested; `build_upstream_request` covered once;
+spill replay re-read twice yields identical bytes; handlers callable in-process
+without a TCP round-trip.
+**Verification:** no client-visible diff; `proxy::execute` returns a typed error;
+a body can be replayed; `cargo test`/clippy/fmt clean.
+
 - [ ] **Unit 3: Backpressure + bounded retry-with-backoff + circuit breaker**
 
 **Goal:** Convert transient blips to successes via bounded backoff retry, and
 sustained saturation to honest 503+Retry-After — **without amplifying load**.
 **Requirements:** R1, R2, R3, R4, R5
-**Dependencies:** Unit 1, Unit 2
+**Dependencies:** Unit 1, Unit 2, **Unit 2.5** (typed `ProxyError`, shared
+request builder, replayable body, and `handler.rs` seam all land in 2.5)
 **Files:** Modify `src/proxy.rs` (surface structured outcome instead of pre-built
 502/504; keep streaming for the final success), new `src/resilience.rs`
-(breaker + in-flight cap + retry loop), `src/main.rs` (`model_route` 439,
-`passthrough_route` 577); tests in `src/resilience.rs` + `src/proxy.rs`.
+(breaker + in-flight cap + retry loop), `src/handler.rs` (`model_route`,
+`passthrough_route` — moved out of `main.rs` in Unit 2.5); tests in
+`src/resilience.rs` + `src/proxy.rs`.
 **Approach:** Change `execute` to return `Result<Response, ProxyError{kind}>`
 (or a `ProxyOutcome`) so the caller sees connect-refused vs timeout vs status.
 Retry loop: backoff+jitter between attempts, within latency budget; per-backend
@@ -242,6 +298,12 @@ client 200" and "5 concurrent 5xx → breaker opens → further requests get 503
 backend not hammered".
 **Patterns to follow:** existing `execute` error arms (proxy.rs:53-71) become
 typed; streaming success path unchanged.
+**Fold-in (trivial perf, from the 2026-05-31 review — only because we're already
+in these files):** drop the redundant `collect_body_to_bytes` → `Bytes::to_vec()`
+copy on the translation path (thread `Bytes` straight into the translator); and
+compute the SSE `created_at` timestamp once per stream rather than per token
+(`translate.rs`). Skip the rest of the micro-allocation findings (per-event
+`drain().collect()`, metric label clones) — negligible on I/O-bound paths.
 **Test scenarios:**
 - Happy: first attempt 200 → no retry, zero added latency.
 - Error→recover: 500 then 200 within budget → client 200 (R1/R3).

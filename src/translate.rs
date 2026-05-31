@@ -19,8 +19,9 @@ use serde_json::{Map, Value, json};
 
 /// A valid RFC 3339 timestamp. The field is required by Ollama clients but
 /// the actual value is not used for anything that matters here, so a fixed
-/// value avoids pulling in a date crate. Matches `heartbeat::FIXED_TIMESTAMP`.
-const FIXED_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
+/// value avoids pulling in a date crate. Canonical home for the epoch
+/// sentinel; `heartbeat` and `registry` reuse this constant.
+pub(crate) const FIXED_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 
 /// Translate an Ollama-native `/api/chat` request body to an OpenAI
 /// `/v1/chat/completions` body. Lifts `options.*` to the root with

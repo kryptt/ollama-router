@@ -177,20 +177,27 @@ async fn fetch_ollama_ps(client: &Client, b: &BackendSnapshot) -> Vec<Value> {
     }
 }
 
+/// Shape of llama-swap's `/running` endpoint. Shared with `heartbeat`'s
+/// preflight probe so the two views of the same endpoint can't drift apart.
+/// Each consumer reads only the fields it needs (`heartbeat`: model+state;
+/// `models`: model+cmd).
 #[derive(Deserialize)]
-struct RunningResponse {
+pub(crate) struct RunningResponse {
     #[serde(default)]
-    running: Vec<RunningEntry>,
+    pub(crate) running: Vec<RunningEntry>,
 }
 
 #[derive(Deserialize)]
-struct RunningEntry {
+pub(crate) struct RunningEntry {
     #[serde(default)]
-    model: String,
+    pub(crate) model: String,
+    /// llama-swap's load state for this model; `"ready"` means resident.
+    #[serde(default)]
+    pub(crate) state: String,
     /// Full llama-server invocation. We parse `--ctx-size` and `--parallel`
     /// out of it to synthesise a per-slot `context_length` for clients.
     #[serde(default)]
-    cmd: String,
+    pub(crate) cmd: String,
 }
 
 async fn fetch_llama_swap_running(client: &Client, b: &BackendSnapshot) -> Vec<Value> {

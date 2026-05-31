@@ -108,13 +108,32 @@ async fn main() {
         async move { registry::discovery_loop(registry, config).await }
     });
 
+    // One shutdown notify shared by both servers and the background tasks. A
+    // single OS-signal listener fans the trigger out so each drains/exits
+    // cleanly. Without this, a SIGTERM during a Fleet rolling update drops
+    // every heartbeat-wrapped stream as a TCP RST mid-response.
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    {
+        let shutdown = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            wait_for_shutdown_signal().await;
+            info!("shutdown signal received, draining in-flight requests");
+            shutdown.notify_waiters();
+        });
+    }
+
     if config.tokens_file.is_some() {
         tokio::spawn({
             let ts = Arc::clone(&token_store);
+            let shutdown = Arc::clone(&shutdown);
             async move {
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                    ts.reload().await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                            ts.reload().await;
+                        }
+                        _ = shutdown.notified() => break,
+                    }
                 }
             }
         });
@@ -159,21 +178,6 @@ async fn main() {
         "listening on {} (public) and {} (internal)",
         config.public_addr, config.internal_addr
     );
-
-    // One shutdown notify shared by both servers. A single OS-signal
-    // listener task fans the trigger out to both `with_graceful_shutdown`
-    // futures so they each drain in-flight requests before returning.
-    // Without this, a SIGTERM during a Fleet rolling update drops every
-    // heartbeat-wrapped stream as a TCP RST mid-response.
-    let shutdown = Arc::new(tokio::sync::Notify::new());
-    {
-        let shutdown = Arc::clone(&shutdown);
-        tokio::spawn(async move {
-            wait_for_shutdown_signal().await;
-            info!("shutdown signal received, draining in-flight requests");
-            shutdown.notify_waiters();
-        });
-    }
 
     let public_shutdown = Arc::clone(&shutdown);
     let internal_shutdown = Arc::clone(&shutdown);

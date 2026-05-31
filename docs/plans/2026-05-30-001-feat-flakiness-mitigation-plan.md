@@ -231,7 +231,7 @@ case), primary first.
   absent model → empty.
 **Verification:** returns 1 for embedders; ordering/filtering correct.
 
-- [ ] **Unit 2.5: Proxy retry-readiness refactor** *(prerequisite for Unit 3; from the 2026-05-31 architectural review)*
+- [x] **Unit 2.5: Proxy retry-readiness refactor** *(prerequisite for Unit 3; from the 2026-05-31 architectural review)* — **K1, K2, K4, I4 done; K3 moved to Unit 3** (replay API is best co-designed with the retry loop that consumes it).
 
 **Goal:** Reshape the proxy layer so Unit 3's retry loop + circuit breaker drop
 in cleanly, instead of fighting the current structure or re-duplicating logic.
@@ -251,13 +251,12 @@ new `src/handler.rs` (move out of `main.rs`); tests in-file.
   join + hop-by-hop header strip + body-stream wrap) now duplicated **byte-for-
   byte** in `proxy::execute` (proxy.rs:34-51) and `heartbeat::execute`
   (heartbeat.rs:382-396). One home so the retry shim and heartbeat stay in sync.
-- **K3 — replayable body.** The spilled body is currently *moved* into
-  `ReaderStream` once (spill.rs:73), so it can't be re-read. Make the on-disk
-  prefix re-seekable per attempt (re-open/clone the temp file handle, or buffer
-  small bodies in memory and re-create the stream) so retry can replay the
-  request. Add the in-memory fast path here too (small bodies skip the temp
-  file). *(The temp file itself is tmpfs/page-cache backed — this is about
-  replay correctness, not disk-I/O perf.)*
+- **K3 — replayable body.** *(MOVED to Unit 3.)* The spilled body is currently
+  *moved* into `ReaderStream` once (spill.rs:73), so it can't be re-read. The
+  replay API (re-seekable temp file and/or in-memory buffering of small bodies)
+  is best designed alongside the retry loop that consumes it, so it now lives in
+  Unit 3 rather than being built speculatively here. *(The temp file itself is
+  tmpfs/page-cache backed — this is replay correctness, not disk-I/O perf.)*
 - **K4 — preflight error fidelity.** `PreflightError::{Request,Parse}` stringify
   their inner error at construction (heartbeat.rs); keep the structured kind so
   the breaker can distinguish connect vs timeout vs parse on the preflight path.
@@ -278,11 +277,13 @@ sustained saturation to honest 503+Retry-After — **without amplifying load**.
 **Requirements:** R1, R2, R3, R4, R5
 **Dependencies:** Unit 1, Unit 2, **Unit 2.5** (typed `ProxyError`, shared
 request builder, replayable body, and `handler.rs` seam all land in 2.5)
-**Files:** Modify `src/proxy.rs` (surface structured outcome instead of pre-built
-502/504; keep streaming for the final success), new `src/resilience.rs`
-(breaker + in-flight cap + retry loop), `src/handler.rs` (`model_route`,
-`passthrough_route` — moved out of `main.rs` in Unit 2.5); tests in
-`src/resilience.rs` + `src/proxy.rs`.
+**Files:** Modify `src/proxy.rs` (typed outcome already in place from Unit 2.5;
+keep streaming for the final success), new `src/resilience.rs` (breaker +
+in-flight cap + retry loop), `src/handler.rs` (`model_route`, `passthrough_route`
+— now in the library, with the retry wrapper injectable here), `src/spill.rs`
+(**K3 — replayable body:** re-seekable temp file and/or in-memory buffering of
+small bodies, designed against the retry loop's replay needs); tests in
+`src/resilience.rs` + `src/proxy.rs` + `src/spill.rs`.
 **Approach:** Change `execute` to return `Result<Response, ProxyError{kind}>`
 (or a `ProxyOutcome`) so the caller sees connect-refused vs timeout vs status.
 Retry loop: backoff+jitter between attempts, within latency budget; per-backend

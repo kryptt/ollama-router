@@ -272,6 +272,15 @@ a body can be replayed; `cargo test`/clippy/fmt clean.
 
 - [ ] **Unit 3: Backpressure + bounded retry-with-backoff + circuit breaker**
 
+> **ON HOLD (2026-06-01) — pending data.** The dominant flakiness was the
+> macvlan-watchdog pod churn (now fixed: watchdog corrected + macvlan dropped +
+> 2 replicas; 0.11.0 deployed). Build Unit 3 only if the 0.11.0 self-health
+> metrics show genuine transient backend 5xx still aborting jobs — watch
+> `upstream_errors{kind=connect|timeout|transport}` and
+> `requests_total{status_code=5xx}` on `llama-swap-cuda` under grepai bulk load.
+> If they stay quiet, close the plan instead. Scope if built: same-backend
+> retry + breaker (embedder is single-homed).
+
 **Goal:** Convert transient blips to successes via bounded backoff retry, and
 sustained saturation to honest 503+Retry-After — **without amplifying load**.
 **Requirements:** R1, R2, R3, R4, R5

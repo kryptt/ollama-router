@@ -74,7 +74,7 @@ backend wiring:
 
 | Var | Default | Purpose |
 |---|---|---|
-| `OLLAMA_ROUTER_BACKENDS` | `ollama-cuda=http://ollama-cuda.ai:11434,ollama-rocm=http://ollama-rocm.ai:11435` | Comma-separated `name=url` pairs. Models are routed first-writer-wins across this list in declaration order. |
+| `OLLAMA_ROUTER_BACKENDS` | `ollama=http://localhost:11434` | Comma-separated `name=url` pairs. Models are routed first-writer-wins across this list in declaration order. |
 | `OLLAMA_ROUTER_PUBLIC_PORT` | `11434` | Port for the public OpenAI/Ollama-compat surface. |
 | `OLLAMA_ROUTER_INTERNAL_PORT` | `9090` | Port for `/health`, `/status`, `/metrics`, `/auth`. |
 | `OLLAMA_ROUTER_DISCOVERY_INTERVAL` | `60` | Seconds between backend model-list refreshes. |

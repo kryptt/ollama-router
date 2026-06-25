@@ -102,11 +102,9 @@ fn defaults_are_sane() {
     let _lock = ENV_LOCK.lock().unwrap();
     unsafe { clear_env() };
     let config = Config::from_env().unwrap();
-    assert_eq!(config.backends.len(), 2);
-    assert_eq!(config.backends[0].name, "ollama-cuda");
-    assert_eq!(config.backends[0].url, "http://ollama-cuda.ai:11434");
-    assert_eq!(config.backends[1].name, "ollama-rocm");
-    assert_eq!(config.backends[1].url, "http://ollama-rocm.ai:11435");
+    assert_eq!(config.backends.len(), 1);
+    assert_eq!(config.backends[0].name, "ollama");
+    assert_eq!(config.backends[0].url, "http://localhost:11434");
     assert_eq!(config.discovery_interval_secs, 60);
     assert_eq!(config.grace_period_secs(), 180);
     assert!(config.tokens_file.is_none());

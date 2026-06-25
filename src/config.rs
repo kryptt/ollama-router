@@ -189,11 +189,8 @@ impl Default for Config {
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let backends_str = env::var("OLLAMA_ROUTER_BACKENDS").unwrap_or_else(|_| {
-            "ollama-cuda=http://ollama-cuda.ai:11434,\
-             ollama-rocm=http://ollama-rocm.ai:11435"
-                .to_string()
-        });
+        let backends_str = env::var("OLLAMA_ROUTER_BACKENDS")
+            .unwrap_or_else(|_| "ollama=http://localhost:11434".to_string());
 
         let backends: Vec<Backend> = backends_str
             .split(',')

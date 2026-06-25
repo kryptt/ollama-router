@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,7 +18,7 @@ use ollama_router::registry;
 use ollama_router::routes::ROUTED_PATHS;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
@@ -42,7 +44,7 @@ async fn main() {
         info!("OTLP tracing enabled");
     }
 
-    let config = Config::from_env().expect("invalid configuration");
+    let config = Config::from_env()?;
 
     info!(
         backends = config.backends.len(),
@@ -71,8 +73,7 @@ async fn main() {
             .pool_max_idle_per_host(10)
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
             .timeout(Duration::from_secs(config.request_timeout_secs))
-            .build()
-            .expect("failed to build HTTP client"),
+            .build()?,
     );
 
     let heartbeat_cfg = HeartbeatConfig::from_secs(
@@ -173,10 +174,10 @@ async fn main() {
 
     let public_listener = TcpListener::bind(config.public_addr)
         .await
-        .expect("failed to bind public port");
+        .map_err(|e| format!("failed to bind public port {}: {e}", config.public_addr))?;
     let internal_listener = TcpListener::bind(config.internal_addr)
         .await
-        .expect("failed to bind internal port");
+        .map_err(|e| format!("failed to bind internal port {}: {e}", config.internal_addr))?;
 
     info!(
         "listening on {} (public) and {} (internal)",
@@ -209,6 +210,7 @@ async fn main() {
     }
 
     info!("server stopped");
+    Ok(())
 }
 
 /// Resolve when the process receives SIGTERM, SIGINT, or Ctrl-C.
@@ -217,16 +219,28 @@ async fn main() {
 /// fires — both halves are racing in `tokio::select!`.
 async fn wait_for_shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("install Ctrl-C handler");
+        // If the Ctrl-C handler can't be installed, log and never resolve this
+        // arm — the SIGTERM arm (and the servers' own lifecycles) still govern
+        // shutdown. A failed handler must not panic the process.
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %e, "failed to install Ctrl-C handler; ignoring");
+            std::future::pending::<()>().await;
+        }
     };
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                // Same fallback as Ctrl-C: log and park this arm forever rather
+                // than aborting. Kubernetes SIGTERM-driven shutdown is degraded,
+                // but the process stays up and serves until killed.
+                tracing::warn!(error = %e, "failed to install SIGTERM handler; ignoring");
+                std::future::pending::<()>().await;
+            }
+        }
     };
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();

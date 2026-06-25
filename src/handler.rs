@@ -223,8 +223,12 @@ pub async fn model_route(
     // against a backend that isn't currently hosting the model in memory.
     // Anything else (non-streaming, embeddings, tags, etc.) just proxies
     // directly — those requests don't suffer from idle-chunk timeouts.
+    // Compute the path's streaming protocol once; the heartbeat decision and
+    // the heartbeat branch both consume this single value, so the protocol is
+    // never re-derived (and never needs an "infallible" unwrap downstream).
+    let protocol = StreamProtocol::from_path(uri.path());
     let use_heartbeat = spilled.stream
-        && StreamProtocol::from_path(uri.path()).is_some()
+        && protocol.is_some()
         && !preflight_model_loaded(&state, &backend_url, &backend_name, &spilled.model).await;
 
     let upstream_path: Option<&str> = if needs_translation {
@@ -233,8 +237,7 @@ pub async fn model_route(
         None
     };
 
-    let response = if use_heartbeat {
-        let protocol = StreamProtocol::from_path(uri.path()).expect("checked above");
+    let response = if let (true, Some(protocol)) = (use_heartbeat, protocol) {
         state.metrics.heartbeat_engaged.inc();
         tracing::info!(
             model = %spilled.model,
@@ -307,7 +310,7 @@ pub async fn model_route(
     // supports streaming. For /api/embed and /api/show this is always
     // false even when the body's stream flag (defaulted) reads true,
     // because those endpoints return a single JSON regardless.
-    let actually_streams = spilled.stream && StreamProtocol::from_path(uri.path()).is_some();
+    let actually_streams = spilled.stream && protocol.is_some();
 
     state
         .metrics

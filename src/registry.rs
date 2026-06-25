@@ -235,10 +235,16 @@ pub fn new_shared(config: &Config) -> SharedRegistry {
 
 /// Long-running discovery loop. Runs first cycle immediately, then every `interval`.
 pub async fn discovery_loop(registry: SharedRegistry, config: Config) {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .expect("failed to build discovery HTTP client");
+    let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
+        Ok(client) => client,
+        Err(e) => {
+            // Discovery can't run without an HTTP client. Log and bail out of
+            // this background task rather than aborting the whole process —
+            // the router can still proxy to statically-configured backends.
+            warn!(error = %e, "failed to build discovery HTTP client; discovery disabled");
+            return;
+        }
+    };
 
     let interval = Duration::from_secs(config.discovery_interval_secs);
     let grace_duration = Duration::from_secs(config.grace_period_secs());

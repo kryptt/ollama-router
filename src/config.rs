@@ -27,15 +27,14 @@ impl EscalationRule {
     /// Parse a `from:max_input_tokens:to` triple. All three fields must be
     /// non-empty; the middle field must be a positive integer.
     fn parse(entry: &str) -> Result<Self, ConfigError> {
+        let err = || ConfigError::InvalidEscalation(entry.to_string());
         let parts: Vec<&str> = entry.trim().split(':').collect();
         if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
-            return Err(ConfigError::InvalidEscalation(entry.to_string()));
+            return Err(err());
         }
-        let max_input_tokens: usize = parts[1]
-            .parse()
-            .map_err(|_| ConfigError::InvalidEscalation(entry.to_string()))?;
+        let max_input_tokens: usize = parts[1].parse().map_err(|_| err())?;
         if max_input_tokens == 0 {
-            return Err(ConfigError::InvalidEscalation(entry.to_string()));
+            return Err(err());
         }
         Ok(EscalationRule {
             from_model: parts[0].to_string(),
@@ -393,30 +392,40 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// Read an env var, trim it, and hand the trimmed value to `parser`.
+/// Missing vars fall back to `default`; present-but-unparseable values are
+/// rejected by `parser`.
+fn parse_env<T>(
+    key: &'static str,
+    default: T,
+    parser: impl FnOnce(&str) -> Result<T, ConfigError>,
+) -> Result<T, ConfigError> {
+    match env::var(key) {
+        Ok(val) => parser(val.trim()),
+        Err(_) => Ok(default),
+    }
+}
+
 /// Parse an integer env var. Surrounding whitespace is ignored; a missing var
 /// falls back to `default`, while a present-but-unparseable value is rejected.
 fn parse_env_u64(key: &'static str, default: u64) -> Result<u64, ConfigError> {
-    match env::var(key) {
-        Ok(val) => val.trim().parse().map_err(|_| ConfigError::InvalidValue {
+    parse_env(key, default, |s| {
+        s.parse().map_err(|_| ConfigError::InvalidValue {
             key,
-            value: val.trim().to_string(),
-        }),
-        Err(_) => Ok(default),
-    }
+            value: s.to_string(),
+        })
+    })
 }
 
 /// Parse a boolean env var. Accepts (case-insensitive, whitespace-trimmed)
 /// `true/false`, `1/0`, `yes/no`, `on/off`; anything else is rejected.
 fn parse_env_bool(key: &'static str, default: bool) -> Result<bool, ConfigError> {
-    match env::var(key) {
-        Ok(val) => match val.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => Ok(true),
-            "false" | "0" | "no" | "off" => Ok(false),
-            _ => Err(ConfigError::InvalidBool {
-                key,
-                value: val.trim().to_string(),
-            }),
-        },
-        Err(_) => Ok(default),
-    }
+    parse_env(key, default, |s| match s.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(ConfigError::InvalidBool {
+            key,
+            value: s.to_string(),
+        }),
+    })
 }

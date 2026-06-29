@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_util::Stream;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 /// A valid RFC 3339 timestamp. The field is required by Ollama clients but
 /// the actual value is not used for anything that matters here, so a fixed
@@ -63,6 +63,67 @@ pub fn ollama_chat_to_openai_request(bytes: &[u8]) -> Result<Vec<u8>, serde_json
     serde_json::to_vec(&root)
 }
 
+/// Build the common Ollama message frame shared by streaming deltas and
+/// non-streaming responses.  Callers merge additional fields (done,
+/// usage counters, etc.) into the returned object.
+fn ollama_message_frame(model: &str, content: &Value) -> Value {
+    json!({
+        "model": model,
+        "created_at": current_timestamp(),
+        "message": { "role": "assistant", "content": content },
+    })
+}
+
+/// Build a terminal `done:true` Ollama frame with timing stubs and token
+/// counts.  Shared by non-streaming `openai_chat_to_ollama_response` and
+/// the streaming adapter's `final_frame`.
+fn done_frame(
+    model: &str,
+    content: &Value,
+    finish_reason: Value,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> Value {
+    let mut out = ollama_message_frame(model, content);
+    let frame = out
+        .as_object_mut()
+        .unwrap_or_else(|| unreachable!("ollama_message_frame always returns an object"));
+    frame.insert("done".into(), json!(true));
+    frame.insert("done_reason".into(), finish_reason);
+    frame.insert("total_duration".into(), json!(0u64));
+    frame.insert("load_duration".into(), json!(0u64));
+    frame.insert("prompt_eval_count".into(), json!(prompt_tokens));
+    frame.insert("prompt_eval_duration".into(), json!(0u64));
+    frame.insert("eval_count".into(), json!(completion_tokens));
+    frame.insert("eval_duration".into(), json!(0u64));
+    out
+}
+
+/// Extract a `u64` token count from an optional usage object.
+///
+/// `extract_token_count(resp.get("usage"), "prompt_tokens")` is the canonical
+/// form; returns `0` when the field is absent or non-numeric.
+fn extract_token_count(usage: Option<&Value>, key: &str) -> u64 {
+    usage
+        .and_then(|u| u.get(key))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+}
+
+/// Extract the `content` string from the first choice of an OpenAI response or
+/// delta chunk.
+///
+/// `msg_field` is `"message"` for non-streaming responses and `"delta"` for
+/// streaming chunks. Returns an empty-string `Value` when absent.
+fn extract_content_from_choice(resp: &Value, msg_field: &str) -> Value {
+    resp.get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get(msg_field))
+        .and_then(|m| m.get("content"))
+        .cloned()
+        .unwrap_or_else(|| Value::String(String::new()))
+}
+
 /// Translate a non-streaming OpenAI `/v1/chat/completions` response into the
 /// Ollama `/api/chat` non-streaming shape. `model_name` is the model the
 /// client originally asked for (post-escalation).
@@ -73,43 +134,23 @@ pub fn openai_chat_to_ollama_response(
     let resp: Value = serde_json::from_slice(bytes)?;
 
     let choice = resp.get("choices").and_then(|c| c.get(0));
-    let content = choice
-        .and_then(|c| c.get("message"))
-        .and_then(|m| m.get("content"))
-        .cloned()
-        .unwrap_or_else(|| Value::String(String::new()));
+    let content = extract_content_from_choice(&resp, "message");
     let finish_reason = choice
         .and_then(|c| c.get("finish_reason"))
         .cloned()
         .unwrap_or(Value::Null);
 
     let usage = resp.get("usage");
-    let prompt_tokens = usage
-        .and_then(|u| u.get("prompt_tokens"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let completion_tokens = usage
-        .and_then(|u| u.get("completion_tokens"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let prompt_tokens = extract_token_count(usage, "prompt_tokens");
+    let completion_tokens = extract_token_count(usage, "completion_tokens");
 
-    let out = json!({
-        "model": model_name,
-        "created_at": current_timestamp(),
-        "message": {
-            "role": "assistant",
-            "content": content,
-        },
-        "done": true,
-        "done_reason": finish_reason,
-        "total_duration": 0u64,
-        "load_duration": 0u64,
-        "prompt_eval_count": prompt_tokens,
-        "prompt_eval_duration": 0u64,
-        "eval_count": completion_tokens,
-        "eval_duration": 0u64,
-    });
-
+    let out = done_frame(
+        model_name,
+        &content,
+        finish_reason,
+        prompt_tokens,
+        completion_tokens,
+    );
     serde_json::to_vec(&out)
 }
 
@@ -212,11 +253,7 @@ impl<S> SseToNdjson<S> {
     /// the final `done:true` frame.
     fn handle_chunk(&mut self, value: Value) {
         let choice = value.get("choices").and_then(|c| c.get(0));
-        let content = choice
-            .and_then(|c| c.get("delta"))
-            .and_then(|d| d.get("content"))
-            .cloned()
-            .unwrap_or_else(|| Value::String(String::new()));
+        let content = extract_content_from_choice(&value, "delta");
 
         if let Some(fr) = choice.and_then(|c| c.get("finish_reason"))
             && !fr.is_null()
@@ -225,10 +262,12 @@ impl<S> SseToNdjson<S> {
         }
 
         if let Some(usage) = value.get("usage") {
-            if let Some(p) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
+            let p = extract_token_count(Some(usage), "prompt_tokens");
+            if p > 0 {
                 self.prompt_tokens = p;
             }
-            if let Some(c) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+            let c = extract_token_count(Some(usage), "completion_tokens");
+            if c > 0 {
                 self.completion_tokens = c;
             }
         }
@@ -238,12 +277,11 @@ impl<S> SseToNdjson<S> {
         // chunk) carries no token for the Ollama client.
         let has_content = content.as_str().is_some_and(|s| !s.is_empty());
         if has_content {
-            let chunk = json!({
-                "model": self.model,
-                "created_at": current_timestamp(),
-                "message": { "role": "assistant", "content": content },
-                "done": false,
-            });
+            let mut chunk = ollama_message_frame(&self.model, &content);
+            chunk
+                .as_object_mut()
+                .unwrap_or_else(|| unreachable!("ollama_message_frame always returns an object"))
+                .insert("done".into(), json!(false));
             let line = format!("{chunk}\n");
             self.out.push_back(Bytes::from(line));
         }
@@ -251,23 +289,15 @@ impl<S> SseToNdjson<S> {
 
     /// Build the terminal `done:true` Ollama frame from accumulated stats.
     fn final_frame(&self) -> Bytes {
-        let mut frame = Map::new();
-        frame.insert("model".to_string(), json!(self.model));
-        frame.insert("created_at".to_string(), json!(current_timestamp()));
-        frame.insert(
-            "message".to_string(),
-            json!({ "role": "assistant", "content": "" }),
+        let empty = Value::String(String::new());
+        let out = done_frame(
+            &self.model,
+            &empty,
+            self.finish_reason.clone(),
+            self.prompt_tokens,
+            self.completion_tokens,
         );
-        frame.insert("done".to_string(), Value::Bool(true));
-        frame.insert("done_reason".to_string(), self.finish_reason.clone());
-        frame.insert("total_duration".to_string(), json!(0u64));
-        frame.insert("load_duration".to_string(), json!(0u64));
-        frame.insert("prompt_eval_count".to_string(), json!(self.prompt_tokens));
-        frame.insert("prompt_eval_duration".to_string(), json!(0u64));
-        frame.insert("eval_count".to_string(), json!(self.completion_tokens));
-        frame.insert("eval_duration".to_string(), json!(0u64));
-        let s = format!("{}\n", Value::Object(frame));
-        Bytes::from(s)
+        Bytes::from(format!("{out}\n"))
     }
 }
 
@@ -365,6 +395,27 @@ mod tests {
     use super::*;
     use futures_util::StreamExt;
     use futures_util::stream;
+    use serde_json::Map;
+
+    const SSE_DONE: &str = "data: [DONE]\n\n";
+
+    fn parse_request(input: &[u8]) -> Value {
+        let out = ollama_chat_to_openai_request(input).unwrap();
+        serde_json::from_slice(&out).unwrap()
+    }
+
+    fn parse_response(input: &[u8], model: &str) -> Value {
+        serde_json::from_slice(&openai_chat_to_ollama_response(input, model).unwrap()).unwrap()
+    }
+
+    fn assert_done_frame(lines: &[String], index: usize, expected_reason: &str) {
+        let frame = parse_ndjson_line(&lines[index]);
+        assert_eq!(frame["done"], true, "expected done=true at line {index}");
+        assert_eq!(
+            frame["done_reason"], expected_reason,
+            "wrong done_reason at line {index}"
+        );
+    }
 
     // ── request translation ──────────────────────────────────────────────
 
@@ -386,8 +437,7 @@ mod tests {
             },
             "keep_alive": "30m"
         }"#;
-        let out = ollama_chat_to_openai_request(input).unwrap();
-        let v: Value = serde_json::from_slice(&out).unwrap();
+        let v = parse_request(input);
 
         assert!(v.get("options").is_none(), "options must be flattened away");
         assert!(
@@ -417,8 +467,7 @@ mod tests {
             "tools": [{"type": "function", "function": {"name": "f"}}],
             "tool_choice": "auto"
         }"#;
-        let out = ollama_chat_to_openai_request(input).unwrap();
-        let v: Value = serde_json::from_slice(&out).unwrap();
+        let v = parse_request(input);
         assert_eq!(v["format"], "json");
         assert_eq!(v["tools"][0]["function"]["name"], "f");
         assert_eq!(v["tool_choice"], "auto");
@@ -427,8 +476,7 @@ mod tests {
     #[test]
     fn request_with_no_options_is_a_no_op_aside_from_keep_alive() {
         let input = br#"{"model": "x", "messages": [], "keep_alive": "1h"}"#;
-        let out = ollama_chat_to_openai_request(input).unwrap();
-        let v: Value = serde_json::from_slice(&out).unwrap();
+        let v = parse_request(input);
         assert_eq!(v["model"], "x");
         assert!(v.get("keep_alive").is_none());
     }
@@ -449,8 +497,7 @@ mod tests {
             "custom": "root_value",
             "options": { "custom": "options_value" }
         }"#;
-        let out = ollama_chat_to_openai_request(input).unwrap();
-        let v: Value = serde_json::from_slice(&out).unwrap();
+        let v = parse_request(input);
         assert_eq!(v["custom"], "root_value");
     }
 
@@ -462,7 +509,7 @@ mod tests {
             "id": "chatcmpl-x",
             "object": "chat.completion",
             "created": 1234567890,
-            "model": "qwen3.6-medium",
+            "model": "glm-4.7-flash",
             "choices": [
                 {
                     "index": 0,
@@ -472,10 +519,9 @@ mod tests {
             ],
             "usage": {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17}
         }"#;
-        let out = openai_chat_to_ollama_response(input, "qwen3.6-medium").unwrap();
-        let v: Value = serde_json::from_slice(&out).unwrap();
+        let v = parse_response(input, "glm-4.7-flash");
 
-        assert_eq!(v["model"], "qwen3.6-medium");
+        assert_eq!(v["model"], "glm-4.7-flash", "response model");
         assert_eq!(v["done"], true);
         assert_eq!(v["done_reason"], "stop");
         assert_eq!(v["message"]["role"], "assistant");
@@ -490,21 +536,37 @@ mod tests {
         let input = br#"{
             "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}]
         }"#;
-        let out = openai_chat_to_ollama_response(input, "m").unwrap();
-        let v: Value = serde_json::from_slice(&out).unwrap();
+        let v = parse_response(input, "m");
         assert_eq!(v["prompt_eval_count"], 0);
         assert_eq!(v["eval_count"], 0);
     }
 
     #[test]
     fn response_missing_choices_yields_empty_content() {
-        let out = openai_chat_to_ollama_response(b"{}", "m").unwrap();
-        let v: Value = serde_json::from_slice(&out).unwrap();
+        let v = parse_response(b"{}", "m");
         assert_eq!(v["message"]["content"], "");
         assert_eq!(v["done"], true);
     }
 
     // ── streaming translation ────────────────────────────────────────────
+
+    fn parse_ndjson_line(line: &str) -> Value {
+        serde_json::from_str(line).unwrap()
+    }
+
+    async fn run_translation(chunks: Vec<Result<Bytes, std::io::Error>>) -> Vec<String> {
+        let upstream = stream::iter(chunks);
+        let out = translate_streaming_response(upstream, "m".to_string());
+        collect(out).await
+    }
+
+    /// Build SSE chunks from event strings, append the `[DONE]` sentinel, and
+    /// run the full translation pipeline in one call.
+    async fn translate_sse(events: Vec<Result<Bytes, std::io::Error>>) -> Vec<String> {
+        let mut chunks = events;
+        chunks.push(Ok(Bytes::from(SSE_DONE)));
+        run_translation(chunks).await
+    }
 
     fn sse_chunk(content: &str, finish: Option<&str>) -> String {
         let mut delta = Map::new();
@@ -541,29 +603,24 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_three_deltas_then_done() {
-        let chunks = vec![
-            Ok::<Bytes, std::io::Error>(Bytes::from(sse_chunk("hello", None))),
-            Ok(Bytes::from(sse_chunk(" ", None))),
-            Ok(Bytes::from(sse_chunk("world", Some("stop")))),
-            Ok(Bytes::from("data: [DONE]\n\n")),
-        ];
-        let upstream = stream::iter(chunks);
-        let out = translate_streaming_response(upstream, "m".to_string());
-        let lines = collect(out).await;
+        let lines = translate_sse(vec![
+            sse_ok("hello", None),
+            sse_ok(" ", None),
+            sse_ok("world", Some("stop")),
+        ])
+        .await;
 
         // 3 deltas with content + 1 final done:true frame
         assert_eq!(lines.len(), 4, "got {} lines: {lines:?}", lines.len());
 
         for (i, expected_content) in ["hello", " ", "world"].iter().enumerate() {
-            let v: Value = serde_json::from_str(&lines[i]).unwrap();
+            let v = parse_ndjson_line(&lines[i]);
             assert_eq!(v["done"], false);
             assert_eq!(v["model"], "m");
             assert_eq!(v["message"]["role"], "assistant");
             assert_eq!(v["message"]["content"], *expected_content);
         }
-        let last: Value = serde_json::from_str(&lines[3]).unwrap();
-        assert_eq!(last["done"], true);
-        assert_eq!(last["done_reason"], "stop");
+        assert_done_frame(&lines, 3, "stop");
     }
 
     #[tokio::test]
@@ -572,56 +629,41 @@ mod tests {
         // the buffer joins them correctly before parsing.
         let event = sse_chunk("hello", None);
         let split = event.len() / 2;
-        let chunks = vec![
+        let lines = translate_sse(vec![
             Ok::<Bytes, std::io::Error>(Bytes::from(event[..split].to_string())),
             Ok(Bytes::from(event[split..].to_string())),
-            Ok(Bytes::from("data: [DONE]\n\n")),
-        ];
-        let upstream = stream::iter(chunks);
-        let out = translate_streaming_response(upstream, "m".to_string());
-        let lines = collect(out).await;
+        ])
+        .await;
 
-        assert_eq!(lines.len(), 2);
-        let v: Value = serde_json::from_str(&lines[0]).unwrap();
-        assert_eq!(v["message"]["content"], "hello");
-        let last: Value = serde_json::from_str(&lines[1]).unwrap();
-        assert_eq!(last["done"], true);
+        assert_eq!(parse_ndjson_line(&lines[0])["message"]["content"], "hello");
+        assert_eq!(
+            parse_ndjson_line(&lines[1])["done"],
+            true,
+            "split-mid-event"
+        );
     }
 
     #[tokio::test]
     async fn streaming_handles_multiple_events_in_one_chunk() {
-        let mut blob = String::new();
-        blob.push_str(&sse_chunk("a", None));
-        blob.push_str(&sse_chunk("b", Some("stop")));
-        blob.push_str("data: [DONE]\n\n");
-        let upstream = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(blob))]);
-        let out = translate_streaming_response(upstream, "m".to_string());
-        let lines = collect(out).await;
+        // All events arrive in a single Bytes chunk, including [DONE].
+        let blob = format!(
+            "{}{}{SSE_DONE}",
+            sse_chunk("a", None),
+            sse_chunk("b", Some("stop"))
+        );
+        let lines = run_translation(vec![Ok::<Bytes, std::io::Error>(Bytes::from(blob))]).await;
         assert_eq!(lines.len(), 3, "got {lines:?}");
-        let v0: Value = serde_json::from_str(&lines[0]).unwrap();
-        assert_eq!(v0["message"]["content"], "a");
-        let v1: Value = serde_json::from_str(&lines[1]).unwrap();
-        assert_eq!(v1["message"]["content"], "b");
-        let v2: Value = serde_json::from_str(&lines[2]).unwrap();
-        assert_eq!(v2["done"], true);
-        assert_eq!(v2["done_reason"], "stop");
+        assert_eq!(parse_ndjson_line(&lines[0])["message"]["content"], "a");
+        assert_eq!(parse_ndjson_line(&lines[1])["message"]["content"], "b");
+        assert_done_frame(&lines, 2, "stop");
     }
 
     #[tokio::test]
     async fn streaming_eof_without_done_still_closes() {
-        // No `[DONE]` sentinel — upstream just stops. The adapter must
-        // still emit a final done:true frame so the client doesn't hang.
-        let chunks = vec![Ok::<Bytes, std::io::Error>(Bytes::from(sse_chunk(
-            "x",
-            Some("length"),
-        )))];
-        let upstream = stream::iter(chunks);
-        let out = translate_streaming_response(upstream, "m".to_string());
-        let lines = collect(out).await;
-        assert_eq!(lines.len(), 2);
-        let last: Value = serde_json::from_str(&lines[1]).unwrap();
-        assert_eq!(last["done"], true);
-        assert_eq!(last["done_reason"], "length");
+        // No [DONE] sentinel -- upstream just stops. Adapter must emit done:true.
+        let lines = translate_sse(vec![sse_ok("x", Some("length"))]).await;
+        assert_eq!(lines.len(), 2, "eof-without-done");
+        assert_done_frame(&lines, 1, "length");
     }
 
     #[tokio::test]
@@ -631,17 +673,13 @@ mod tests {
         // so the adapter must drop it (otherwise clients see a confusing
         // empty NDJSON frame with done:false).
         let prime = r#"data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}"#;
-        let chunks = vec![
+        let lines = translate_sse(vec![
             Ok::<Bytes, std::io::Error>(Bytes::from(format!("{prime}\n\n"))),
-            Ok(Bytes::from(sse_chunk("x", Some("stop")))),
-            Ok(Bytes::from("data: [DONE]\n\n")),
-        ];
-        let upstream = stream::iter(chunks);
-        let out = translate_streaming_response(upstream, "m".to_string());
-        let lines = collect(out).await;
+            sse_ok("x", Some("stop")),
+        ])
+        .await;
         assert_eq!(lines.len(), 2, "expected priming delta dropped: {lines:?}");
-        let v: Value = serde_json::from_str(&lines[0]).unwrap();
-        assert_eq!(v["message"]["content"], "x");
+        assert_eq!(parse_ndjson_line(&lines[0])["message"]["content"], "x");
     }
 
     #[tokio::test]
@@ -650,18 +688,19 @@ mod tests {
         // content but populated usage. The adapter must thread that into
         // the terminal done:true frame.
         let usage_chunk = r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}"#;
-        let chunks = vec![
-            Ok::<Bytes, std::io::Error>(Bytes::from(sse_chunk("hi", None))),
+        let lines = translate_sse(vec![
+            sse_ok("hi", None),
             Ok(Bytes::from(format!("{usage_chunk}\n\n"))),
-            Ok(Bytes::from("data: [DONE]\n\n")),
-        ];
-        let upstream = stream::iter(chunks);
-        let out = translate_streaming_response(upstream, "m".to_string());
-        let lines = collect(out).await;
-        let last: Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+        ])
+        .await;
+        let last = parse_ndjson_line(lines.last().unwrap());
         assert_eq!(last["done"], true);
         assert_eq!(last["prompt_eval_count"], 7);
         assert_eq!(last["eval_count"], 3);
+    }
+
+    fn sse_ok(content: &str, finish: Option<&str>) -> Result<Bytes, std::io::Error> {
+        Ok(Bytes::from(sse_chunk(content, finish)))
     }
 
     // ── helpers ─────────────────────────────────────────────────────────

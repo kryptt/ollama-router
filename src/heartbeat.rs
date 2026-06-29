@@ -34,7 +34,9 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+#[cfg(test)]
+use axum::http::{HeaderMap, Method};
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -114,24 +116,12 @@ impl StreamProtocol {
     /// valid chunk with empty content and `done: false`.
     pub fn heartbeat(self, model: &str) -> Bytes {
         match self {
-            Self::OllamaChat => {
-                let chunk = json!({
-                    "model": model,
-                    "created_at": FIXED_TIMESTAMP,
-                    "message": { "role": "assistant", "content": "" },
-                    "done": false,
-                });
-                Bytes::from(format!("{chunk}\n"))
-            }
-            Self::OllamaGenerate => {
-                let chunk = json!({
-                    "model": model,
-                    "created_at": FIXED_TIMESTAMP,
-                    "response": "",
-                    "done": false,
-                });
-                Bytes::from(format!("{chunk}\n"))
-            }
+            Self::OllamaChat => ollama_ndjson_heartbeat(
+                model,
+                "message",
+                json!({"role": "assistant", "content": ""}),
+            ),
+            Self::OllamaGenerate => ollama_ndjson_heartbeat(model, "response", json!("")),
             Self::OpenAiSse | Self::AnthropicSse => {
                 Bytes::from_static(b": ollama-router heartbeat\n\n")
             }
@@ -143,16 +133,7 @@ impl StreamProtocol {
     /// change the HTTP status.
     pub fn error_event(self, model: &str, message: &str) -> Bytes {
         match self {
-            Self::OllamaChat => {
-                let chunk = json!({
-                    "model": model,
-                    "created_at": FIXED_TIMESTAMP,
-                    "error": message,
-                    "done": true,
-                });
-                Bytes::from(format!("{chunk}\n"))
-            }
-            Self::OllamaGenerate => {
+            Self::OllamaChat | Self::OllamaGenerate => {
                 let chunk = json!({
                     "model": model,
                     "created_at": FIXED_TIMESTAMP,
@@ -176,6 +157,27 @@ impl StreamProtocol {
             }
         }
     }
+}
+
+/// Build a single Ollama NDJSON heartbeat chunk with a variable content field.
+///
+/// Used by [`StreamProtocol::heartbeat`] to share the boilerplate between
+/// `OllamaChat` (`"message": {…}`) and `OllamaGenerate` (`"response": ""`).
+fn ollama_ndjson_heartbeat(
+    model: &str,
+    content_field: &str,
+    content_value: serde_json::Value,
+) -> Bytes {
+    let mut chunk = json!({
+        "model": model,
+        "created_at": FIXED_TIMESTAMP,
+        "done": false,
+    });
+    chunk
+        .as_object_mut()
+        .unwrap_or_else(|| unreachable!("json! object literal is always an object"))
+        .insert(content_field.to_string(), content_value);
+    Bytes::from(format!("{chunk}\n"))
 }
 
 // `FIXED_TIMESTAMP` is the shared epoch sentinel from `crate::translate`
@@ -358,17 +360,10 @@ pub type BodyTranslator = Box<
 /// Request parameters for the heartbeat proxy. Mirrors `proxy::ProxyRequest`
 /// plus the protocol classification and timing knobs.
 pub struct HeartbeatRequest<'a> {
-    pub client: &'a reqwest::Client,
-    pub backend_url: &'a str,
-    pub path: &'a str,
-    /// When `Some`, used as the backend-side path. The client-facing
-    /// `path` still drives the heartbeat protocol — only the upstream
-    /// URL changes. Used by protocol translation.
-    pub override_path: Option<&'a str>,
-    pub query: Option<&'a str>,
-    pub method: Method,
-    pub headers: &'a HeaderMap,
-    pub body: Body,
+    /// The proxy fields shared with the normal (non-heartbeat) forwarding
+    /// path. Embedded so callers build one `ProxyRequest` and then extend
+    /// it with heartbeat-specific fields.
+    pub proxy: crate::proxy::ProxyRequest<'a>,
     pub protocol: StreamProtocol,
     pub model: String,
     pub config: HeartbeatConfig,
@@ -384,15 +379,16 @@ pub struct HeartbeatRequest<'a> {
 /// heartbeat is emitted. From that point, any upstream failure is encoded
 /// in-band using `StreamProtocol::error_event`.
 pub async fn execute(req: HeartbeatRequest<'_>) -> Response {
-    let upstream_path = req.override_path.unwrap_or(req.path);
+    let p = req.proxy;
+    let upstream_path = p.override_path.unwrap_or(p.path);
     let builder = crate::proxy::build_upstream_request(
-        req.client,
-        req.method,
-        req.backend_url,
+        p.client,
+        p.method,
+        p.backend_url,
         upstream_path,
-        req.query,
-        req.headers,
-        req.body,
+        p.query,
+        p.headers,
+        p.body,
     );
     let send_future = builder.send();
 
@@ -692,6 +688,16 @@ mod tests {
     use http_body_util::BodyExt;
     use tokio::net::TcpListener;
 
+    /// Bind an ephemeral port, serve `app` on it, and return its base URL.
+    async fn spawn_test_app(app: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
     async fn spawn_ps_server(models: Vec<&'static str>) -> String {
         let payload = serde_json::json!({
             "models": models.iter().map(|m| serde_json::json!({"name": m, "model": m})).collect::<Vec<_>>()
@@ -704,12 +710,7 @@ mod tests {
                 async move { (StatusCode::OK, p) }
             }),
         );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        format!("http://{addr}")
+        spawn_test_app(app).await
     }
 
     #[tokio::test]
@@ -830,12 +831,7 @@ mod tests {
                 async move { (StatusCode::OK, p) }
             }),
         );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        format!("http://{addr}")
+        spawn_test_app(app).await
     }
 
     #[tokio::test]
@@ -937,12 +933,7 @@ mod tests {
                 )
             }),
         );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        format!("http://{addr}")
+        spawn_test_app(app).await
     }
 
     #[tokio::test]
@@ -957,14 +948,16 @@ mod tests {
         let client = reqwest::Client::new();
         let headers = HeaderMap::new();
         let req = HeartbeatRequest {
-            client: &client,
-            backend_url: &url,
-            path: "/api/chat",
-            override_path: None,
-            query: None,
-            method: Method::POST,
-            headers: &headers,
-            body: Body::from("{\"model\":\"llama3\",\"stream\":true}"),
+            proxy: crate::proxy::ProxyRequest {
+                client: &client,
+                backend_url: &url,
+                path: "/api/chat",
+                override_path: None,
+                query: None,
+                method: Method::POST,
+                headers: &headers,
+                body: Body::from("{\"model\":\"llama3\",\"stream\":true}"),
+            },
             protocol: StreamProtocol::OllamaChat,
             model: "llama3".to_string(),
             config: HeartbeatConfig {
@@ -1016,14 +1009,16 @@ mod tests {
         let client = reqwest::Client::new();
         let headers = HeaderMap::new();
         let req = HeartbeatRequest {
-            client: &client,
-            backend_url: &url,
-            path: "/api/chat",
-            override_path: None,
-            query: None,
-            method: Method::POST,
-            headers: &headers,
-            body: Body::from("{}"),
+            proxy: crate::proxy::ProxyRequest {
+                client: &client,
+                backend_url: &url,
+                path: "/api/chat",
+                override_path: None,
+                query: None,
+                method: Method::POST,
+                headers: &headers,
+                body: Body::from("{}"),
+            },
             protocol: StreamProtocol::OllamaChat,
             model: "llama3".to_string(),
             config: HeartbeatConfig {
@@ -1065,14 +1060,16 @@ mod tests {
         let client = reqwest::Client::new();
         let headers = HeaderMap::new();
         let req = HeartbeatRequest {
-            client: &client,
-            backend_url: &url,
-            path: "/api/chat",
-            override_path: None,
-            query: None,
-            method: Method::POST,
-            headers: &headers,
-            body: Body::from("{}"),
+            proxy: crate::proxy::ProxyRequest {
+                client: &client,
+                backend_url: &url,
+                path: "/api/chat",
+                override_path: None,
+                query: None,
+                method: Method::POST,
+                headers: &headers,
+                body: Body::from("{}"),
+            },
             protocol: StreamProtocol::OllamaChat,
             model: "llama3".to_string(),
             config: HeartbeatConfig {

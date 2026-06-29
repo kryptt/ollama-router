@@ -113,9 +113,7 @@ enum State {
     /// whether this string could be `"model"` or `"stream"`.
     QuoteOpen,
     /// Inside a JSON string we are not interested in — skip to close-quote.
-    SkipString {
-        escaped: bool,
-    },
+    SkipString { escaped: bool },
 
     // ---- matching "model" key ----
     /// Saw `"m`, matching remaining chars of `odel"`.
@@ -125,9 +123,7 @@ enum State {
     /// Saw `:`, skipping whitespace before value `"`.
     ModelQuote,
     /// Inside model value string, accumulating into `buf`.
-    ModelValue {
-        escaped: bool,
-    },
+    ModelValue { escaped: bool },
 
     // ---- matching "stream" key ----
     /// Saw `"s`, matching remaining chars of `tream"`.
@@ -136,10 +132,14 @@ enum State {
     StreamColon,
     /// Saw `:`, skipping whitespace before `t`/`f`.
     StreamBool,
-    /// Matching `true` (pos 1..4) or `false` (pos 1..5).
-    StreamTrue(u8),
-    StreamFalse(u8),
+    /// Matching a boolean literal tail (`rue` or `alse`) at position `pos`
+    /// (0-indexed into the tail slice). `value` is the result written to
+    /// `stream_value` on a full match.
+    StreamBoolTail { pos: u8, value: bool },
 }
+
+/// Tail bytes for boolean literals, indexed by `StreamBoolTail.value`.
+const BOOL_TAILS: [&[u8]; 2] = [b"alse", b"rue"];
 
 // Lookup tables for the suffixes we match after the opening `"` + first char.
 const MODEL_SUFFIX: &[u8] = b"odel\""; // after "m
@@ -190,36 +190,28 @@ impl Scanner {
                 b'm' if self.model.is_none() => State::MatchModel(0),
                 b's' if self.stream_value.is_none() => State::MatchStream(0),
                 b'"' => State::Idle, // empty string `""`
-                b'\\' => State::SkipString { escaped: true },
-                _ => State::SkipString { escaped: false },
+                _ => Self::enter_skip_string(b),
             },
 
             State::SkipString { escaped: true } => State::SkipString { escaped: false },
             State::SkipString { escaped: false } => match b {
-                b'\\' => State::SkipString { escaped: true },
                 b'"' => State::Idle,
-                _ => State::SkipString { escaped: false },
+                _ => Self::enter_skip_string(b),
             },
 
             // -- "model" key matching -----------------------------------------
             State::MatchModel(pos) => {
-                if b == MODEL_SUFFIX[pos as usize] {
-                    if pos as usize == MODEL_SUFFIX.len() - 1 {
-                        // Fully matched `"model"`, now expect `:`
-                        State::ModelColon
-                    } else {
-                        State::MatchModel(pos + 1)
-                    }
-                } else {
-                    // Mismatch — resume skipping this string.
-                    self.recover_skip(b)
-                }
+                Self::match_key_suffix(b, pos, MODEL_SUFFIX, State::ModelColon, State::MatchModel)
             }
 
-            State::ModelColon => match b {
-                b':' => State::ModelQuote,
-                b if b.is_ascii_whitespace() => State::ModelColon,
-                _ => State::Idle, // wasn't a key after all
+            State::ModelColon | State::StreamColon => match b {
+                b':' => match self.state {
+                    State::ModelColon => State::ModelQuote,
+                    State::StreamColon => State::StreamBool,
+                    _ => unreachable!(),
+                },
+                b if b.is_ascii_whitespace() => self.state,
+                _ => State::Idle,
             },
 
             State::ModelQuote => match b {
@@ -231,16 +223,12 @@ impl Scanner {
                 _ => State::Idle, // value isn't a string
             },
 
-            State::ModelValue { escaped: true } => {
-                self.buf.push(b);
-                State::ModelValue { escaped: false }
-            }
-            State::ModelValue { escaped: false } => match b {
-                b'\\' => {
+            State::ModelValue { escaped } => match (escaped, b) {
+                (false, b'\\') => {
                     self.buf.push(b);
                     State::ModelValue { escaped: true }
                 }
-                b'"' => {
+                (false, b'"') => {
                     self.model = String::from_utf8(self.buf.clone())
                         .ok()
                         .filter(|s| !s.is_empty());
@@ -253,55 +241,38 @@ impl Scanner {
             },
 
             // -- "stream" key matching ----------------------------------------
-            State::MatchStream(pos) => {
-                if b == STREAM_SUFFIX[pos as usize] {
-                    if pos as usize == STREAM_SUFFIX.len() - 1 {
-                        State::StreamColon
-                    } else {
-                        State::MatchStream(pos + 1)
-                    }
-                } else {
-                    self.recover_skip(b)
-                }
-            }
-
-            State::StreamColon => match b {
-                b':' => State::StreamBool,
-                b if b.is_ascii_whitespace() => State::StreamColon,
-                _ => State::Idle,
-            },
+            State::MatchStream(pos) => Self::match_key_suffix(
+                b,
+                pos,
+                STREAM_SUFFIX,
+                State::StreamColon,
+                State::MatchStream,
+            ),
 
             State::StreamBool => match b {
-                b't' => State::StreamTrue(1),
-                b'f' => State::StreamFalse(1),
+                b't' => State::StreamBoolTail {
+                    pos: 0,
+                    value: true,
+                },
+                b'f' => State::StreamBoolTail {
+                    pos: 0,
+                    value: false,
+                },
                 b if b.is_ascii_whitespace() => State::StreamBool,
                 _ => State::Idle,
             },
 
-            State::StreamTrue(pos) => {
-                const TRUE_TAIL: &[u8] = b"rue";
-                let idx = (pos - 1) as usize;
-                if idx < TRUE_TAIL.len() && b == TRUE_TAIL[idx] {
-                    if idx == TRUE_TAIL.len() - 1 {
-                        self.stream_value = Some(true);
+            State::StreamBoolTail { pos, value } => {
+                let tail = BOOL_TAILS[value as usize];
+                if (pos as usize) < tail.len() && b == tail[pos as usize] {
+                    if pos as usize == tail.len() - 1 {
+                        self.stream_value = Some(value);
                         State::Idle
                     } else {
-                        State::StreamTrue(pos + 1)
-                    }
-                } else {
-                    State::Idle
-                }
-            }
-
-            State::StreamFalse(pos) => {
-                const FALSE_TAIL: &[u8] = b"alse";
-                let idx = (pos - 1) as usize;
-                if idx < FALSE_TAIL.len() && b == FALSE_TAIL[idx] {
-                    if idx == FALSE_TAIL.len() - 1 {
-                        self.stream_value = Some(false);
-                        State::Idle
-                    } else {
-                        State::StreamFalse(pos + 1)
+                        State::StreamBoolTail {
+                            pos: pos + 1,
+                            value,
+                        }
                     }
                 } else {
                     State::Idle
@@ -310,15 +281,34 @@ impl Scanner {
         };
     }
 
-    /// When a key-match fails mid-string, figure out where to resume.
-    fn recover_skip(&self, b: u8) -> State {
-        if b == b'"' {
-            // The failing byte is the close-quote of this string.
+    /// Try to advance a key-suffix match by one byte. On a match, returns
+    /// `on_complete` (suffix fully consumed) or `on_advance(pos + 1)`. On a
+    /// mismatch, recovers into `SkipString` or `Idle`.
+    fn match_key_suffix(
+        b: u8,
+        pos: u8,
+        suffix: &[u8],
+        on_complete: State,
+        on_advance: fn(u8) -> State,
+    ) -> State {
+        if b == suffix[pos as usize] {
+            if pos as usize == suffix.len() - 1 {
+                on_complete
+            } else {
+                on_advance(pos + 1)
+            }
+        } else if b == b'"' {
             State::Idle
-        } else if b == b'\\' {
-            State::SkipString { escaped: true }
         } else {
-            State::SkipString { escaped: false }
+            Self::enter_skip_string(b)
+        }
+    }
+
+    /// Produce the appropriate `SkipString` state for a byte that is not a
+    /// close-quote. Handles the `\\` -> escaped transition.
+    fn enter_skip_string(b: u8) -> State {
+        State::SkipString {
+            escaped: b == b'\\',
         }
     }
 }
@@ -335,72 +325,92 @@ mod tests {
         s
     }
 
+    /// Assert that scanning `input` produces the expected model and stream.
+    fn assert_scan(input: &[u8], model: Option<&str>, stream: Option<bool>) {
+        let s = scan(input);
+        assert_eq!(s.model(), model, "model mismatch");
+        assert_eq!(s.stream_value(), stream, "stream mismatch");
+    }
+
     #[test]
     fn basic_model_extraction() {
-        let s = scan(br#"{"model": "llama3", "messages": []}"#);
-        assert_eq!(s.model(), Some("llama3"));
-        assert_eq!(s.stream_value(), None); // absent → caller defaults true
+        // absent stream -> caller defaults true
+        assert_scan(
+            br#"{"model": "llama3", "messages": []}"#,
+            Some("llama3"),
+            None,
+        );
     }
 
     #[test]
     fn model_and_stream_true() {
-        let s = scan(br#"{"model": "glm-4.7-flash", "stream": true}"#);
-        assert_eq!(s.model(), Some("glm-4.7-flash"));
-        assert_eq!(s.stream_value(), Some(true));
+        assert_scan(
+            br#"{"model": "glm-4.7-flash", "stream": true}"#,
+            Some("glm-4.7-flash"),
+            Some(true),
+        );
     }
 
     #[test]
     fn model_and_stream_false() {
-        let s = scan(br#"{"model": "glm-4.7-flash", "stream": false}"#);
-        assert_eq!(s.model(), Some("glm-4.7-flash"));
-        assert_eq!(s.stream_value(), Some(false));
+        assert_scan(
+            br#"{"model": "glm-4.7-flash", "stream": false}"#,
+            Some("glm-4.7-flash"),
+            Some(false),
+        );
     }
 
     #[test]
     fn stream_before_model() {
-        let s = scan(br#"{"stream": false, "model": "codellama"}"#);
-        assert_eq!(s.model(), Some("codellama"));
-        assert_eq!(s.stream_value(), Some(false));
+        assert_scan(
+            br#"{"stream": false, "model": "codellama"}"#,
+            Some("codellama"),
+            Some(false),
+        );
     }
 
     #[test]
     fn model_with_slashes_and_colons() {
-        let s = scan(br#"{"model": "fixt/home-3b-v3:latest"}"#);
-        assert_eq!(s.model(), Some("fixt/home-3b-v3:latest"));
+        assert_scan(
+            br#"{"model": "fixt/home-3b-v3:latest"}"#,
+            Some("fixt/home-3b-v3:latest"),
+            None,
+        );
     }
 
     #[test]
     fn whitespace_around_colon() {
-        let s = scan(br#"{ "model"  :  "test-model" }"#);
-        assert_eq!(s.model(), Some("test-model"));
+        assert_scan(br#"{ "model"  :  "test-model" }"#, Some("test-model"), None);
     }
 
     #[test]
     fn model_value_in_prior_string_ignored() {
-        // "model" appears as a value before appearing as a key
-        let s = scan(br#"{"type": "model", "model": "actual"}"#);
-        // The scanner may pick up the first "model" but it won't find a ":"
-        // after the string "model" (value) because the next token is `,`.
-        // So it resets and finds the real key.
-        assert_eq!(s.model(), Some("actual"));
+        // "model" appears as a value before appearing as a key.
+        // The scanner resets after `"model"` (value) since the next token is `,` not `:`.
+        assert_scan(
+            br#"{"type": "model", "model": "actual"}"#,
+            Some("actual"),
+            None,
+        );
     }
 
     #[test]
     fn escaped_quotes_in_value_before_model() {
-        let s = scan(br#"{"prompt": "say \"hello\"", "model": "phi3"}"#);
-        assert_eq!(s.model(), Some("phi3"));
+        assert_scan(
+            br#"{"prompt": "say \"hello\"", "model": "phi3"}"#,
+            Some("phi3"),
+            None,
+        );
     }
 
     #[test]
     fn no_model_field() {
-        let s = scan(br#"{"prompt": "hello"}"#);
-        assert_eq!(s.model(), None);
+        assert_scan(br#"{"prompt": "hello"}"#, None, None);
     }
 
     #[test]
     fn empty_model_value() {
-        let s = scan(br#"{"model": ""}"#);
-        assert_eq!(s.model(), None);
+        assert_scan(br#"{"model": ""}"#, None, None);
     }
 
     #[test]
@@ -430,30 +440,70 @@ mod tests {
 
     #[test]
     fn openai_compat_format() {
-        let s = scan(br#"{"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]}"#);
-        assert_eq!(s.model(), Some("gpt-4"));
+        assert_scan(
+            br#"{"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}]}"#,
+            Some("gpt-4"),
+            None,
+        );
     }
 
     #[test]
     fn model_not_confused_by_substring() {
         // "remodel" contains "model" but isn't the key
-        let s = scan(br#"{"remodel": "no", "model": "yes"}"#);
-        assert_eq!(s.model(), Some("yes"));
+        assert_scan(br#"{"remodel": "no", "model": "yes"}"#, Some("yes"), None);
     }
 
     // -- spill_and_detect integration tests ----------------------------------
 
+    /// Run `spill_and_detect` on a JSON byte-slice body and assert model + stream.
+    async fn assert_spill(
+        json: &[u8],
+        default_stream: bool,
+        model: &str,
+        stream: bool,
+    ) -> SpillResult {
+        let body = Body::from(json.to_vec());
+        assert_spill_body(body, default_stream, model, stream).await
+    }
+
+    /// Run `spill_and_detect` on an arbitrary `Body` and assert model + stream.
+    async fn assert_spill_body(
+        body: Body,
+        default_stream: bool,
+        model: &str,
+        stream: bool,
+    ) -> SpillResult {
+        let result = spill_and_detect(body, default_stream)
+            .await
+            .expect("spill_and_detect IO error")
+            .expect("expected Some(SpillResult)");
+        assert_eq!(result.model, model, "model mismatch");
+        assert_eq!(result.stream, stream, "stream mismatch");
+        result
+    }
+
+    /// Build a streaming `Body` from pre-split byte chunks.
+    fn body_from_chunks(chunks: Vec<Bytes>) -> Body {
+        let io_chunks: Vec<Result<Bytes, std::io::Error>> = chunks.into_iter().map(Ok).collect();
+        Body::from_stream(futures_util::stream::iter(io_chunks))
+    }
+
+    /// Collect a `Body` into a `Vec<u8>`.
+    async fn collect_body(body: Body) -> Vec<u8> {
+        use http_body_util::BodyExt;
+        body.collect()
+            .await
+            .expect("failed to collect body")
+            .to_bytes()
+            .to_vec()
+    }
+
     #[tokio::test]
     async fn spill_small_body() {
         let json = br#"{"model": "test-model", "stream": false, "messages": []}"#;
-        let body = Body::from(json.to_vec());
-        let result = spill_and_detect(body, true).await.unwrap().unwrap();
-        assert_eq!(result.model, "test-model");
-        assert!(!result.stream);
-
+        let result = assert_spill(json, true, "test-model", false).await;
         // The replayed body should contain the full original bytes.
-        let collected = collect_body(result.body).await;
-        assert_eq!(collected, json);
+        assert_eq!(collect_body(result.body).await, json);
     }
 
     #[tokio::test]
@@ -465,19 +515,15 @@ mod tests {
     #[tokio::test]
     async fn spill_chunked_body() {
         // Simulate a chunked body where model spans two chunks.
-        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
-            Ok(Bytes::from(r#"{"model": "chu"#)),
-            Ok(Bytes::from(r#"nked", "stream": true}"#)),
-        ];
-        let stream = futures_util::stream::iter(chunks);
-        let body = Body::from_stream(stream);
-
-        let result = spill_and_detect(body, true).await.unwrap().unwrap();
-        assert_eq!(result.model, "chunked");
-        assert!(result.stream);
-
-        let collected = collect_body(result.body).await;
-        assert_eq!(collected, br#"{"model": "chunked", "stream": true}"#);
+        let body = body_from_chunks(vec![
+            Bytes::from(r#"{"model": "chu"#),
+            Bytes::from(r#"nked", "stream": true}"#),
+        ]);
+        let result = assert_spill_body(body, true, "chunked", true).await;
+        assert_eq!(
+            collect_body(result.body).await,
+            br#"{"model": "chunked", "stream": true}"#
+        );
     }
 
     #[tokio::test]
@@ -487,22 +533,17 @@ mod tests {
         let tail = "x".repeat(1024 * 64); // 64 KiB of payload
         let suffix = br#""}"#;
 
-        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
-            Ok(Bytes::from(prefix.to_vec())),
-            Ok(Bytes::from(tail.clone())),
-            Ok(Bytes::from(suffix.to_vec())),
-        ];
-        let stream = futures_util::stream::iter(chunks);
-        let body = Body::from_stream(stream);
+        let body = body_from_chunks(vec![
+            Bytes::from(prefix.to_vec()),
+            Bytes::from(tail.clone()),
+            Bytes::from(suffix.to_vec()),
+        ]);
+        let result = assert_spill_body(body, true, "early", true).await;
 
-        let result = spill_and_detect(body, true).await.unwrap().unwrap();
-        assert_eq!(result.model, "early");
-
-        let collected = collect_body(result.body).await;
         let mut expected = prefix.to_vec();
         expected.extend(tail.as_bytes());
         expected.extend(suffix);
-        assert_eq!(collected, expected);
+        assert_eq!(collect_body(result.body).await, expected);
     }
 
     #[tokio::test]
@@ -511,22 +552,20 @@ mod tests {
         // large messages array in between.  The old break condition exited as
         // soon as model was found, missing the stream field entirely and
         // defaulting to stream=true.
-        let json = br#"{"model": "llmvision/glimpse-v1:latest", "messages": [{"role": "user", "content": "describe"}], "stream": false}"#;
-        let body = Body::from(json.to_vec());
-        let result = spill_and_detect(body, true).await.unwrap().unwrap();
-        assert_eq!(result.model, "llmvision/glimpse-v1:latest");
-        assert!(!result.stream, "stream should be false, not default true");
+        assert_spill(
+            br#"{"model": "llmvision/glimpse-v1:latest", "messages": [{"role": "user", "content": "describe"}], "stream": false}"#,
+            true,
+            "llmvision/glimpse-v1:latest",
+            false,
+        )
+        .await;
     }
 
     #[tokio::test]
     async fn spill_stream_absent_takes_ollama_default() {
         // Ollama-protocol paths (/api/chat, /api/generate) default to
         // stream=true when the field is absent.
-        let json = br#"{"model": "test", "messages": []}"#;
-        let body = Body::from(json.to_vec());
-        let result = spill_and_detect(body, true).await.unwrap().unwrap();
-        assert_eq!(result.model, "test");
-        assert!(result.stream);
+        assert_spill(br#"{"model": "test", "messages": []}"#, true, "test", true).await;
     }
 
     #[tokio::test]
@@ -536,21 +575,12 @@ mod tests {
         // Regression: hermes title_generator omits the field on
         // non-streaming requests; the old fixed default of true engaged
         // the SSE heartbeat path and corrupted the response.
-        let json = br#"{"model": "test", "messages": []}"#;
-        let body = Body::from(json.to_vec());
-        let result = spill_and_detect(body, false).await.unwrap().unwrap();
-        assert_eq!(result.model, "test");
-        assert!(!result.stream);
-    }
-
-    /// Helper: collect a Body into bytes.
-    async fn collect_body(body: Body) -> Vec<u8> {
-        use http_body_util::BodyExt;
-        let bytes = body
-            .collect()
-            .await
-            .expect("failed to collect body")
-            .to_bytes();
-        bytes.to_vec()
+        assert_spill(
+            br#"{"model": "test", "messages": []}"#,
+            false,
+            "test",
+            false,
+        )
+        .await;
     }
 }

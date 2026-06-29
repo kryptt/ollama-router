@@ -102,11 +102,11 @@ pub(crate) fn build_upstream_request(
         }
     }
 
-    // Convert axum Body stream → reqwest streaming body.
-    let body_stream = body
-        .into_data_stream()
-        .map(|r| r.map_err(std::io::Error::other));
-    builder.body(reqwest::Body::wrap_stream(body_stream))
+    // Convert axum Body stream -> reqwest streaming body.
+    builder.body(reqwest::Body::wrap_stream(
+        body.into_data_stream()
+            .map(|r| r.map_err(std::io::Error::other)),
+    ))
 }
 
 /// Forward a request to the backend and stream the response back. Returns
@@ -145,11 +145,11 @@ pub async fn execute(req: ProxyRequest<'_>) -> Result<Response, ProxyError> {
 
     let content_type = upstream_resp.headers().get("content-type").cloned();
 
-    let stream = upstream_resp
-        .bytes_stream()
-        .map(|r| r.map_err(std::io::Error::other));
-
-    let mut response = Response::new(Body::from_stream(stream));
+    let mut response = Response::new(Body::from_stream(
+        upstream_resp
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(std::io::Error::other)),
+    ));
     *response.status_mut() = status;
     if let Some(ct) = content_type {
         response.headers_mut().insert("content-type", ct);
@@ -185,6 +185,8 @@ pub fn bad_gateway(msg: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── response builders ───────────────────────────────────────────────
 
     #[test]
     fn model_not_found_returns_404() {

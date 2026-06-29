@@ -64,7 +64,7 @@ pub async fn model_route(
             return proxy::bad_request("request body must contain a non-empty 'model' field");
         }
         Err(e) => {
-            tracing::warn!(error = %e, "failed to spill request body");
+            tracing::warn!(err = %e, "spill request body failed");
             return proxy::bad_gateway("failed to read request body");
         }
     };
@@ -86,13 +86,7 @@ pub async fn model_route(
                 // upload). We can't estimate input size cheaply, so we
                 // can't make an escalation decision — count and continue
                 // with the originally requested model.
-                state
-                    .metrics
-                    .escalations_skipped
-                    .get_or_create(&metrics::EscalationSkipLabels {
-                        reason: "no_content_length".to_string(),
-                    })
-                    .inc();
+                record_escalation_skip(&state.metrics, "no_content_length");
             }
         }
     }
@@ -108,13 +102,7 @@ pub async fn model_route(
             escalation_target = %spilled.model,
             "escalation target not in registry; falling back to original model",
         );
-        state
-            .metrics
-            .escalations_skipped
-            .get_or_create(&metrics::EscalationSkipLabels {
-                reason: "target_not_found".to_string(),
-            })
-            .inc();
+        record_escalation_skip(&state.metrics, "target_not_found");
         spilled.model = original_model.clone();
         &spilled.model
     } else {
@@ -191,26 +179,26 @@ pub async fn model_route(
 
     if needs_translation {
         tracing::info!(
-            model = %spilled.model,
             backend = %backend_name,
+            requested_model = %spilled.model,
             "translating /api/chat → /v1/chat/completions"
         );
         state.metrics.protocol_translations.inc();
 
-        // Buffer the request body and translate it.
-        let body_bytes = match collect_body_to_bytes(spilled.body).await {
+        // Buffer the request body then translate Ollama → OpenAI.
+        let body_bytes = collect_body_to_bytes(spilled.body).await.map_err(|e| {
+            tracing::warn!(error = %e, "failed to buffer request body for translation");
+        });
+        let body_bytes = match body_bytes {
             Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to buffer request body for translation");
-                return proxy::bad_gateway("failed to read request body");
-            }
+            Err(()) => return proxy::bad_gateway("failed to buffer request body for translation"),
         };
-        let translated = match translate::ollama_chat_to_openai_request(&body_bytes) {
+        let translated = translate::ollama_chat_to_openai_request(&body_bytes).map_err(|e| {
+            tracing::warn!(error = %e, "failed to translate /api/chat body");
+        });
+        let translated = match translated {
             Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to translate /api/chat body");
-                return proxy::bad_request("body is not valid JSON");
-            }
+            Err(()) => return proxy::bad_request("body is not valid JSON"),
         };
         spilled.body = Body::from(translated);
     }
@@ -237,6 +225,17 @@ pub async fn model_route(
         None
     };
 
+    let proxy_req = proxy::ProxyRequest {
+        client: &state.client,
+        backend_url: &backend_url,
+        path: uri.path(),
+        override_path: upstream_path,
+        query: uri.query(),
+        method: method.clone(),
+        headers: &headers,
+        body: spilled.body,
+    };
+
     let response = if let (true, Some(protocol)) = (use_heartbeat, protocol) {
         state.metrics.heartbeat_engaged.inc();
         tracing::info!(
@@ -254,14 +253,7 @@ pub async fn model_route(
             None
         };
         heartbeat::execute(heartbeat::HeartbeatRequest {
-            client: &state.client,
-            backend_url: &backend_url,
-            path: uri.path(),
-            override_path: upstream_path,
-            query: uri.query(),
-            method: method.clone(),
-            headers: &headers,
-            body: spilled.body,
+            proxy: proxy_req,
             protocol,
             model: spilled.model.clone(),
             config: state.heartbeat,
@@ -269,30 +261,7 @@ pub async fn model_route(
         })
         .await
     } else {
-        let raw = match proxy::execute(proxy::ProxyRequest {
-            client: &state.client,
-            backend_url: &backend_url,
-            path: uri.path(),
-            override_path: upstream_path,
-            query: uri.query(),
-            method: method.clone(),
-            headers: &headers,
-            body: spilled.body,
-        })
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                state
-                    .metrics
-                    .upstream_errors
-                    .get_or_create(&metrics::UpstreamErrorLabels {
-                        kind: e.kind_str().to_string(),
-                    })
-                    .inc();
-                e.into_response()
-            }
-        };
+        let raw = proxy_with_metrics(proxy_req, &state.metrics).await;
 
         if needs_translation {
             translate_proxy_response(raw, spilled.stream, spilled.model.clone()).await
@@ -312,27 +281,15 @@ pub async fn model_route(
     // because those endpoints return a single JSON regardless.
     let actually_streams = spilled.stream && protocol.is_some();
 
-    state
-        .metrics
-        .requests_total
-        .get_or_create(&metrics::RequestLabels {
-            model: spilled.model.clone(),
-            backend: backend_name.clone(),
-            status_code,
-            method: method.to_string(),
-            stream: actually_streams,
-        })
-        .inc();
-
-    state
-        .metrics
-        .request_duration
-        .get_or_create(&metrics::DurationLabels {
-            model: spilled.model,
-            backend: backend_name,
-            stream: actually_streams,
-        })
-        .observe(duration);
+    record_request_metrics(
+        &state.metrics,
+        spilled.model,
+        backend_name,
+        status_code,
+        method.as_str(),
+        actually_streams,
+        duration,
+    );
 
     response
 }
@@ -418,44 +375,34 @@ pub async fn v1_model_route(
     fields(http.request.method = %method, url.path = %uri.path())
 )]
 pub async fn passthrough_route(
-    State(state): State<AppState>,
     method: Method,
     OriginalUri(uri): OriginalUri,
+    State(state): State<AppState>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let reg = state.registry.read().await;
-    let backend_id = match reg.any_healthy() {
-        Some(id) => id,
-        None => return proxy::bad_gateway("no healthy backends available"),
-    };
-    let backend_url = reg.backend(backend_id).url.to_string();
-    drop(reg);
-
-    match proxy::execute(proxy::ProxyRequest {
-        client: &state.client,
-        backend_url: &backend_url,
-        path: uri.path(),
-        override_path: None,
-        query: uri.query(),
-        method,
-        headers: &headers,
-        body,
-    })
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            state
-                .metrics
-                .upstream_errors
-                .get_or_create(&metrics::UpstreamErrorLabels {
-                    kind: e.kind_str().to_string(),
-                })
-                .inc();
-            e.into_response()
+    let target_url = {
+        let reg = state.registry.read().await;
+        match reg.any_healthy() {
+            Some(id) => reg.backend(id).url.to_string(),
+            None => return proxy::bad_gateway("no healthy backends available"),
         }
-    }
+    };
+
+    proxy_with_metrics(
+        proxy::ProxyRequest {
+            client: &state.client,
+            backend_url: &target_url,
+            path: uri.path(),
+            query: uri.query(),
+            override_path: None,
+            method,
+            headers: &headers,
+            body,
+        },
+        &state.metrics,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -463,16 +410,18 @@ pub async fn passthrough_route(
 // ---------------------------------------------------------------------------
 
 pub async fn health_route(State(state): State<AppState>) -> Response {
-    let reg = state.registry.read().await;
+    let snapshot = state.registry.read().await;
 
-    if !reg.is_discovery_done() {
+    if !snapshot.is_discovery_done() {
         return json_status(
             StatusCode::SERVICE_UNAVAILABLE,
             json!({"status": "unhealthy", "reason": "awaiting first discovery"}),
         );
     }
 
-    let any_reachable = reg.all_backends().any(|b| b.healthy || b.in_grace_period);
+    let any_reachable = snapshot
+        .all_backends()
+        .any(|b| b.healthy || b.in_grace_period);
 
     if any_reachable {
         json_status(StatusCode::OK, json!({"status": "ok"}))
@@ -485,9 +434,9 @@ pub async fn health_route(State(state): State<AppState>) -> Response {
 }
 
 pub async fn status_route(State(state): State<AppState>) -> Response {
-    let reg = state.registry.read().await;
+    let view = state.registry.read().await;
 
-    let backends: Vec<serde_json::Value> = reg
+    let backends: Vec<serde_json::Value> = view
         .all_backends()
         .map(|b| {
             json!({
@@ -500,13 +449,13 @@ pub async fn status_route(State(state): State<AppState>) -> Response {
         })
         .collect();
 
-    let model_count = reg.reachable_models().len();
+    let model_count = view.reachable_models().len();
 
     json_status(
         StatusCode::OK,
         json!({
             "backends": backends,
-            "discovery_done": reg.is_discovery_done(),
+            "discovery_done": view.is_discovery_done(),
             "model_count": model_count,
         }),
     )
@@ -590,6 +539,81 @@ fn extract_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|v| v.to_str().ok())
 }
 
+/// Execute a proxy request, recording upstream-error metrics on failure.
+async fn proxy_with_metrics(req: proxy::ProxyRequest<'_>, metrics: &Metrics) -> Response {
+    match proxy::execute(req).await {
+        Ok(r) => r,
+        Err(e) => {
+            metrics
+                .upstream_errors
+                .get_or_create(&metrics::UpstreamErrorLabels {
+                    kind: e.kind_str().to_string(),
+                })
+                .inc();
+            e.into_response()
+        }
+    }
+}
+
+/// Increment the `escalations_skipped` counter with a caller-supplied reason label.
+fn record_escalation_skip(metrics: &Metrics, reason: &str) {
+    metrics
+        .escalations_skipped
+        .get_or_create(&metrics::EscalationSkipLabels {
+            reason: reason.to_string(),
+        })
+        .inc();
+}
+
+/// Record both the per-request counter and the duration histogram in one
+/// call. Owns its `model` and `backend` strings so callers can move them
+/// in instead of cloning.
+fn record_request_metrics(
+    metrics: &Metrics,
+    model: String,
+    backend: String,
+    status_code: u16,
+    method: &str,
+    stream: bool,
+    duration: f64,
+) {
+    metrics
+        .requests_total
+        .get_or_create(&metrics::RequestLabels {
+            model: model.clone(),
+            backend: backend.clone(),
+            status_code,
+            method: method.to_string(),
+            stream,
+        })
+        .inc();
+    metrics
+        .request_duration
+        .get_or_create(&metrics::DurationLabels {
+            model,
+            backend,
+            stream,
+        })
+        .observe(duration);
+}
+
+/// Build a `Response` with the given body, status code, and a single
+/// `Content-Type` header. Avoids repeating the three-step
+/// `new → status_mut → headers_mut` dance at every call site.
+fn response_with_content_type(
+    body: Body,
+    status: StatusCode,
+    content_type: &'static str,
+) -> Response {
+    let mut resp = Response::new(body);
+    *resp.status_mut() = status;
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        HeaderValue::from_static(content_type),
+    );
+    resp
+}
+
 /// Collect an `axum::body::Body` into a single `Vec<u8>`. Used to buffer
 /// /api/chat request bodies before protocol translation rewrites them.
 async fn collect_body_to_bytes(body: Body) -> Result<Vec<u8>, axum::Error> {
@@ -618,13 +642,11 @@ async fn translate_proxy_response(resp: Response, streaming: bool, model: String
             .into_data_stream()
             .map(|r| r.map_err(std::io::Error::other));
         let translated = translate::translate_streaming_response(stream, model);
-        let mut new_resp = Response::new(Body::from_stream(translated));
-        *new_resp.status_mut() = status;
-        new_resp.headers_mut().insert(
-            axum::http::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/x-ndjson"),
-        );
-        new_resp
+        response_with_content_type(
+            Body::from_stream(translated),
+            status,
+            "application/x-ndjson",
+        )
     } else {
         use http_body_util::BodyExt;
         let bytes = match resp.into_body().collect().await {
@@ -635,15 +657,7 @@ async fn translate_proxy_response(resp: Response, streaming: bool, model: String
             }
         };
         match translate::openai_chat_to_ollama_response(&bytes, &model) {
-            Ok(out) => {
-                let mut new_resp = Response::new(Body::from(out));
-                *new_resp.status_mut() = status;
-                new_resp.headers_mut().insert(
-                    axum::http::header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/json"),
-                );
-                new_resp
-            }
+            Ok(out) => response_with_content_type(Body::from(out), status, "application/json"),
             Err(e) => {
                 tracing::warn!(error = %e, "failed to translate non-streaming response");
                 proxy::bad_gateway("failed to translate upstream response")
@@ -755,9 +769,9 @@ mod tests {
         // Before the first discovery cycle completes, readiness is 503.
         let resp = health_route(State(test_state())).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["reason"], "awaiting first discovery");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["reason"], "awaiting first discovery");
     }
 
     #[tokio::test]
@@ -794,55 +808,77 @@ mod tests {
         }
     }
 
+    /// Assert escalation produces `expected` for the given model + tokens.
+    fn assert_escalation(
+        model: &str,
+        tokens: usize,
+        rules: &[EscalationRule],
+        expected: Option<&str>,
+    ) {
+        assert_eq!(
+            apply_escalation(model, tokens, rules),
+            expected.map(str::to_string),
+            "model={model:?}, tokens={tokens}",
+        );
+    }
+
+    /// Single-step rule: qwen3.6-medium --35k--> qwen3.6-high.
+    fn one_step_rules() -> Vec<EscalationRule> {
+        vec![rule("qwen3.6-medium", 35_000, "qwen3.6-high")]
+    }
+
+    /// Two-step chain: medium --35k--> high --120k--> ultra.
+    fn two_step_chain() -> Vec<EscalationRule> {
+        vec![
+            rule("qwen3.6-medium", 35_000, "qwen3.6-high"),
+            rule("qwen3.6-high", 120_000, "qwen3.6-ultra"),
+        ]
+    }
+
     #[test]
     fn escalation_no_rules_is_noop() {
-        assert_eq!(apply_escalation("qwen3.6-medium", 100_000, &[]), None);
+        assert_escalation("qwen3.6-medium", 100_000, &[], None);
     }
 
     #[test]
     fn escalation_below_threshold_is_noop() {
-        let rules = vec![rule("qwen3.6-medium", 35_000, "qwen3.6-high")];
-        assert_eq!(apply_escalation("qwen3.6-medium", 1_000, &rules), None);
+        assert_escalation("qwen3.6-medium", 1_000, &one_step_rules(), None);
     }
 
     #[test]
     fn escalation_above_threshold_rewrites() {
-        let rules = vec![rule("qwen3.6-medium", 35_000, "qwen3.6-high")];
-        assert_eq!(
-            apply_escalation("qwen3.6-medium", 50_000, &rules),
-            Some("qwen3.6-high".to_string())
+        assert_escalation(
+            "qwen3.6-medium",
+            50_000,
+            &one_step_rules(),
+            Some("qwen3.6-high"),
         );
     }
 
     #[test]
     fn escalation_chains_through_multiple_hops() {
-        // medium → high → ultra in one decision.
-        let rules = vec![
-            rule("qwen3.6-medium", 35_000, "qwen3.6-high"),
-            rule("qwen3.6-high", 120_000, "qwen3.6-ultra"),
-        ];
-        assert_eq!(
-            apply_escalation("qwen3.6-medium", 200_000, &rules),
-            Some("qwen3.6-ultra".to_string())
+        // medium --> high --> ultra in one decision.
+        assert_escalation(
+            "qwen3.6-medium",
+            200_000,
+            &two_step_chain(),
+            Some("qwen3.6-ultra"),
         );
     }
 
     #[test]
     fn escalation_chain_stops_when_target_threshold_not_exceeded() {
-        let rules = vec![
-            rule("qwen3.6-medium", 35_000, "qwen3.6-high"),
-            rule("qwen3.6-high", 120_000, "qwen3.6-ultra"),
-        ];
-        assert_eq!(
-            apply_escalation("qwen3.6-medium", 50_000, &rules),
-            Some("qwen3.6-high".to_string())
+        assert_escalation(
+            "qwen3.6-medium",
+            50_000,
+            &two_step_chain(),
+            Some("qwen3.6-high"),
         );
     }
 
     #[test]
     fn escalation_ignores_unrelated_models() {
-        let rules = vec![rule("qwen3.6-medium", 35_000, "qwen3.6-high")];
-        assert_eq!(apply_escalation("gpt-oss:latest", 100_000, &rules), None);
+        assert_escalation("gpt-oss:latest", 100_000, &one_step_rules(), None);
     }
 
     #[test]
@@ -850,7 +886,7 @@ mod tests {
         // Comparator is strict-greater: estimated_tokens > threshold. At
         // exactly the threshold we don't escalate. Pinning this so a
         // future refactor to >= can't slip past the test suite.
-        let rules = vec![rule("qwen3.6-medium", 35_000, "qwen3.6-high")];
+        let rules = one_step_rules();
         assert_eq!(
             apply_escalation("qwen3.6-medium", 35_000, &rules),
             None,
@@ -881,24 +917,24 @@ mod tests {
 
     #[test]
     fn escalation_symmetric_cycle_returns_none() {
-        // a→b→c→a, all thresholds exceeded. After rules.len() hops the
+        // a->b->c->a, all thresholds exceeded. After rules.len() hops the
         // walker is back at "a" (the original model). The function MUST
-        // return None — escalation contributes nothing for a symmetric
+        // return None -- escalation contributes nothing for a symmetric
         // cycle. Without this assertion the cycle behaviour is undefined
         // and a future refactor could silently route every request
         // through the wrong model.
         let rules = vec![rule("a", 10, "b"), rule("b", 10, "c"), rule("c", 10, "a")];
-        assert_eq!(apply_escalation("a", 100, &rules), None);
+        assert_escalation("a", 100, &rules, None);
     }
 
     #[test]
     fn escalation_asymmetric_cycle_terminates_at_hop_budget() {
-        // a→b, b↔c. Walker traverses a→b→c→b, hits hop budget at
+        // a->b, b<->c. Walker traverses a->b->c->b, hits hop budget at
         // hops==rules.len()=3, current=="b", model=="a". This is a
-        // *deterministic* but non-fixed-point answer — pin it so any
+        // *deterministic* but non-fixed-point answer -- pin it so any
         // future change to the iteration order is loud.
         let rules = vec![rule("a", 10, "b"), rule("b", 10, "c"), rule("c", 10, "b")];
-        assert_eq!(apply_escalation("a", 100, &rules), Some("b".to_string()));
+        assert_escalation("a", 100, &rules, Some("b"));
     }
 
     // ── estimate_input_tokens unit tests ─────────────────────────────────
@@ -912,44 +948,49 @@ mod tests {
         h
     }
 
+    /// Assert that a `Content-Length` value produces the expected token
+    /// estimate. Wraps the header construction so each test case is one line.
+    fn assert_token_estimate(content_length: &str, expected: Option<usize>) {
+        let h = header_with("content-length", content_length);
+        assert_eq!(
+            estimate_input_tokens(&h),
+            expected,
+            "content-length={content_length:?}",
+        );
+    }
+
     #[test]
     fn estimate_input_tokens_missing_header_is_none() {
-        let h = HeaderMap::new();
-        assert_eq!(estimate_input_tokens(&h), None);
+        assert_eq!(estimate_input_tokens(&HeaderMap::new()), None);
     }
 
     #[test]
     fn estimate_input_tokens_non_numeric_value_is_none() {
-        let h = header_with("content-length", "not-a-number");
-        assert_eq!(estimate_input_tokens(&h), None);
+        assert_token_estimate("not-a-number", None);
     }
 
     #[test]
     fn estimate_input_tokens_negative_value_is_none() {
         // Negative content length is nonsense; usize parser rejects it.
-        let h = header_with("content-length", "-1");
-        assert_eq!(estimate_input_tokens(&h), None);
+        assert_token_estimate("-1", None);
     }
 
     #[test]
     fn estimate_input_tokens_valid_header_is_bytes_over_three() {
-        let h = header_with("content-length", "105000");
-        assert_eq!(estimate_input_tokens(&h), Some(35_000));
+        assert_token_estimate("105000", Some(35_000));
     }
 
     #[test]
     fn estimate_input_tokens_zero_is_zero() {
         // Edge case: an empty body has Content-Length: 0 → 0 tokens.
         // Not an error, just a trivial small body.
-        let h = header_with("content-length", "0");
-        assert_eq!(estimate_input_tokens(&h), Some(0));
+        assert_token_estimate("0", Some(0));
     }
 
     #[test]
     fn estimate_input_tokens_small_body_rounds_down() {
         // 5 bytes / 3 = 1 (integer division). This is fine — small
         // bodies are always under any sensible escalation threshold.
-        let h = header_with("content-length", "5");
-        assert_eq!(estimate_input_tokens(&h), Some(1));
+        assert_token_estimate("5", Some(1));
     }
 }

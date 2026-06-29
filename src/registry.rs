@@ -49,6 +49,17 @@ impl BackendState {
             .iter()
             .any(|m| m.name == model || m.name.split_once(':').map(|(p, _)| p) == Some(model))
     }
+
+    fn view(&self) -> BackendView<'_> {
+        BackendView {
+            name: &self.name,
+            url: &self.url,
+            healthy: self.healthy,
+            protocol: self.protocol,
+            models: &self.models,
+            in_grace_period: self.grace_deadline.is_some(),
+        }
+    }
 }
 
 /// Model metadata from Ollama's `/api/tags` response.
@@ -124,6 +135,16 @@ impl Registry {
         self.model_map.get(model).copied()
     }
 
+    /// Backend ids matching `pred`, in config-declaration order.
+    fn filter_backends(&self, pred: impl Fn(&BackendState) -> bool) -> Vec<BackendId> {
+        self.backends
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| pred(b))
+            .map(|(idx, _)| BackendId(idx))
+            .collect()
+    }
+
     /// All **healthy** backends serving `model`, in routing-priority order
     /// (config declaration order). This puts the `lookup` primary first
     /// whenever it is healthy — the model_map's first-writer pick is, by
@@ -139,46 +160,22 @@ impl Registry {
     /// For single-homed models this returns exactly one backend; the
     /// multi-homed case is rare (the motivating embedder is single-homed).
     pub fn healthy_backends_for(&self, model: &str) -> Vec<BackendId> {
-        self.backends
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.healthy && b.serves(model))
-            .map(|(idx, _)| BackendId(idx))
-            .collect()
+        self.filter_backends(|b| b.healthy && b.serves(model))
     }
 
     /// Return the first healthy backend for model-less request proxying.
     pub fn any_healthy(&self) -> Option<BackendId> {
-        self.backends
-            .iter()
-            .enumerate()
-            .find(|(_, b)| b.healthy)
-            .map(|(i, _)| BackendId(i))
+        self.filter_backends(|b| b.healthy).into_iter().next()
     }
 
     /// Borrow a backend's view by id.
     pub fn backend(&self, id: BackendId) -> BackendView<'_> {
-        let b = &self.backends[id.0];
-        BackendView {
-            name: &b.name,
-            url: &b.url,
-            healthy: b.healthy,
-            protocol: b.protocol,
-            models: &b.models,
-            in_grace_period: b.grace_deadline.is_some(),
-        }
+        self.backends[id.0].view()
     }
 
     /// Iterate over all backends.
     pub fn all_backends(&self) -> impl Iterator<Item = BackendView<'_>> {
-        self.backends.iter().map(|b| BackendView {
-            name: &b.name,
-            url: &b.url,
-            healthy: b.healthy,
-            protocol: b.protocol,
-            models: &b.models,
-            in_grace_period: b.grace_deadline.is_some(),
-        })
+        self.backends.iter().map(BackendState::view)
     }
 
     /// Deduplicated models from all reachable backends.
@@ -266,6 +263,20 @@ enum FetchResult {
     Err,
 }
 
+/// Build a successful `FetchResult` from sanitized models.
+fn fetch_ok(protocol: BackendProtocol, mut models: Vec<ModelInfo>) -> FetchResult {
+    for m in &mut models {
+        sanitize_model_entry(m);
+    }
+    FetchResult::Ok { protocol, models }
+}
+
+/// Log a fetch-phase error and return `FetchResult::Err`.
+fn fetch_err(name: &str, error: &dyn std::fmt::Display, context: &str) -> FetchResult {
+    warn!(backend = %name, error = %error, "{context}");
+    FetchResult::Err
+}
+
 /// Try Ollama `/api/tags` first, then fall back to OpenAI `/v1/models`.
 /// The successful endpoint determines `protocol`: an `/api/tags` 200 means
 /// the backend speaks Ollama-native; only `/v1/models` succeeding marks it
@@ -276,27 +287,12 @@ async fn fetch_models(client: &Client, name: &str, url: &str) -> FetchResult {
     match client.get(&tags_url).send().await {
         Ok(resp) if resp.status().is_success() => {
             return match resp.json::<TagsResponse>().await {
-                Ok(tags) => {
-                    let mut models = tags.models.unwrap_or_default();
-                    for m in &mut models {
-                        sanitize_model_entry(m);
-                    }
-                    FetchResult::Ok {
-                        protocol: BackendProtocol::Ollama,
-                        models,
-                    }
-                }
-                Err(e) => {
-                    warn!(backend = %name, error = %e, "failed to parse /api/tags");
-                    FetchResult::Err
-                }
+                Ok(tags) => fetch_ok(BackendProtocol::Ollama, tags.models.unwrap_or_default()),
+                Err(e) => fetch_err(name, &e, "failed to parse /api/tags"),
             };
         }
         Ok(_) => {} // non-success — try OpenAI fallback
-        Err(e) => {
-            warn!(backend = %name, error = %e, "failed to reach backend");
-            return FetchResult::Err;
-        }
+        Err(e) => return fetch_err(name, &e, "failed to reach backend"),
     }
 
     // Fallback: OpenAI /v1/models
@@ -308,33 +304,21 @@ async fn fetch_models(client: &Client, name: &str, url: &str) -> FetchResult {
                     .data
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|m| {
-                        let mut info = ModelInfo {
-                            name: m.id,
-                            extra: m.extra,
-                        };
-                        sanitize_model_entry(&mut info);
-                        info
+                    .map(|m| ModelInfo {
+                        name: m.id,
+                        extra: m.extra,
                     })
                     .collect();
-                FetchResult::Ok {
-                    protocol: BackendProtocol::OpenAi,
-                    models,
-                }
+                fetch_ok(BackendProtocol::OpenAi, models)
             }
-            Err(e) => {
-                warn!(backend = %name, error = %e, "failed to parse /v1/models");
-                FetchResult::Err
-            }
+            Err(e) => fetch_err(name, &e, "failed to parse /v1/models"),
         },
-        Ok(resp) => {
-            warn!(backend = %name, status = %resp.status(), "unhealthy backend (tried /api/tags and /v1/models)");
-            FetchResult::Err
-        }
-        Err(e) => {
-            warn!(backend = %name, error = %e, "failed to reach backend");
-            FetchResult::Err
-        }
+        Ok(resp) => fetch_err(
+            name,
+            &resp.status(),
+            "unhealthy backend (tried /api/tags and /v1/models)",
+        ),
+        Err(e) => fetch_err(name, &e, "failed to reach backend"),
     }
 }
 
@@ -459,16 +443,83 @@ mod tests {
     }
 
     fn make_model(name: &str) -> ModelInfo {
+        make_model_with_extra(name, serde_json::Value::Object(serde_json::Map::new()))
+    }
+
+    /// Set backend health, grace deadline, models, and rebuild the model map.
+    fn setup_backend(
+        reg: &mut Registry,
+        idx: usize,
+        healthy: bool,
+        grace: Option<Duration>,
+        models: Vec<ModelInfo>,
+    ) {
+        reg.backends[idx].healthy = healthy;
+        reg.backends[idx].grace_deadline = grace.map(|d| Instant::now() + d);
+        reg.backends[idx].models = models;
+        reg.rebuild_model_map();
+    }
+
+    /// Assert that `model` resolves to a backend named `expected_name`.
+    #[track_caller]
+    fn assert_lookup_name(reg: &Registry, model: &str, expected_name: &str) {
+        let id = reg
+            .lookup(model)
+            .unwrap_or_else(|| panic!("lookup({model:?}) returned None"));
+        assert_eq!(reg.backend(id).name, expected_name);
+    }
+
+    /// Collect backend names for all healthy backends serving `model`.
+    fn backend_names_for<'a>(reg: &'a Registry, model: &str) -> Vec<&'a str> {
+        reg.healthy_backends_for(model)
+            .iter()
+            .map(|&id| reg.backend(id).name)
+            .collect()
+    }
+
+    /// Construct a `ModelInfo` with custom `extra` metadata.
+    fn make_model_with_extra(name: &str, extra: serde_json::Value) -> ModelInfo {
         ModelInfo {
             name: name.to_string(),
-            extra: serde_json::Value::Object(serde_json::Map::new()),
+            extra,
         }
     }
 
-    fn set_backend_models(reg: &mut Registry, idx: usize, healthy: bool, models: Vec<ModelInfo>) {
-        reg.backends[idx].healthy = healthy;
-        reg.backends[idx].models = models;
-        reg.rebuild_model_map();
+    /// Construct, sanitize, and return a `ModelInfo`.
+    fn sanitized(name: &str, extra: serde_json::Value) -> ModelInfo {
+        let mut m = make_model_with_extra(name, extra);
+        super::sanitize_model_entry(&mut m);
+        m
+    }
+
+    /// Create a fresh registry with one healthy backend serving `models`.
+    fn reg_with_healthy(idx: usize, models: &[&str]) -> Registry {
+        let mut reg = Registry::new(&test_config());
+        setup_backend(
+            &mut reg,
+            idx,
+            true,
+            None,
+            models.iter().map(|n| make_model(n)).collect(),
+        );
+        reg
+    }
+
+    /// Set up both backends serving the same model, with backend 0 in a
+    /// given health/grace state and backend 1 healthy.
+    fn reg_dual_serving(model: &str, b0_healthy: bool, b0_grace: Option<Duration>) -> Registry {
+        let mut reg = Registry::new(&test_config());
+        setup_backend(&mut reg, 0, b0_healthy, b0_grace, vec![make_model(model)]);
+        setup_backend(&mut reg, 1, true, None, vec![make_model(model)]);
+        reg
+    }
+
+    /// Set up both backends with no models, only health flags.
+    fn reg_health_only(b0_healthy: bool, b1_healthy: bool) -> Registry {
+        let mut reg = Registry::new(&test_config());
+        setup_backend(&mut reg, 0, b0_healthy, None, vec![]);
+        setup_backend(&mut reg, 1, b1_healthy, None, vec![]);
+        reg
     }
 
     #[test]
@@ -480,126 +531,76 @@ mod tests {
 
     #[test]
     fn lookup_exact_match() {
-        let mut reg = Registry::new(&test_config());
-        set_backend_models(
-            &mut reg,
-            0,
-            true,
-            vec![make_model("fixt/home-3b-v3:latest")],
-        );
-
-        let id = reg.lookup("fixt/home-3b-v3:latest").unwrap();
-        assert_eq!(reg.backend(id).name, "cuda");
+        let reg = reg_with_healthy(0, &["fixt/home-3b-v3:latest"]);
+        assert_lookup_name(&reg, "fixt/home-3b-v3:latest", "cuda");
     }
 
     #[test]
     fn lookup_prefix_match() {
-        let mut reg = Registry::new(&test_config());
-        set_backend_models(&mut reg, 1, true, vec![make_model("qwen3.5:latest")]);
-
-        let id = reg.lookup("qwen3.5").unwrap();
-        assert_eq!(reg.backend(id).name, "rocm");
+        let reg = reg_with_healthy(1, &["qwen3.5:latest"]);
+        assert_lookup_name(&reg, "qwen3.5", "rocm");
     }
 
     #[test]
     fn lookup_exact_tag_preferred() {
-        let mut reg = Registry::new(&test_config());
-        set_backend_models(
-            &mut reg,
-            1,
-            true,
-            vec![make_model("qwen3.5:latest"), make_model("glm-4.7-flash")],
-        );
-
-        let id = reg.lookup("glm-4.7-flash").unwrap();
-        assert_eq!(reg.backend(id).name, "rocm");
+        let reg = reg_with_healthy(1, &["qwen3.5:latest", "glm-4.7-flash"]);
+        assert_lookup_name(&reg, "glm-4.7-flash", "rocm");
     }
 
     #[test]
     fn lookup_unknown_returns_none() {
-        let mut reg = Registry::new(&test_config());
-        set_backend_models(&mut reg, 0, true, vec![make_model("model:v1")]);
+        let reg = reg_with_healthy(0, &["model:v1"]);
         assert!(reg.lookup("nonexistent").is_none());
     }
 
     #[test]
     fn healthy_backends_for_single_homed_returns_one() {
-        let mut reg = Registry::new(&test_config());
-        set_backend_models(&mut reg, 0, true, vec![make_model("jina-embed:v1")]);
+        let reg = reg_with_healthy(0, &["jina-embed:v1"]);
 
-        let ids = reg.healthy_backends_for("jina-embed:v1");
-        assert_eq!(ids.len(), 1);
-        assert_eq!(reg.backend(ids[0]).name, "cuda");
-
+        assert_eq!(backend_names_for(&reg, "jina-embed:v1"), vec!["cuda"]);
         // Prefix form resolves to the same single backend.
-        let by_prefix = reg.healthy_backends_for("jina-embed");
-        assert_eq!(by_prefix.len(), 1);
-        assert_eq!(reg.backend(by_prefix[0]).name, "cuda");
+        assert_eq!(backend_names_for(&reg, "jina-embed"), vec!["cuda"]);
     }
 
     #[test]
     fn healthy_backends_for_multi_homed_lists_primary_first() {
-        let mut reg = Registry::new(&test_config());
-        set_backend_models(&mut reg, 0, true, vec![make_model("shared:v1")]);
-        set_backend_models(&mut reg, 1, true, vec![make_model("shared:v1")]);
+        let reg = reg_dual_serving("shared:v1", true, None);
 
-        let names: Vec<&str> = reg
-            .healthy_backends_for("shared:v1")
-            .iter()
-            .map(|&id| reg.backend(id).name)
-            .collect();
         // cuda is first in config order and is the lookup primary.
-        assert_eq!(names, vec!["cuda", "rocm"]);
-        assert_eq!(reg.backend(reg.lookup("shared:v1").unwrap()).name, "cuda");
+        assert_eq!(backend_names_for(&reg, "shared:v1"), vec!["cuda", "rocm"]);
+        assert_lookup_name(&reg, "shared:v1", "cuda");
     }
 
     #[test]
     fn healthy_backends_for_excludes_unhealthy_serving_backend() {
-        let mut reg = Registry::new(&test_config());
         // cuda serves the model but is hard-down (no grace); rocm is healthy.
-        reg.backends[0].healthy = false;
-        reg.backends[0].grace_deadline = None;
-        reg.backends[0].models = vec![make_model("m:v1")];
-        set_backend_models(&mut reg, 1, true, vec![make_model("m:v1")]);
-
-        let ids = reg.healthy_backends_for("m:v1");
-        assert_eq!(ids.len(), 1);
-        assert_eq!(reg.backend(ids[0]).name, "rocm");
+        let reg = reg_dual_serving("m:v1", false, None);
+        assert_eq!(backend_names_for(&reg, "m:v1"), vec!["rocm"]);
     }
 
     #[test]
     fn healthy_backends_for_excludes_grace_period_backend() {
-        let mut reg = Registry::new(&test_config());
         // cuda is in its grace period: still routable via `lookup`, but NOT a
         // healthy failover candidate.
-        reg.backends[0].healthy = false;
-        reg.backends[0].grace_deadline = Some(Instant::now() + Duration::from_secs(60));
-        reg.backends[0].models = vec![make_model("m:v1")];
-        set_backend_models(&mut reg, 1, true, vec![make_model("m:v1")]);
+        let reg = reg_dual_serving("graced:v1", false, Some(Duration::from_secs(60)));
 
         // lookup still finds the graced backend (first reachable)...
-        assert_eq!(reg.backend(reg.lookup("m:v1").unwrap()).name, "cuda");
+        assert_lookup_name(&reg, "graced:v1", "cuda");
         // ...but healthy_backends_for excludes it.
-        let names: Vec<&str> = reg
-            .healthy_backends_for("m:v1")
-            .iter()
-            .map(|&id| reg.backend(id).name)
-            .collect();
-        assert_eq!(names, vec!["rocm"]);
+        assert_eq!(backend_names_for(&reg, "graced:v1"), vec!["rocm"]);
     }
 
     #[test]
     fn healthy_backends_for_absent_model_is_empty() {
-        let mut reg = Registry::new(&test_config());
-        set_backend_models(&mut reg, 0, true, vec![make_model("present:v1")]);
+        let reg = reg_with_healthy(0, &["present:v1"]);
         assert!(reg.healthy_backends_for("absent").is_empty());
     }
 
     #[test]
     fn available_models_returns_only_qualified_names() {
         let mut reg = Registry::new(&test_config());
-        set_backend_models(&mut reg, 0, true, vec![make_model("a:v1")]);
-        set_backend_models(&mut reg, 1, true, vec![make_model("b:latest")]);
+        setup_backend(&mut reg, 0, true, None, vec![make_model("a:v1")]);
+        setup_backend(&mut reg, 1, true, None, vec![make_model("b:latest")]);
 
         let mut available = reg.available_model_names();
         available.sort();
@@ -609,10 +610,7 @@ mod tests {
     #[test]
     fn unhealthy_without_grace_excluded() {
         let mut reg = Registry::new(&test_config());
-        reg.backends[0].healthy = false;
-        reg.backends[0].grace_deadline = None;
-        reg.backends[0].models = vec![make_model("orphan:v1")];
-        reg.rebuild_model_map();
+        setup_backend(&mut reg, 0, false, None, vec![make_model("orphan:v1")]);
 
         assert!(reg.lookup("orphan:v1").is_none());
     }
@@ -620,72 +618,56 @@ mod tests {
     #[test]
     fn unhealthy_within_grace_included() {
         let mut reg = Registry::new(&test_config());
-        reg.backends[0].healthy = false;
-        reg.backends[0].grace_deadline = Some(Instant::now() + Duration::from_secs(60));
-        reg.backends[0].models = vec![make_model("graced:v1")];
-        reg.rebuild_model_map();
+        setup_backend(
+            &mut reg,
+            0,
+            false,
+            Some(Duration::from_secs(60)),
+            vec![make_model("graced:v1")],
+        );
 
-        let id = reg.lookup("graced:v1").unwrap();
-        assert_eq!(reg.backend(id).name, "cuda");
+        assert_lookup_name(&reg, "graced:v1", "cuda");
     }
 
     #[test]
     fn empty_model_list_clears_previous() {
-        let mut reg = Registry::new(&test_config());
-        set_backend_models(&mut reg, 0, true, vec![make_model("old:v1")]);
+        let reg = reg_with_healthy(0, &["old:v1"]);
         assert!(reg.lookup("old:v1").is_some());
 
-        set_backend_models(&mut reg, 0, true, vec![]);
+        let mut reg = reg;
+        setup_backend(&mut reg, 0, true, None, vec![]);
         assert!(reg.lookup("old:v1").is_none());
     }
 
     #[test]
     fn models_from_both_backends() {
         let mut reg = Registry::new(&test_config());
-        reg.backends[0].healthy = true;
-        reg.backends[0].models = vec![make_model("small:v1")];
-        reg.backends[1].healthy = true;
-        reg.backends[1].models = vec![make_model("large:v1")];
-        reg.rebuild_model_map();
+        setup_backend(&mut reg, 0, true, None, vec![make_model("small:v1")]);
+        setup_backend(&mut reg, 1, true, None, vec![make_model("large:v1")]);
 
-        assert_eq!(reg.backend(reg.lookup("small:v1").unwrap()).name, "cuda");
-        assert_eq!(reg.backend(reg.lookup("large:v1").unwrap()).name, "rocm");
+        assert_lookup_name(&reg, "small:v1", "cuda");
+        assert_lookup_name(&reg, "large:v1", "rocm");
     }
 
     #[test]
     fn duplicate_model_first_backend_wins() {
-        let mut reg = Registry::new(&test_config());
-        reg.backends[0].healthy = true;
-        reg.backends[0].models = vec![make_model("shared:latest")];
-        reg.backends[1].healthy = true;
-        reg.backends[1].models = vec![make_model("shared:latest")];
-        reg.rebuild_model_map();
+        let reg = reg_dual_serving("shared:latest", true, None);
 
         // First backend in config wins for both exact and prefix lookups.
-        let exact = reg.lookup("shared:latest").unwrap();
-        assert_eq!(reg.backend(exact).name, "cuda");
-        let prefix = reg.lookup("shared").unwrap();
-        assert_eq!(reg.backend(prefix).name, "cuda");
+        assert_lookup_name(&reg, "shared:latest", "cuda");
+        assert_lookup_name(&reg, "shared", "cuda");
     }
 
     #[test]
     fn any_healthy_returns_first_healthy() {
-        let mut reg = Registry::new(&test_config());
-        reg.backends[0].healthy = true;
-        reg.backends[1].healthy = true;
-
-        let id = reg.any_healthy().unwrap();
-        assert_eq!(reg.backend(id).name, "cuda");
+        let reg = reg_health_only(true, true);
+        assert_eq!(reg.backend(reg.any_healthy().unwrap()).name, "cuda");
     }
 
     #[test]
     fn any_healthy_skips_unhealthy() {
-        let mut reg = Registry::new(&test_config());
-        reg.backends[0].healthy = false;
-        reg.backends[1].healthy = true;
-
-        let id = reg.any_healthy().unwrap();
-        assert_eq!(reg.backend(id).name, "rocm");
+        let reg = reg_health_only(false, true);
+        assert_eq!(reg.backend(reg.any_healthy().unwrap()).name, "rocm");
     }
 
     #[test]
@@ -701,11 +683,7 @@ mod tests {
 
     #[test]
     fn sanitize_replaces_empty_modified_at() {
-        let mut m = ModelInfo {
-            name: "x".to_string(),
-            extra: serde_json::json!({"modified_at": "", "size": 123u64}),
-        };
-        super::sanitize_model_entry(&mut m);
+        let m = sanitized("x", serde_json::json!({"modified_at": "", "size": 123u64}));
         assert_eq!(
             m.extra.get("modified_at").and_then(|v| v.as_str()),
             Some("1970-01-01T00:00:00Z")
@@ -715,21 +693,14 @@ mod tests {
 
     #[test]
     fn sanitize_replaces_empty_size() {
-        let mut m = ModelInfo {
-            name: "x".to_string(),
-            extra: serde_json::json!({"modified_at": "2026-01-01T00:00:00Z", "size": ""}),
-        };
-        super::sanitize_model_entry(&mut m);
+        let input = serde_json::json!({"modified_at": "2026-01-01T00:00:00Z", "size": ""});
+        let m = sanitized("x", input);
         assert_eq!(m.extra.get("size").and_then(|v| v.as_u64()), Some(0));
     }
 
     #[test]
     fn sanitize_fills_missing_fields() {
-        let mut m = ModelInfo {
-            name: "x".to_string(),
-            extra: serde_json::json!({}),
-        };
-        super::sanitize_model_entry(&mut m);
+        let m = sanitized("x", serde_json::json!({}));
         assert!(m.extra.get("modified_at").is_some());
         assert_eq!(m.extra.get("size").and_then(|v| v.as_u64()), Some(0));
         // Regression for HA's `KeyError: 'model'` (commit 0141020): when
@@ -751,11 +722,7 @@ mod tests {
         // it alone. This is the contract for the no-op-on-well-formed
         // path that `sanitize_leaves_well_formed_entry_alone` exercises,
         // pinned explicitly so refactors don't silently change behaviour.
-        let mut m = ModelInfo {
-            name: "x".to_string(),
-            extra: serde_json::json!({"model": "y"}),
-        };
-        super::sanitize_model_entry(&mut m);
+        let m = sanitized("x", serde_json::json!({"model": "y"}));
         assert_eq!(m.extra.get("model").and_then(|v| v.as_str()), Some("y"));
     }
 
@@ -767,11 +734,7 @@ mod tests {
             "size": 9_608_350_718u64,
             "digest": "abc123",
         });
-        let mut m = ModelInfo {
-            name: "gemma:2b".to_string(),
-            extra: original.clone(),
-        };
-        super::sanitize_model_entry(&mut m);
+        let m = sanitized("gemma:2b", original.clone());
         assert_eq!(m.extra, original);
     }
 
@@ -780,14 +743,8 @@ mod tests {
         // serde(flatten) over a primitive value never appears in practice
         // (TagsResponse deserialise would fail first), but guard the
         // function against panicking if it ever did.
-        let mut m = ModelInfo {
-            name: "x".to_string(),
-            extra: serde_json::Value::String("not-an-object".to_string()),
-        };
-        super::sanitize_model_entry(&mut m);
-        assert_eq!(
-            m.extra,
-            serde_json::Value::String("not-an-object".to_string())
-        );
+        let not_an_object = serde_json::Value::String("not-an-object".to_string());
+        let m = sanitized("x", not_an_object.clone());
+        assert_eq!(m.extra, not_an_object);
     }
 }

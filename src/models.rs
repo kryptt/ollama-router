@@ -10,6 +10,11 @@ use serde_json::{Value, json};
 use crate::registry::{ModelInfo, Registry, SharedRegistry};
 use crate::response::{json_ok, json_status};
 
+/// Wrap a serialisable model list in a `{ "models": [...] }` JSON response.
+fn models_response(models: impl serde::Serialize) -> Response {
+    json_ok(json!({ "models": models }))
+}
+
 /// Per-backend timeout for the `/api/ps` fan-out. Independent of the shared
 /// client's request timeout (which is sized for long LLM streams).
 const PS_FANOUT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -17,8 +22,7 @@ const PS_FANOUT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Build a merged `/api/tags` response from the registry's discovery cache.
 /// Deduplicates by model name, preferring the first backend encountered.
 pub fn api_tags_response(reg: &Registry) -> Response {
-    let models = reg.reachable_models();
-    json_ok(json!({ "models": models }))
+    models_response(reg.reachable_models())
 }
 
 /// Build a merged `/v1/models` response (OpenAI-compatible list).
@@ -116,7 +120,7 @@ pub async fn api_ps_response(registry: &SharedRegistry, client: &Client) -> Resp
     });
     let per_backend: Vec<Vec<Value>> = join_all(futs).await;
     let models: Vec<Value> = per_backend.into_iter().flatten().collect();
-    json_ok(json!({ "models": models }))
+    models_response(models)
 }
 
 /// Which `/api/ps`-shaped endpoint a backend speaks, derived from its
@@ -151,30 +155,41 @@ struct BackendSnapshot {
     models: Vec<ModelInfo>,
 }
 
-async fn fetch_ollama_ps(client: &Client, b: &BackendSnapshot) -> Vec<Value> {
-    let url = format!("{}/api/ps", b.url);
-    let resp = match client.get(&url).timeout(PS_FANOUT_TIMEOUT).send().await {
+/// Fetch a URL with `PS_FANOUT_TIMEOUT`, deserialise the body as `T`, and
+/// return `Some(T)` on success.  Returns `None` on any failure (non-2xx
+/// status, network error, or JSON parse error), logging each failure at
+/// DEBUG level so callers can unconditionally unwrap-or-default.
+async fn fetch_json_or_empty<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    url: &str,
+    backend_name: &str,
+    endpoint_label: &str,
+) -> Option<T> {
+    let resp = match client.get(url).timeout(PS_FANOUT_TIMEOUT).send().await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
-            tracing::debug!(backend = %b.name, status = %r.status(), "/api/ps non-success");
-            return Vec::new();
+            tracing::debug!(backend = %backend_name, status = %r.status(), "{endpoint_label} non-success");
+            return None;
         }
         Err(e) => {
-            tracing::debug!(backend = %b.name, error = %e, "/api/ps fetch failed");
-            return Vec::new();
+            tracing::debug!(backend = %backend_name, error = %e, "{endpoint_label} fetch failed");
+            return None;
         }
     };
-    match resp.json::<Value>().await {
-        Ok(v) => v
-            .get("models")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default(),
+    match resp.json().await {
+        Ok(v) => Some(v),
         Err(e) => {
-            tracing::debug!(backend = %b.name, error = %e, "/api/ps json parse failed");
-            Vec::new()
+            tracing::debug!(backend = %backend_name, error = %e, "{endpoint_label} json parse failed");
+            None
         }
     }
+}
+
+async fn fetch_ollama_ps(client: &Client, b: &BackendSnapshot) -> Vec<Value> {
+    let url = format!("{}/api/ps", b.url);
+    let body: Option<Value> = fetch_json_or_empty(client, &url, &b.name, "/api/ps").await;
+    body.and_then(|v| v.get("models").and_then(Value::as_array).cloned())
+        .unwrap_or_default()
 }
 
 /// Shape of llama-swap's `/running` endpoint. Shared with `heartbeat`'s
@@ -202,32 +217,19 @@ pub(crate) struct RunningEntry {
 
 async fn fetch_llama_swap_running(client: &Client, b: &BackendSnapshot) -> Vec<Value> {
     let url = format!("{}/running", b.url);
-    let resp = match client.get(&url).timeout(PS_FANOUT_TIMEOUT).send().await {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => {
-            tracing::debug!(backend = %b.name, status = %r.status(), "/running non-success");
-            return Vec::new();
-        }
-        Err(e) => {
-            tracing::debug!(backend = %b.name, error = %e, "/running fetch failed");
-            return Vec::new();
-        }
-    };
-    let body: RunningResponse = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::debug!(backend = %b.name, error = %e, "/running json parse failed");
-            return Vec::new();
-        }
-    };
-    body.running
-        .into_iter()
-        .filter(|r| !r.model.is_empty())
-        .map(|r| {
-            let context_length = per_slot_context_length(&r.cmd);
-            ps_entry(&r.model, &b.models, context_length)
-        })
-        .collect()
+    let body: Option<RunningResponse> =
+        fetch_json_or_empty(client, &url, &b.name, "/running").await;
+    body.map(|resp| {
+        resp.running
+            .into_iter()
+            .filter(|r| !r.model.is_empty())
+            .map(|r| {
+                let context_length = per_slot_context_length(&r.cmd);
+                ps_entry(&r.model, &b.models, context_length)
+            })
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 fn synthesise_all_loaded(b: &BackendSnapshot) -> Vec<Value> {
@@ -320,6 +322,21 @@ fn parse_llama_server_flags(cmd: &str) -> (Option<u64>, Option<u64>) {
 mod tests {
     use super::*;
 
+    fn make_model_info(name: &str, extra: Value) -> ModelInfo {
+        ModelInfo {
+            name: name.into(),
+            extra,
+        }
+    }
+
+    /// Rich discovery metadata for the canonical test model.
+    fn qwen_discovery_models() -> Vec<ModelInfo> {
+        vec![make_model_info(
+            "qwen3.6:latest",
+            json!({"size": 21_000_000_000_u64, "digest": "abc123", "details": {"family": "qwen"}}),
+        )]
+    }
+
     #[test]
     fn classify_known_backends() {
         assert_eq!(classify("ollama-cuda"), BackendKind::Ollama);
@@ -333,14 +350,7 @@ mod tests {
 
     #[test]
     fn ps_entry_merges_discovery_metadata() {
-        let models = vec![ModelInfo {
-            name: "qwen3.6:latest".into(),
-            extra: json!({
-                "size": 21_000_000_000_u64,
-                "digest": "abc123",
-                "details": {"family": "qwen"}
-            }),
-        }];
+        let models = qwen_discovery_models();
         let entry = ps_entry("qwen3.6:latest", &models, None);
         assert_eq!(entry["name"], "qwen3.6:latest");
         assert_eq!(entry["model"], "qwen3.6:latest");
@@ -385,10 +395,10 @@ mod tests {
     fn ps_entry_real_expires_at_from_registry_wins() {
         // If discovery already carries an expires_at (real Ollama upstream),
         // we don't clobber it with the synthesised one.
-        let models = vec![ModelInfo {
-            name: "qwen3.6:latest".into(),
-            extra: json!({"expires_at": "2030-01-01T00:00:00Z"}),
-        }];
+        let models = vec![make_model_info(
+            "qwen3.6:latest",
+            json!({"expires_at": "2030-01-01T00:00:00Z"}),
+        )];
         let entry = ps_entry("qwen3.6:latest", &models, None);
         assert_eq!(entry["expires_at"], "2030-01-01T00:00:00Z");
     }
@@ -417,35 +427,46 @@ mod tests {
         assert_eq!(entries[1]["name"], "tinyllama:latest");
     }
 
+    fn assert_flags(cmd: &str, expected: (Option<u64>, Option<u64>)) {
+        assert_eq!(parse_llama_server_flags(cmd), expected, "cmd: {cmd:?}");
+    }
+
     #[test]
     fn parse_cmd_extracts_space_separated_flags() {
-        let cmd = "llama-server --model /m --ctx-size 262144 --parallel 6 --jinja";
-        assert_eq!(parse_llama_server_flags(cmd), (Some(262_144), Some(6)));
+        assert_flags(
+            "llama-server --model /m --ctx-size 262144 --parallel 6 --jinja",
+            (Some(262_144), Some(6)),
+        );
     }
 
     #[test]
     fn parse_cmd_extracts_equals_separated_flags() {
-        let cmd = "llama-server --ctx-size=4096 --parallel=2";
-        assert_eq!(parse_llama_server_flags(cmd), (Some(4_096), Some(2)));
+        assert_flags(
+            "llama-server --ctx-size=4096 --parallel=2",
+            (Some(4_096), Some(2)),
+        );
     }
 
     #[test]
     fn parse_cmd_handles_short_flags() {
-        let cmd = "llama-server -c 8192 -np 4";
-        assert_eq!(parse_llama_server_flags(cmd), (Some(8_192), Some(4)));
+        assert_flags("llama-server -c 8192 -np 4", (Some(8_192), Some(4)));
     }
 
     #[test]
     fn parse_cmd_tolerates_newlines() {
         // llama-swap's /running response embeds newlines in `cmd`.
+        // Same flags as the space-separated variant; the parse result must be
+        // identical regardless of whitespace flavour.
         let cmd = "llama-server\n--model /m\n--ctx-size 262144\n--parallel 6\n--jinja\n";
-        assert_eq!(parse_llama_server_flags(cmd), (Some(262_144), Some(6)));
+        assert_flags(cmd, (Some(262_144), Some(6)));
     }
 
     #[test]
     fn per_slot_context_divides_by_parallel() {
-        let cmd = "llama-server --ctx-size 262144 --parallel 6";
-        assert_eq!(per_slot_context_length(cmd), Some(43_690));
+        assert_eq!(
+            per_slot_context_length("llama-server --ctx-size 262144 --parallel 6"),
+            Some(43_690),
+        );
     }
 
     #[test]

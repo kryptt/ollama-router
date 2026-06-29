@@ -9,13 +9,12 @@ use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
-use ollama_router::auth::TokenStore;
-use ollama_router::config::Config;
 use ollama_router::handler::{self, AppState};
 use ollama_router::heartbeat::HeartbeatConfig;
 use ollama_router::metrics::Metrics;
 use ollama_router::registry;
 use ollama_router::routes::ROUTED_PATHS;
+use ollama_router::{auth::TokenStore, config::Config};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -213,18 +212,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Log the failure to install a signal handler and park this future
+/// forever. The other arm of the `select!` (or the servers' own
+/// lifecycles) still governs shutdown — a broken handler must not
+/// crash the process.
+async fn log_handler_failure_and_park(error: impl std::fmt::Display, handler: &str) {
+    tracing::warn!(%error, handler, "failed to install signal handler; ignoring");
+    std::future::pending::<()>().await;
+}
+
 /// Resolve when the process receives SIGTERM, SIGINT, or Ctrl-C.
 /// SIGTERM is what Kubernetes sends on pod termination; Ctrl-C is the
 /// developer-affordance equivalent. The future returns once *either*
 /// fires — both halves are racing in `tokio::select!`.
 async fn wait_for_shutdown_signal() {
     let ctrl_c = async {
-        // If the Ctrl-C handler can't be installed, log and never resolve this
-        // arm — the SIGTERM arm (and the servers' own lifecycles) still govern
-        // shutdown. A failed handler must not panic the process.
         if let Err(e) = tokio::signal::ctrl_c().await {
-            tracing::warn!(error = %e, "failed to install Ctrl-C handler; ignoring");
-            std::future::pending::<()>().await;
+            log_handler_failure_and_park(e, "Ctrl-C").await;
         }
     };
     #[cfg(unix)]
@@ -234,11 +238,7 @@ async fn wait_for_shutdown_signal() {
                 sig.recv().await;
             }
             Err(e) => {
-                // Same fallback as Ctrl-C: log and park this arm forever rather
-                // than aborting. Kubernetes SIGTERM-driven shutdown is degraded,
-                // but the process stays up and serves until killed.
-                tracing::warn!(error = %e, "failed to install SIGTERM handler; ignoring");
-                std::future::pending::<()>().await;
+                log_handler_failure_and_park(e, "SIGTERM").await;
             }
         }
     };

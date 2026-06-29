@@ -4,81 +4,138 @@ use axum::Router;
 use axum::body::Bytes;
 use axum::http::StatusCode;
 use axum::routing::{any, get, post};
+use reqwest::Client;
 use tokio::net::TcpListener;
 
 use ollama_router::auth::TokenStore;
 use ollama_router::config::{Backend, Config};
-use ollama_router::registry;
+use ollama_router::registry::{self, Registry, SharedRegistry};
 use ollama_router::routes::{ROUTED_PATHS, default_stream_for_path};
 
-async fn start_mock_backend(
-    models: Vec<&str>,
-) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-    let tags_json = serde_json::json!({
-        "models": models.iter().map(|m| serde_json::json!({"name": m})).collect::<Vec<_>>()
-    })
-    .to_string();
+// ─── Test helpers ────────────────────────────────────────────────────────────
 
-    let app = Router::new()
-        .route(
-            "/api/tags",
-            get({
-                let tags = tags_json.clone();
-                move || {
-                    let tags = tags.clone();
-                    async move { (StatusCode::OK, tags) }
-                }
-            }),
-        )
-        .route(
-            "/api/chat",
-            post(|body: Bytes| async move { (StatusCode::OK, format!("echoed: {}", body.len())) }),
-        )
-        .route(
-            "/api/version",
-            get(|| async { (StatusCode::OK, r#"{"version":"0.9.0"}"#) }),
-        )
-        .fallback(any(
-            |uri: axum::extract::OriginalUri, body: Bytes| async move {
-                (
-                    StatusCode::OK,
-                    format!("fallback: {} {}", uri.0.path(), body.len()),
-                )
-            },
-        ));
-
+async fn spawn_test_server(app: Router) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-
-    let handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-
-    (addr, handle)
+    format!("http://{addr}")
 }
 
-#[tokio::test]
-async fn model_routing_to_correct_backend() {
-    let (cuda_addr, _h1) = start_mock_backend(vec!["fixt/home-3b-v3:latest"]).await;
-    let (rocm_addr, _h2) = start_mock_backend(vec!["glm-4.7-flash:latest"]).await;
-
-    let config = Config::from_backends(vec![
-        Backend::for_test("cuda", &format!("http://{cuda_addr}")),
-        Backend::for_test("rocm", &format!("http://{rocm_addr}")),
-    ]);
-
-    let reg = registry::new_shared(&config);
-
+fn spawn_discovery(reg: &SharedRegistry, config: &Config) {
     tokio::spawn({
         let reg = reg.clone();
         let config = config.clone();
         async move { registry::discovery_loop(reg, config).await }
     });
+}
 
+/// Sleep for discovery to complete, assert it finished, and return the
+/// read guard so callers can inspect the registry without a second lock.
+async fn run_discovery_to_completion<'a>(
+    reg: &'a SharedRegistry,
+    config: &Config,
+) -> tokio::sync::RwLockReadGuard<'a, Registry> {
+    spawn_discovery(reg, config);
     tokio::time::sleep(Duration::from_millis(500)).await;
+    let guard = reg.read().await;
+    assert!(guard.is_discovery_done());
+    guard
+}
 
-    let r = reg.read().await;
-    assert!(r.is_discovery_done());
+/// Create a single-backend config pointing at `url` and its shared registry.
+fn single_backend_config(name: &str, url: &str) -> (Config, SharedRegistry) {
+    let config = Config::from_backends(vec![Backend::for_test(name, url)]);
+    let reg = registry::new_shared(&config);
+    (config, reg)
+}
+
+/// Build a mock Ollama backend that advertises `models` on /api/tags,
+/// echoes on /api/chat, and catches everything else in a fallback.
+async fn start_mock_backend(models: Vec<&str>) -> String {
+    let tags_json = serde_json::json!({
+        "models": models.iter().map(|m| serde_json::json!({"name": m})).collect::<Vec<_>>()
+    })
+    .to_string();
+
+    let tags_handler = get({
+        let tags = tags_json.clone();
+        move || {
+            let tags = tags.clone();
+            async move { (StatusCode::OK, tags) }
+        }
+    });
+    let chat_handler =
+        post(
+            |payload: Bytes| async move { (StatusCode::OK, format!("echoed: {}", payload.len())) },
+        );
+    let version_handler = get(|| async { (StatusCode::OK, r#"{"version":"0.9.0"}"#) });
+    let catch_all = any(|uri: axum::extract::OriginalUri, body: Bytes| async move {
+        (
+            StatusCode::OK,
+            format!("fallback: {} {}", uri.0.path(), body.len()),
+        )
+    });
+
+    let app = Router::new()
+        .route("/api/tags", tags_handler)
+        .route("/api/chat", chat_handler)
+        .route("/api/version", version_handler)
+        .fallback(catch_all);
+
+    spawn_test_server(app).await
+}
+
+/// POST `{}` to `url`, assert the response status, and return the body text.
+async fn post_and_expect(client: &Client, url: &str, expected: StatusCode) -> String {
+    let resp = client.post(url).body("{}").send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        expected,
+        "POST {url} returned {}",
+        resp.status()
+    );
+    resp.text().await.unwrap()
+}
+
+/// Spin up the `build_routed_paths_only_router` behind a test server and
+/// return `(base_url, client)` ready for requests.
+async fn serve_routed_paths_router() -> (String, Client) {
+    let base = spawn_test_server(build_routed_paths_only_router()).await;
+    (base, Client::new())
+}
+
+/// Assert a `TokenStore` is enabled but rejects every token.
+async fn assert_enabled_but_rejects_all(store: &TokenStore) {
+    assert!(store.is_enabled());
+    assert!(!store.validate("anything").await);
+}
+
+/// Write `content` to a temp "tokens" file and return a `TokenStore` backed
+/// by it.  The returned `TempDir` keeps the file alive for the test scope.
+fn token_store_with_content(content: &str) -> (tempfile::TempDir, TokenStore) {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tokens");
+    std::fs::write(&file, content).unwrap();
+    let store = TokenStore::new(Some(file.to_str().unwrap()));
+    (dir, store)
+}
+
+// ─── Discovery + routing tests ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn model_routing_to_correct_backend() {
+    let cuda_url = start_mock_backend(vec!["fixt/home-3b-v3:latest"]).await;
+    let rocm_url = start_mock_backend(vec!["glm-4.7-flash:latest"]).await;
+
+    let backends = vec![
+        Backend::for_test("cuda", &cuda_url),
+        Backend::for_test("rocm", &rocm_url),
+    ];
+    let config = Config::from_backends(backends);
+    let reg = registry::new_shared(&config);
+    let r = run_discovery_to_completion(&reg, &config).await;
 
     let cuda_id = r.lookup("fixt/home-3b-v3:latest").unwrap();
     assert_eq!(r.backend(cuda_id).name, "cuda");
@@ -94,40 +151,24 @@ async fn model_routing_to_correct_backend() {
 
 #[tokio::test]
 async fn health_before_discovery_is_not_ready() {
-    let config = Config::from_backends(vec![Backend::for_test("test", "http://127.0.0.1:1")]);
-
-    let reg = registry::new_shared(&config);
+    let (_config, reg) = single_backend_config("test", "http://127.0.0.1:1");
     let r = reg.read().await;
     assert!(!r.is_discovery_done());
 }
 
 #[tokio::test]
 async fn discovery_marks_unreachable_backend_down() {
-    let config = Config::from_backends(vec![Backend::for_test("dead", "http://127.0.0.1:1")]);
-
-    let reg = registry::new_shared(&config);
-
-    tokio::spawn({
-        let reg = reg.clone();
-        let config = config.clone();
-        async move { registry::discovery_loop(reg, config).await }
-    });
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let r = reg.read().await;
-    assert!(r.is_discovery_done());
+    let (config, reg) = single_backend_config("dead", "http://127.0.0.1:1");
+    let r = run_discovery_to_completion(&reg, &config).await;
     assert!(r.any_healthy().is_none());
     assert!(r.available_model_names().is_empty());
 }
 
+// ─── TokenStore tests ───────────────────────────────────────────────────────
+
 #[tokio::test]
 async fn token_store_validates_correctly() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("tokens");
-    std::fs::write(&path, "token-abc\ntoken-def\n# comment\n\n").unwrap();
-
-    let store = TokenStore::new(Some(path.to_str().unwrap()));
+    let (_dir, store) = token_store_with_content("token-abc\ntoken-def\n# comment\n\n");
 
     assert!(store.is_enabled());
     assert!(store.validate("token-abc").await);
@@ -145,15 +186,11 @@ async fn token_store_no_file_disables_auth() {
 
 #[tokio::test]
 async fn token_store_reload_picks_up_changes() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("tokens");
-    std::fs::write(&path, "old-token\n").unwrap();
-
-    let store = TokenStore::new(Some(path.to_str().unwrap()));
+    let (dir, store) = token_store_with_content("old-token\n");
     assert!(store.validate("old-token").await);
     assert!(!store.validate("new-token").await);
 
-    std::fs::write(&path, "new-token\n").unwrap();
+    std::fs::write(dir.path().join("tokens"), "new-token\n").unwrap();
     store.reload().await;
 
     assert!(!store.validate("old-token").await);
@@ -162,24 +199,16 @@ async fn token_store_reload_picks_up_changes() {
 
 #[tokio::test]
 async fn token_store_empty_file_fails_closed() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("tokens");
-    std::fs::write(&path, "# only a comment\n\n").unwrap();
-
-    let store = TokenStore::new(Some(path.to_str().unwrap()));
-
-    // Auth is enabled (path configured) but no valid tokens → all rejected
-    assert!(store.is_enabled());
-    assert!(!store.validate("anything").await);
+    let (_dir, store) = token_store_with_content("# only a comment\n\n");
+    // Auth is enabled (path configured) but no valid tokens -> all rejected
+    assert_enabled_but_rejects_all(&store).await;
 }
 
 #[tokio::test]
 async fn token_store_missing_file_fails_closed() {
     let store = TokenStore::new(Some("/nonexistent/path/tokens"));
-
-    // Path configured but file missing → auth enabled, all rejected
-    assert!(store.is_enabled());
-    assert!(!store.validate("anything").await);
+    // Path configured but file missing -> auth enabled, all rejected
+    assert_enabled_but_rejects_all(&store).await;
 }
 
 // ─── Routes contract (item #7 from the 2026-05-20 review) ────────────────────
@@ -194,38 +223,33 @@ async fn token_store_missing_file_fails_closed() {
 /// so if a path string ever stops being acceptable to axum, this test
 /// fails before the production binary panics at startup.
 fn build_routed_paths_only_router() -> Router {
-    let mut router = Router::new();
-    for entry in ROUTED_PATHS {
-        let path = entry.path;
-        router = router.route(
-            path,
-            post(move || async move { (StatusCode::OK, format!("routed: {path}")) }),
-        );
-    }
-    router.fallback(any(|| async { StatusCode::NOT_FOUND }))
+    ROUTED_PATHS
+        .iter()
+        .fold(Router::new(), |acc, entry| {
+            let path = entry.path;
+            acc.route(
+                path,
+                post(move || async move { (StatusCode::OK, format!("routed: {path}")) }),
+            )
+        })
+        .fallback(any(|| async { StatusCode::NOT_FOUND }))
 }
+
+/// Paths that should NOT be in ROUTED_PATHS and must 404.
+const NON_ROUTED_PATHS: &[&str] = &[
+    "/some/future/path",
+    "/v1/audio/transcriptions", // OpenAI Whisper — not in ROUTED_PATHS
+    "/api/version",             // valid Ollama endpoint, not in our model_route set
+    "/",
+];
 
 #[tokio::test]
 async fn every_routed_path_actually_routes_through_axum() {
-    let app = build_routed_paths_only_router();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let (base, client) = serve_routed_paths_router().await;
 
-    let client = reqwest::Client::new();
     for entry in ROUTED_PATHS {
-        let url = format!("http://{}{}", addr, entry.path);
-        let resp = client.post(&url).body("{}").send().await.unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "ROUTED_PATHS entry {} did not route through axum (got {})",
-            entry.path,
-            resp.status(),
-        );
-        let body = resp.text().await.unwrap();
+        let url = format!("{base}{}", entry.path);
+        let body = post_and_expect(&client, &url, StatusCode::OK).await;
         assert_eq!(body, format!("routed: {}", entry.path));
     }
 }
@@ -235,28 +259,11 @@ async fn paths_not_in_routed_paths_get_404() {
     // Sanity: the fallback wired above must catch anything not declared
     // in ROUTED_PATHS. If a future change makes the router permissive
     // (e.g. wildcard match that swallows everything), this fails.
-    let app = build_routed_paths_only_router();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+    let (base, client) = serve_routed_paths_router().await;
 
-    let client = reqwest::Client::new();
-    for unknown in &[
-        "/some/future/path",
-        "/v1/audio/transcriptions", // OpenAI Whisper — not in ROUTED_PATHS
-        "/api/version",             // valid Ollama endpoint, not in our model_route set
-        "/",
-    ] {
-        let url = format!("http://{addr}{unknown}");
-        let resp = client.post(&url).body("{}").send().await.unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::NOT_FOUND,
-            "expected {unknown} to 404 (not in ROUTED_PATHS), got {}",
-            resp.status(),
-        );
+    for unknown in NON_ROUTED_PATHS {
+        let url = format!("{base}{unknown}");
+        post_and_expect(&client, &url, StatusCode::NOT_FOUND).await;
     }
 }
 

@@ -82,6 +82,20 @@ backend wiring:
 | `OLLAMA_ROUTER_CONNECT_TIMEOUT` | `10` | Connect-timeout (seconds) for upstream requests. |
 | `OLLAMA_ROUTER_REQUEST_TIMEOUT` | `300` | End-to-end request timeout (seconds) for upstream requests. Long enough for streaming LLM responses. |
 | `OLLAMA_ROUTER_TOKENS_FILE` | (unset, no auth) | Path to a newline-separated file of valid bearer tokens. Reloaded every 60 s without restart. |
+| `OLLAMA_ROUTER_MODEL_ALLOW` | (unset, publish everything) | Per-backend discovery allowlist: `backend=model1\|model2,other=model3`. A backend not named here publishes its full catalogue, so this is purely additive. Naming a backend that isn't in `OLLAMA_ROUTER_BACKENDS`, or an entry with no models, fails at startup. |
+| `OLLAMA_ROUTER_EXTRA_CA_FILE` | (unset, built-in roots only) | Path to a PEM bundle of additional root certificates to trust on outbound requests. Needed when a backend is reached through a TLS-intercepting egress proxy whose CA is private. Applied to both the proxy and discovery clients. |
+| `OLLAMA_ROUTER_STRIP_AUTH` | (unset, forward everything) | Comma-separated backend names whose upstream requests should have the client's `authorization` header dropped. Use for backends whose credential is attached downstream (by an egress proxy): the inbound token is a *router* token, useless to the backend and not something to send to a third party. |
+
+Notes on the model allowlist:
+
+- It exists for **hosted aggregator backends**. A local llama-swap serves a
+  handful of models and wants none of this; a hosted endpoint may advertise
+  hundreds, which buries the local models in every consumer's picker.
+- It is also the **spend boundary**. Anything that can reach the router can
+  request any model the router publishes. For a metered backend, the allowlist
+  is what stops a client from putting a frontier model on your bill.
+- Filtering happens at discovery, so an excluded model is not merely hidden —
+  it never enters the model map and requests for it 404 like any unknown model.
 
 Cold-load heartbeat (kicks in when an upstream model isn't loaded):
 

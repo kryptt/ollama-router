@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt;
 use std::net::SocketAddr;
@@ -8,6 +9,21 @@ use std::net::SocketAddr;
 pub struct Backend {
     pub name: String,
     pub url: String,
+    /// Optional discovery allowlist. `None` = publish every model the backend
+    /// advertises (the behaviour for every local backend). `Some(set)` = keep
+    /// only these model names.
+    ///
+    /// This exists for hosted aggregators: Nous Portal advertises ~350 models,
+    /// and publishing all of them would bury the local models in every
+    /// consumer's picker *and* let anything that reaches the router spend
+    /// portal credits on a frontier model. An allowlist is the only thing
+    /// bounding that blast radius — see `OLLAMA_ROUTER_MODEL_ALLOW`.
+    pub allow_models: Option<HashSet<String>>,
+    /// Drop the client's `authorization` header before forwarding to this
+    /// backend. For backends whose credential is injected by an egress proxy:
+    /// our inbound token is not a backend credential, and sending it to a
+    /// third party is both useless and a leak. See `OLLAMA_ROUTER_STRIP_AUTH`.
+    pub strip_auth: bool,
 }
 
 /// A "if a request for `from_model` looks bigger than this model's
@@ -58,6 +74,8 @@ impl Backend {
         Ok(Backend {
             name: name.to_string(),
             url: url.trim_end_matches('/').to_string(),
+            allow_models: None,
+            strip_auth: false,
         })
     }
 
@@ -66,8 +84,46 @@ impl Backend {
         Backend {
             name: name.to_string(),
             url: url.to_string(),
+            allow_models: None,
+            strip_auth: false,
         }
     }
+}
+
+/// Parse `OLLAMA_ROUTER_MODEL_ALLOW` into a per-backend allowlist.
+///
+/// Format: `backend=model1|model2,other=model3`. Backends absent from the
+/// variable are left unfiltered, so this is purely additive — an empty or
+/// unset variable reproduces the previous behaviour exactly.
+///
+/// An entry with a name but no models (`nous=`) is rejected rather than
+/// treated as "allow nothing": silently publishing zero models from a
+/// backend is indistinguishable from the backend being down.
+fn parse_model_allow(raw: &str) -> Result<HashMap<String, HashSet<String>>, ConfigError> {
+    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for entry in raw.split(',').filter(|e| !e.trim().is_empty()) {
+        let entry = entry.trim();
+        let (name, models) = entry
+            .split_once('=')
+            .ok_or_else(|| ConfigError::InvalidModelAllow(entry.to_string()))?;
+
+        let name = name.trim();
+        let models: HashSet<String> = models
+            .split('|')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        if name.is_empty() || models.is_empty() {
+            return Err(ConfigError::InvalidModelAllow(entry.to_string()));
+        }
+
+        out.entry(name.to_string()).or_default().extend(models);
+    }
+
+    Ok(out)
 }
 
 // Default values, shared between `from_env` (as the parse fallbacks) and the
@@ -102,6 +158,10 @@ pub struct Config {
     pub discovery_interval_secs: u64,
     pub grace_multiplier: u64,
     pub tokens_file: Option<String>,
+    /// PEM bundle of extra root certificates to trust on outbound requests,
+    /// on top of the built-in roots. Needed when a backend is reached through
+    /// a TLS-intercepting egress proxy (postern), whose MITM CA is private.
+    pub extra_ca_file: Option<String>,
     pub public_addr: SocketAddr,
     pub internal_addr: SocketAddr,
     pub connect_timeout_secs: u64,
@@ -163,6 +223,7 @@ impl Default for Config {
             discovery_interval_secs: DEFAULT_DISCOVERY_INTERVAL_SECS,
             grace_multiplier: DEFAULT_GRACE_MULTIPLIER,
             tokens_file: None,
+            extra_ca_file: None,
             public_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             internal_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
@@ -191,13 +252,41 @@ impl Config {
         let backends_str = env::var("OLLAMA_ROUTER_BACKENDS")
             .unwrap_or_else(|_| "ollama=http://localhost:11434".to_string());
 
-        let backends: Vec<Backend> = backends_str
+        let mut backends: Vec<Backend> = backends_str
             .split(',')
             .map(|e| Backend::parse(e.trim()))
             .collect::<Result<Vec<_>, _>>()?;
 
         if backends.is_empty() {
             return Err(ConfigError::NoBackends);
+        }
+
+        let mut model_allow = match env::var("OLLAMA_ROUTER_MODEL_ALLOW") {
+            Ok(s) if !s.trim().is_empty() => parse_model_allow(&s)?,
+            _ => HashMap::new(),
+        };
+        let strip_auth: HashSet<String> = env::var("OLLAMA_ROUTER_STRIP_AUTH")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        for backend in &mut backends {
+            backend.allow_models = model_allow.remove(&backend.name);
+            backend.strip_auth = strip_auth.contains(&backend.name);
+        }
+        // Whatever is left names a backend that does not exist. That is always
+        // a typo, and a silent one: the operator believes a backend is being
+        // filtered when it is publishing its full catalogue.
+        if let Some(unknown) = model_allow.keys().next() {
+            return Err(ConfigError::Invalid {
+                key: "OLLAMA_ROUTER_MODEL_ALLOW",
+                reason: format!(
+                    "names backend '{unknown}', which is not in OLLAMA_ROUTER_BACKENDS"
+                ),
+            });
         }
 
         let discovery_interval_secs = parse_env_u64(
@@ -207,6 +296,9 @@ impl Config {
         let grace_multiplier =
             parse_env_u64("OLLAMA_ROUTER_GRACE_MULTIPLIER", DEFAULT_GRACE_MULTIPLIER)?;
         let tokens_file = env::var("OLLAMA_ROUTER_TOKENS_FILE").ok();
+        let extra_ca_file = env::var("OLLAMA_ROUTER_EXTRA_CA_FILE")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
         let public_port =
             parse_env_u64("OLLAMA_ROUTER_PUBLIC_PORT", DEFAULT_PUBLIC_PORT as u64)? as u16;
         let internal_port =
@@ -299,6 +391,7 @@ impl Config {
             discovery_interval_secs,
             grace_multiplier,
             tokens_file,
+            extra_ca_file,
             public_addr: SocketAddr::from(([0, 0, 0, 0], public_port)),
             internal_addr: SocketAddr::from(([0, 0, 0, 0], internal_port)),
             connect_timeout_secs,
@@ -323,6 +416,39 @@ impl Config {
 
     pub fn grace_period_secs(&self) -> u64 {
         self.discovery_interval_secs * self.grace_multiplier
+    }
+
+    /// Add `extra_ca_file`'s certificates to an outbound HTTP client.
+    ///
+    /// A no-op when unset, so the default build keeps the bundled roots and
+    /// nothing else. Both the proxy client and the discovery client must go
+    /// through this: discovery reaching a backend that the proxy path cannot
+    /// (or vice versa) shows up as a backend that lists models but 502s on
+    /// every request.
+    pub fn apply_extra_ca(
+        &self,
+        mut builder: reqwest::ClientBuilder,
+    ) -> Result<reqwest::ClientBuilder, ConfigError> {
+        const KEY: &str = "OLLAMA_ROUTER_EXTRA_CA_FILE";
+        let invalid = |reason: String| ConfigError::Invalid { key: KEY, reason };
+
+        let Some(path) = &self.extra_ca_file else {
+            return Ok(builder);
+        };
+
+        let pem = std::fs::read(path)
+            .map_err(|e| invalid(format!("could not be read from '{path}': {e}")))?;
+        let certs = reqwest::Certificate::from_pem_bundle(&pem)
+            .map_err(|e| invalid(format!("'{path}' is not a valid PEM bundle: {e}")))?;
+
+        if certs.is_empty() {
+            return Err(invalid(format!("'{path}' contained no certificates")));
+        }
+
+        for cert in certs {
+            builder = builder.add_root_certificate(cert);
+        }
+        Ok(builder)
     }
 
     /// Construct a config from explicit backends with sensible defaults. For tests.
@@ -354,6 +480,7 @@ pub enum ConfigError {
         reason: String,
     },
     InvalidEscalation(String),
+    InvalidModelAllow(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -384,6 +511,12 @@ impl fmt::Display for ConfigError {
                 write!(
                     f,
                     "invalid escalation rule: '{entry}' (expected from_model:max_input_tokens:to_model with positive integer threshold)"
+                )
+            }
+            Self::InvalidModelAllow(entry) => {
+                write!(
+                    f,
+                    "invalid model allowlist entry: '{entry}' (expected backend=model1|model2)"
                 )
             }
         }
@@ -428,4 +561,52 @@ fn parse_env_bool(key: &'static str, default: bool) -> Result<bool, ConfigError>
             value: s.to_string(),
         }),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn allow(raw: &str) -> HashMap<String, HashSet<String>> {
+        parse_model_allow(raw).expect("expected a valid allowlist")
+    }
+
+    #[test]
+    fn parses_backends_and_models() {
+        let got = allow("nous=a/one|a/two,local=b/three");
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            got["nous"],
+            HashSet::from(["a/one".to_string(), "a/two".to_string()])
+        );
+        assert_eq!(got["local"], HashSet::from(["b/three".to_string()]));
+    }
+
+    #[test]
+    fn tolerates_whitespace_and_empty_entries() {
+        let got = allow("  nous = a/one | a/two ,, ");
+        assert_eq!(
+            got["nous"],
+            HashSet::from(["a/one".to_string(), "a/two".to_string()])
+        );
+    }
+
+    #[test]
+    fn merges_repeated_backend_entries() {
+        let got = allow("nous=a/one,nous=a/two");
+        assert_eq!(
+            got["nous"],
+            HashSet::from(["a/one".to_string(), "a/two".to_string()])
+        );
+    }
+
+    #[test]
+    fn rejects_entries_that_would_silently_publish_nothing() {
+        // A backend with no models is indistinguishable at runtime from a
+        // backend that is down, so it must fail at startup instead.
+        assert!(parse_model_allow("nous=").is_err());
+        assert!(parse_model_allow("nous=|").is_err());
+        assert!(parse_model_allow("=a/one").is_err());
+        assert!(parse_model_allow("nous").is_err());
+    }
 }

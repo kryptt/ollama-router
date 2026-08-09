@@ -18,6 +18,12 @@ pub struct ProxyRequest<'a> {
     pub method: Method,
     pub headers: &'a HeaderMap,
     pub body: Body,
+    /// Drop the client's `authorization` header instead of forwarding it.
+    /// Set for backends whose credential is attached downstream of us (an
+    /// egress proxy that injects it). Forwarding would send our *inbound*
+    /// token — meaningless to the backend — out to a third party, and leave
+    /// the injector to reconcile two competing values.
+    pub strip_auth: bool,
 }
 
 /// A transport-level failure that prevented obtaining *any* upstream response.
@@ -72,18 +78,23 @@ impl ProxyError {
 /// headers, and wrap the axum body as a streaming reqwest body. Shared by
 /// `execute` (this module) and `heartbeat::execute` so the two forwarding
 /// paths can't drift — and so a single place gates request construction for
-/// the Unit 3 retry wrapper. `upstream_path` is the already-resolved path
-/// (the caller applies any `override_path`).
-pub(crate) fn build_upstream_request(
-    client: &reqwest::Client,
-    method: Method,
-    backend_url: &str,
-    upstream_path: &str,
-    query: Option<&str>,
-    headers: &HeaderMap,
-    body: Body,
-) -> reqwest::RequestBuilder {
-    let mut url = format!("{backend_url}{upstream_path}");
+/// the Unit 3 retry wrapper. Takes the whole `ProxyRequest` and resolves
+/// `override_path` itself, so the two callers can't disagree about which
+/// path reaches the backend.
+pub(crate) fn build_upstream_request(req: ProxyRequest<'_>) -> reqwest::RequestBuilder {
+    let ProxyRequest {
+        client,
+        backend_url,
+        path,
+        override_path,
+        query,
+        method,
+        headers,
+        body,
+        strip_auth,
+    } = req;
+
+    let mut url = format!("{backend_url}{}", override_path.unwrap_or(path));
     if let Some(q) = query {
         url.push('?');
         url.push_str(q);
@@ -98,6 +109,7 @@ pub(crate) fn build_upstream_request(
             // and reqwest aborts the request on length mismatch.
             "host" | "connection" | "transfer-encoding" | "keep-alive" | "upgrade"
             | "content-length" => continue,
+            "authorization" if strip_auth => continue,
             _ => builder = builder.header(key.clone(), value.clone()),
         }
     }
@@ -113,16 +125,7 @@ pub(crate) fn build_upstream_request(
 /// `Ok` with the streamed response for *any* upstream status, or `Err` when
 /// no response could be obtained (connect/timeout/transport).
 pub async fn execute(req: ProxyRequest<'_>) -> Result<Response, ProxyError> {
-    let upstream_path = req.override_path.unwrap_or(req.path);
-    let builder = build_upstream_request(
-        req.client,
-        req.method,
-        req.backend_url,
-        upstream_path,
-        req.query,
-        req.headers,
-        req.body,
-    );
+    let builder = build_upstream_request(req);
 
     let upstream_resp = match builder.send().await {
         Ok(r) => r,
@@ -246,15 +249,17 @@ mod tests {
         headers.insert("authorization", HeaderValue::from_static("Bearer x"));
         headers.insert("x-custom", HeaderValue::from_static("foo"));
 
-        let req = build_upstream_request(
-            &client,
-            Method::POST,
-            "http://backend:1234",
-            "/v1/chat/completions",
-            Some("q=1"),
-            &headers,
-            Body::empty(),
-        )
+        let req = build_upstream_request(ProxyRequest {
+            client: &client,
+            backend_url: "http://backend:1234",
+            path: "/v1/chat/completions",
+            override_path: None,
+            query: Some("q=1"),
+            method: Method::POST,
+            headers: &headers,
+            body: Body::empty(),
+            strip_auth: false,
+        })
         .build()
         .expect("request should build");
 
@@ -267,8 +272,41 @@ mod tests {
         assert!(h.get("content-length").is_none(), "content-length stripped");
         assert!(h.get("host").is_none(), "host stripped");
         assert!(h.get("connection").is_none(), "connection stripped");
-        // ...application headers pass through.
+        // ...application headers pass through, authorization included: the
+        // default is to forward it, so a backend that expects the client's
+        // own key keeps working. `strip_auth` is the opt-out.
         assert_eq!(h.get("authorization").unwrap(), "Bearer x");
+        assert_eq!(h.get("x-custom").unwrap(), "foo");
+    }
+
+    #[test]
+    fn build_upstream_request_drops_authorization_when_stripping() {
+        use axum::http::HeaderValue;
+
+        let client = reqwest::Client::new();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer inbound"));
+        headers.insert("x-custom", HeaderValue::from_static("foo"));
+
+        let req = build_upstream_request(ProxyRequest {
+            client: &client,
+            backend_url: "http://backend:1234",
+            path: "/v1/chat/completions",
+            override_path: None,
+            query: None,
+            method: Method::POST,
+            headers: &headers,
+            body: Body::empty(),
+            strip_auth: true,
+        })
+        .build()
+        .expect("request should build");
+
+        let h = req.headers();
+        // The inbound router token must not reach a backend whose credential
+        // is injected downstream — it is useless there and leaks outward.
+        assert!(h.get("authorization").is_none(), "authorization stripped");
+        // Stripping is surgical: everything else still passes through.
         assert_eq!(h.get("x-custom").unwrap(), "foo");
     }
 }

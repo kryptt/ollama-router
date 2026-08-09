@@ -34,6 +34,7 @@ struct BackendState {
     models: Vec<ModelInfo>,
     last_seen: Option<Instant>,
     grace_deadline: Option<Instant>,
+    strip_auth: bool,
 }
 
 impl BackendState {
@@ -58,6 +59,7 @@ impl BackendState {
             protocol: self.protocol,
             models: &self.models,
             in_grace_period: self.grace_deadline.is_some(),
+            strip_auth: self.strip_auth,
         }
     }
 }
@@ -95,6 +97,7 @@ pub struct BackendView<'a> {
     pub protocol: BackendProtocol,
     pub models: &'a [ModelInfo],
     pub in_grace_period: bool,
+    pub strip_auth: bool,
 }
 
 /// The central routing table. All access goes through `SharedRegistry`.
@@ -120,6 +123,7 @@ impl Registry {
                 models: Vec::new(),
                 last_seen: None,
                 grace_deadline: None,
+                strip_auth: b.strip_auth,
             })
             .collect();
 
@@ -232,7 +236,14 @@ pub fn new_shared(config: &Config) -> SharedRegistry {
 
 /// Long-running discovery loop. Runs first cycle immediately, then every `interval`.
 pub async fn discovery_loop(registry: SharedRegistry, config: Config) {
-    let client = match Client::builder().timeout(Duration::from_secs(10)).build() {
+    let builder = match config.apply_extra_ca(Client::builder().timeout(Duration::from_secs(10))) {
+        Ok(builder) => builder,
+        Err(e) => {
+            warn!(error = %e, "invalid extra CA for discovery client; discovery disabled");
+            return;
+        }
+    };
+    let client = match builder.build() {
         Ok(client) => client,
         Err(e) => {
             // Discovery can't run without an HTTP client. Log and bail out of
@@ -370,13 +381,32 @@ async fn run_discovery(
     // join_all preserves order, so results still zip with `reg.backends`.
     // Concurrency matters: a slow/dead backend's per-probe timeout would
     // otherwise serialise, making a cycle take N × timeout.
-    let fetch_results = futures_util::future::join_all(
+    let mut fetch_results = futures_util::future::join_all(
         config
             .backends
             .iter()
             .map(|backend| fetch_models(client, &backend.name, &backend.url)),
     )
     .await;
+
+    // Phase 1b: Apply per-backend discovery allowlists. Done here rather than
+    // in `fetch_models` so the filter is visible next to the fetch it trims,
+    // and so an allowlisted backend that returns nothing recognisable still
+    // reports as reachable-but-empty rather than as an error.
+    for (backend, result) in config.backends.iter().zip(fetch_results.iter_mut()) {
+        let (Some(allow), FetchResult::Ok { models, .. }) = (&backend.allow_models, result) else {
+            continue;
+        };
+        let before = models.len();
+        models.retain(|m| allow.contains(&m.name));
+        if models.is_empty() && before > 0 {
+            warn!(
+                backend = %backend.name,
+                advertised = before,
+                "allowlist matched none of the backend's models; check OLLAMA_ROUTER_MODEL_ALLOW spelling"
+            );
+        }
+    }
 
     // Phase 2: Apply results under write lock (no I/O, microseconds).
     let mut reg = registry.write().await;

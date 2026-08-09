@@ -379,17 +379,7 @@ pub struct HeartbeatRequest<'a> {
 /// heartbeat is emitted. From that point, any upstream failure is encoded
 /// in-band using `StreamProtocol::error_event`.
 pub async fn execute(req: HeartbeatRequest<'_>) -> Response {
-    let p = req.proxy;
-    let upstream_path = p.override_path.unwrap_or(p.path);
-    let builder = crate::proxy::build_upstream_request(
-        p.client,
-        p.method,
-        p.backend_url,
-        upstream_path,
-        p.query,
-        p.headers,
-        p.body,
-    );
+    let builder = crate::proxy::build_upstream_request(req.proxy);
     let send_future = builder.send();
 
     // Channel buffer of 16 is plenty — a heartbeat every 15s and an
@@ -957,6 +947,7 @@ mod tests {
                 method: Method::POST,
                 headers: &headers,
                 body: Body::from("{\"model\":\"llama3\",\"stream\":true}"),
+                strip_auth: false,
             },
             protocol: StreamProtocol::OllamaChat,
             model: "llama3".to_string(),
@@ -1018,6 +1009,7 @@ mod tests {
                 method: Method::POST,
                 headers: &headers,
                 body: Body::from("{}"),
+                strip_auth: false,
             },
             protocol: StreamProtocol::OllamaChat,
             model: "llama3".to_string(),
@@ -1069,6 +1061,7 @@ mod tests {
                 method: Method::POST,
                 headers: &headers,
                 body: Body::from("{}"),
+                strip_auth: false,
             },
             protocol: StreamProtocol::OllamaChat,
             model: "llama3".to_string(),

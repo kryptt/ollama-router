@@ -149,6 +149,7 @@ pub async fn model_route(
     let backend_url = view.url.to_string();
     let backend_name = view.name.to_string();
     let backend_protocol = view.protocol;
+    let backend_strip_auth = view.strip_auth;
     drop(reg);
 
     let span = tracing::Span::current();
@@ -234,6 +235,7 @@ pub async fn model_route(
         method: method.clone(),
         headers: &headers,
         body: spilled.body,
+        strip_auth: backend_strip_auth,
     };
 
     let response = if let (true, Some(protocol)) = (use_heartbeat, protocol) {
@@ -381,10 +383,13 @@ pub async fn passthrough_route(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    let target_url = {
+    let (target_url, strip_auth) = {
         let reg = state.registry.read().await;
         match reg.any_healthy() {
-            Some(id) => reg.backend(id).url.to_string(),
+            Some(id) => {
+                let view = reg.backend(id);
+                (view.url.to_string(), view.strip_auth)
+            }
             None => return proxy::bad_gateway("no healthy backends available"),
         }
     };
@@ -399,6 +404,7 @@ pub async fn passthrough_route(
             method,
             headers: &headers,
             body,
+            strip_auth,
         },
         &state.metrics,
     )

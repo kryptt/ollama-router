@@ -68,10 +68,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let token_store = Arc::new(TokenStore::new(config.tokens_file.as_deref()));
     let client = Arc::new(
-        reqwest::Client::builder()
-            .pool_max_idle_per_host(10)
-            .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
-            .timeout(Duration::from_secs(config.request_timeout_secs))
+        config
+            .apply_extra_ca(
+                reqwest::Client::builder()
+                    .pool_max_idle_per_host(10)
+                    .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+                    .timeout(Duration::from_secs(config.request_timeout_secs)),
+            )?
             .build()?,
     );
 

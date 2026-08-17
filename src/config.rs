@@ -141,9 +141,7 @@ fn parse_model_allow(raw: &str) -> Result<HashMap<String, HashSet<String>>, Conf
 
 /// Load and parse an allowlist file (`OLLAMA_ROUTER_MODEL_ALLOW_FILE`).
 /// Same grammar as the env value, plus newlines-as-commas and `#` comments.
-pub fn load_model_allow_file(
-    path: &str,
-) -> Result<HashMap<String, HashSet<String>>, ConfigError> {
+pub fn load_model_allow_file(path: &str) -> Result<HashMap<String, HashSet<String>>, ConfigError> {
     let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::Invalid {
         key: "OLLAMA_ROUTER_MODEL_ALLOW_FILE",
         reason: format!("could not read '{path}': {e}"),
@@ -388,13 +386,9 @@ impl Config {
         for backend in &mut backends {
             backend.strip_auth = strip_auth.contains(&backend.name);
         }
-        apply_model_allow(&mut backends, model_allow).map_err(|unknown| {
-            ConfigError::Invalid {
-                key: "OLLAMA_ROUTER_MODEL_ALLOW",
-                reason: format!(
-                    "names backend '{unknown}', which is not in OLLAMA_ROUTER_BACKENDS"
-                ),
-            }
+        apply_model_allow(&mut backends, model_allow).map_err(|unknown| ConfigError::Invalid {
+            key: "OLLAMA_ROUTER_MODEL_ALLOW",
+            reason: format!("names backend '{unknown}', which is not in OLLAMA_ROUTER_BACKENDS"),
         })?;
 
         let fallback_file = env::var("OLLAMA_ROUTER_FALLBACK_FILE")
@@ -715,7 +709,10 @@ mod tests {
         let mut backends = vec![Backend::for_test("nous", "http://n")];
         backends[0].allow_models = Some(HashSet::from(["keep".to_string()]));
         let bad = HashMap::from([("typo".to_string(), HashSet::from(["m".to_string()]))]);
-        assert_eq!(apply_model_allow(&mut backends, bad), Err("typo".to_string()));
+        assert_eq!(
+            apply_model_allow(&mut backends, bad),
+            Err("typo".to_string())
+        );
         // Nothing applied: previous filter survives a bad reload.
         assert_eq!(
             backends[0].allow_models,

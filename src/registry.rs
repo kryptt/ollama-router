@@ -542,11 +542,15 @@ mod tests {
         let mut reg = Registry::new(&test_config());
         // cuda is up serving the stand-in; rocm (which served the local
         // model) is down, so the local name has vanished from the map.
-        setup_backend(&mut reg, 0, true, None, vec![make_model("qwen/qwen3.8-27b")]);
-        reg.fallbacks = HashMap::from([(
-            "qwen3.6-medium".to_string(),
-            "qwen/qwen3.8-27b".to_string(),
-        )]);
+        setup_backend(
+            &mut reg,
+            0,
+            true,
+            None,
+            vec![make_model("qwen/qwen3.8-27b")],
+        );
+        reg.fallbacks =
+            HashMap::from([("qwen3.6-medium".to_string(), "qwen/qwen3.8-27b".to_string())]);
 
         assert!(reg.lookup("qwen3.6-medium").is_none());
         assert_eq!(reg.fallback_for("qwen3.6-medium"), Some("qwen/qwen3.8-27b"));

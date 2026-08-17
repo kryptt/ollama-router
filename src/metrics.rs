@@ -29,6 +29,10 @@ pub struct Metrics {
     ///   at lookup time (typo, decommissioned backend, or pre-discovery
     ///   startup window).
     pub escalations_skipped: Family<EscalationSkipLabels, Counter>,
+    /// Backend-down fallback rewrites: a request for `from` was rewritten
+    /// to `to` because no reachable backend served `from` and the operator
+    /// fallback map named a published stand-in.
+    pub fallbacks: Family<EscalationLabels, Counter>,
     /// Requests that were translated between protocol dialects (e.g.
     /// `/api/chat` from a client → `/v1/chat/completions` to a backend
     /// that only speaks OpenAI). Label-free on purpose — cardinality.
@@ -115,6 +119,13 @@ impl Metrics {
             escalations_skipped.clone(),
         );
 
+        let fallbacks = Family::default();
+        registry.register(
+            "ollama_router_fallbacks",
+            "Backend-down fallback rewrites applied (per from→to pair)",
+            fallbacks.clone(),
+        );
+
         let protocol_translations = Counter::default();
         registry.register(
             "ollama_router_protocol_translations",
@@ -178,6 +189,7 @@ impl Metrics {
             unknown_model_requests,
             escalations,
             escalations_skipped,
+            fallbacks,
             protocol_translations,
             start_time_seconds,
             ready,

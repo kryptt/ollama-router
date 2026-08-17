@@ -107,6 +107,10 @@ pub struct BackendView<'a> {
 pub struct Registry {
     backends: Vec<BackendState>,
     model_map: HashMap<String, BackendId>,
+    /// `local-model → stand-in-model` rewrites for when no reachable backend
+    /// serves the requested model. Refreshed from `OLLAMA_ROUTER_FALLBACK_FILE`
+    /// each discovery cycle; empty when the file isn't configured.
+    fallbacks: HashMap<String, String>,
     discovery_done: bool,
 }
 
@@ -130,8 +134,15 @@ impl Registry {
         Registry {
             backends,
             model_map: HashMap::new(),
+            fallbacks: HashMap::new(),
             discovery_done: false,
         }
+    }
+
+    /// The configured stand-in for `model`, if any. Callers decide whether
+    /// the hop applies (only when `model` itself resolves to no backend).
+    pub fn fallback_for(&self, model: &str) -> Option<&str> {
+        self.fallbacks.get(model).map(String::as_str)
     }
 
     /// Look up a model by exact name, then by prefix (before `:`) if no exact match.
@@ -256,12 +267,48 @@ pub async fn discovery_loop(registry: SharedRegistry, config: Config) {
 
     let interval = Duration::from_secs(config.discovery_interval_secs);
     let grace_duration = Duration::from_secs(config.grace_period_secs());
+    let mut config = config;
 
+    reload_file_config(&mut config, &registry).await;
     run_discovery(&client, &registry, &config, grace_duration).await;
 
     loop {
         tokio::time::sleep(interval).await;
+        reload_file_config(&mut config, &registry).await;
         run_discovery(&client, &registry, &config, grace_duration).await;
+    }
+}
+
+/// Re-read the allowlist and fallback files (when configured) so mounted
+/// ConfigMap edits land within one discovery cycle, no restart needed.
+/// Any read/parse error keeps the previous cycle's values: wiping the
+/// allowlist on a bad edit would blow the spend boundary open, and wiping
+/// fallbacks would silently drop failover.
+async fn reload_file_config(config: &mut crate::config::Config, registry: &SharedRegistry) {
+    if let Some(path) = config.model_allow_file.clone() {
+        match crate::config::load_model_allow_file(&path) {
+            Ok(allow) => {
+                if let Err(unknown) = crate::config::apply_model_allow(&mut config.backends, allow)
+                {
+                    warn!(
+                        backend = %unknown,
+                        file = %path,
+                        "allowlist file names an unknown backend; keeping previous allowlist"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, file = %path, "failed to reload allowlist file; keeping previous allowlist");
+            }
+        }
+    }
+    if let Some(path) = config.fallback_file.clone() {
+        match crate::config::load_fallbacks_file(&path) {
+            Ok(fallbacks) => registry.write().await.fallbacks = fallbacks,
+            Err(e) => {
+                warn!(error = %e, file = %path, "failed to reload fallback file; keeping previous fallbacks");
+            }
+        }
     }
 }
 
@@ -488,6 +535,23 @@ mod tests {
         reg.backends[idx].grace_deadline = grace.map(|d| Instant::now() + d);
         reg.backends[idx].models = models;
         reg.rebuild_model_map();
+    }
+
+    #[test]
+    fn fallback_map_covers_models_of_unreachable_backends() {
+        let mut reg = Registry::new(&test_config());
+        // cuda is up serving the stand-in; rocm (which served the local
+        // model) is down, so the local name has vanished from the map.
+        setup_backend(&mut reg, 0, true, None, vec![make_model("qwen/qwen3.8-27b")]);
+        reg.fallbacks = HashMap::from([(
+            "qwen3.6-medium".to_string(),
+            "qwen/qwen3.8-27b".to_string(),
+        )]);
+
+        assert!(reg.lookup("qwen3.6-medium").is_none());
+        assert_eq!(reg.fallback_for("qwen3.6-medium"), Some("qwen/qwen3.8-27b"));
+        assert_lookup_name(&reg, "qwen/qwen3.8-27b", "cuda");
+        assert_eq!(reg.fallback_for("unmapped"), None);
     }
 
     /// Assert that `model` resolves to a backend named `expected_name`.

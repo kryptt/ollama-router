@@ -90,9 +90,21 @@ impl Backend {
     }
 }
 
+/// Strip `#`-to-end-of-line comments and rejoin lines with commas, so file
+/// contents (one entry per line, comments allowed) parse with the same
+/// grammar as the comma-separated env values.
+fn strip_comments(raw: &str) -> String {
+    raw.lines()
+        .map(|l| l.split('#').next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Parse `OLLAMA_ROUTER_MODEL_ALLOW` into a per-backend allowlist.
 ///
-/// Format: `backend=model1|model2,other=model3`. Backends absent from the
+/// Format: `backend=model1|model2,other=model3`. Newlines work like commas
+/// and `#` starts a comment, so the same grammar serves both the env value
+/// and `OLLAMA_ROUTER_MODEL_ALLOW_FILE` contents. Backends absent from the
 /// variable are left unfiltered, so this is purely additive — an empty or
 /// unset variable reproduces the previous behaviour exactly.
 ///
@@ -100,6 +112,7 @@ impl Backend {
 /// treated as "allow nothing": silently publishing zero models from a
 /// backend is indistinguishable from the backend being down.
 fn parse_model_allow(raw: &str) -> Result<HashMap<String, HashSet<String>>, ConfigError> {
+    let raw = strip_comments(raw);
     let mut out: HashMap<String, HashSet<String>> = HashMap::new();
 
     for entry in raw.split(',').filter(|e| !e.trim().is_empty()) {
@@ -124,6 +137,77 @@ fn parse_model_allow(raw: &str) -> Result<HashMap<String, HashSet<String>>, Conf
     }
 
     Ok(out)
+}
+
+/// Load and parse an allowlist file (`OLLAMA_ROUTER_MODEL_ALLOW_FILE`).
+/// Same grammar as the env value, plus newlines-as-commas and `#` comments.
+pub fn load_model_allow_file(
+    path: &str,
+) -> Result<HashMap<String, HashSet<String>>, ConfigError> {
+    let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::Invalid {
+        key: "OLLAMA_ROUTER_MODEL_ALLOW_FILE",
+        reason: format!("could not read '{path}': {e}"),
+    })?;
+    parse_model_allow(&raw)
+}
+
+/// Apply a parsed allowlist to the backend list. Every backend named in
+/// `allow` must exist; an unknown name is always a typo, and a silent one:
+/// the operator believes a backend is being filtered when it is publishing
+/// its full catalogue. Nothing is applied on error, so a bad reload keeps
+/// the previous cycle's filters intact.
+pub fn apply_model_allow(
+    backends: &mut [Backend],
+    mut allow: HashMap<String, HashSet<String>>,
+) -> Result<(), String> {
+    if let Some(unknown) = allow
+        .keys()
+        .find(|name| !backends.iter().any(|b| b.name == **name))
+    {
+        return Err(unknown.clone());
+    }
+    for backend in backends {
+        backend.allow_models = allow.remove(&backend.name);
+    }
+    Ok(())
+}
+
+/// Parse a fallback map (`OLLAMA_ROUTER_FALLBACK_FILE` contents): one
+/// `local-model=stand-in-model` pair per line, `#` comments allowed.
+///
+/// The map is consulted only when no reachable backend serves the requested
+/// model; the stand-in must itself be published (allowlisted) or the hop is
+/// skipped. Duplicate keys are rejected — last-wins would hide the typo.
+pub fn parse_fallbacks(raw: &str) -> Result<HashMap<String, String>, ConfigError> {
+    let mut out = HashMap::new();
+    for line in raw.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let err = || ConfigError::InvalidFallback(line.to_string());
+        let (from, to) = line.split_once('=').ok_or_else(err)?;
+        let (from, to) = (from.trim(), to.trim());
+        if from.is_empty() || to.is_empty() || from == to {
+            return Err(err());
+        }
+        if out.insert(from.to_string(), to.to_string()).is_some() {
+            return Err(ConfigError::Invalid {
+                key: "OLLAMA_ROUTER_FALLBACK_FILE",
+                reason: format!("duplicate fallback entry for '{from}'"),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Load and parse a fallback file. See [`parse_fallbacks`].
+pub fn load_fallbacks_file(path: &str) -> Result<HashMap<String, String>, ConfigError> {
+    let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::Invalid {
+        key: "OLLAMA_ROUTER_FALLBACK_FILE",
+        reason: format!("could not read '{path}': {e}"),
+    })?;
+    parse_fallbacks(&raw)
 }
 
 // Default values, shared between `from_env` (as the parse fallbacks) and the
@@ -177,6 +261,13 @@ pub struct Config {
     pub loading_max_wait_secs: u64,
     /// Per-model escalation rules. Empty = no escalation (default).
     pub escalation_rules: Vec<EscalationRule>,
+    /// Path to an allowlist file, re-read every discovery cycle so a mounted
+    /// ConfigMap edit lands without a restart. Mutually exclusive with
+    /// `OLLAMA_ROUTER_MODEL_ALLOW`.
+    pub model_allow_file: Option<String>,
+    /// Path to a `local-model=stand-in` fallback map, re-read every discovery
+    /// cycle. Consulted when no reachable backend serves a requested model.
+    pub fallback_file: Option<String>,
 
     // --- Resilience: bounded retry-with-backoff (Unit 3) ---
     /// Maximum retry attempts after the first try for a transient failure.
@@ -232,6 +323,8 @@ impl Default for Config {
             preflight_timeout_secs: DEFAULT_PREFLIGHT_TIMEOUT_SECS,
             loading_max_wait_secs: DEFAULT_LOADING_MAX_WAIT_SECS,
             escalation_rules: Vec::new(),
+            model_allow_file: None,
+            fallback_file: None,
             max_retries: DEFAULT_MAX_RETRIES,
             retry_backoff_base_ms: DEFAULT_RETRY_BACKOFF_BASE_MS,
             retry_jitter_pct: DEFAULT_RETRY_JITTER_PCT,
@@ -261,8 +354,27 @@ impl Config {
             return Err(ConfigError::NoBackends);
         }
 
-        let mut model_allow = match env::var("OLLAMA_ROUTER_MODEL_ALLOW") {
-            Ok(s) if !s.trim().is_empty() => parse_model_allow(&s)?,
+        let model_allow_file = env::var("OLLAMA_ROUTER_MODEL_ALLOW_FILE")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let model_allow_env = env::var("OLLAMA_ROUTER_MODEL_ALLOW")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        // Two sources for the same filter would make "which one is live?"
+        // a runtime question. Refuse the ambiguity at startup.
+        if model_allow_file.is_some() && model_allow_env.is_some() {
+            return Err(ConfigError::Invalid {
+                key: "OLLAMA_ROUTER_MODEL_ALLOW_FILE",
+                reason: "mutually exclusive with OLLAMA_ROUTER_MODEL_ALLOW; set only one"
+                    .to_string(),
+            });
+        }
+        let model_allow = match (&model_allow_file, &model_allow_env) {
+            // Fail fast on an unreadable/unparseable file even though the
+            // discovery loop re-reads it — a typo'd path would otherwise run
+            // unfiltered until someone reads the logs.
+            (Some(path), _) => load_model_allow_file(path)?,
+            (_, Some(s)) => parse_model_allow(s)?,
             _ => HashMap::new(),
         };
         let strip_auth: HashSet<String> = env::var("OLLAMA_ROUTER_STRIP_AUTH")
@@ -274,19 +386,24 @@ impl Config {
             .collect();
 
         for backend in &mut backends {
-            backend.allow_models = model_allow.remove(&backend.name);
             backend.strip_auth = strip_auth.contains(&backend.name);
         }
-        // Whatever is left names a backend that does not exist. That is always
-        // a typo, and a silent one: the operator believes a backend is being
-        // filtered when it is publishing its full catalogue.
-        if let Some(unknown) = model_allow.keys().next() {
-            return Err(ConfigError::Invalid {
+        apply_model_allow(&mut backends, model_allow).map_err(|unknown| {
+            ConfigError::Invalid {
                 key: "OLLAMA_ROUTER_MODEL_ALLOW",
                 reason: format!(
                     "names backend '{unknown}', which is not in OLLAMA_ROUTER_BACKENDS"
                 ),
-            });
+            }
+        })?;
+
+        let fallback_file = env::var("OLLAMA_ROUTER_FALLBACK_FILE")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        if let Some(path) = &fallback_file {
+            // Validate now, discard the value: the discovery loop loads it
+            // fresh on its first cycle (immediately at startup).
+            load_fallbacks_file(path)?;
         }
 
         let discovery_interval_secs = parse_env_u64(
@@ -400,6 +517,8 @@ impl Config {
             preflight_timeout_secs,
             loading_max_wait_secs,
             escalation_rules,
+            model_allow_file,
+            fallback_file,
             max_retries,
             retry_backoff_base_ms,
             retry_jitter_pct,
@@ -481,6 +600,7 @@ pub enum ConfigError {
     },
     InvalidEscalation(String),
     InvalidModelAllow(String),
+    InvalidFallback(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -517,6 +637,12 @@ impl fmt::Display for ConfigError {
                 write!(
                     f,
                     "invalid model allowlist entry: '{entry}' (expected backend=model1|model2)"
+                )
+            }
+            Self::InvalidFallback(entry) => {
+                write!(
+                    f,
+                    "invalid fallback entry: '{entry}' (expected local-model=stand-in-model)"
                 )
             }
         }
@@ -569,6 +695,55 @@ mod tests {
 
     fn allow(raw: &str) -> HashMap<String, HashSet<String>> {
         parse_model_allow(raw).expect("expected a valid allowlist")
+    }
+
+    #[test]
+    fn allowlist_accepts_newlines_and_comments() {
+        let got = allow("# spend boundary\nnous=a/one|a/two\n\nnous=a/three # inline note\n");
+        assert_eq!(
+            got["nous"],
+            HashSet::from([
+                "a/one".to_string(),
+                "a/two".to_string(),
+                "a/three".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn apply_model_allow_rejects_unknown_backend_without_applying() {
+        let mut backends = vec![Backend::for_test("nous", "http://n")];
+        backends[0].allow_models = Some(HashSet::from(["keep".to_string()]));
+        let bad = HashMap::from([("typo".to_string(), HashSet::from(["m".to_string()]))]);
+        assert_eq!(apply_model_allow(&mut backends, bad), Err("typo".to_string()));
+        // Nothing applied: previous filter survives a bad reload.
+        assert_eq!(
+            backends[0].allow_models,
+            Some(HashSet::from(["keep".to_string()]))
+        );
+    }
+
+    #[test]
+    fn parses_fallback_map() {
+        let got = parse_fallbacks(
+            "# stand-ins\nqwen3.6-medium=qwen/qwen3.8-27b\ngemma4:26b = google/gemma-4-26b-a4b-it\n",
+        )
+        .expect("valid fallback map");
+        assert_eq!(got["qwen3.6-medium"], "qwen/qwen3.8-27b");
+        assert_eq!(got["gemma4:26b"], "google/gemma-4-26b-a4b-it");
+    }
+
+    #[test]
+    fn fallback_map_rejects_bad_entries() {
+        assert!(parse_fallbacks("no-equals-sign").is_err());
+        assert!(parse_fallbacks("a=").is_err());
+        assert!(parse_fallbacks("=b").is_err());
+        assert!(parse_fallbacks("a=a").is_err(), "self-mapping is a typo");
+        assert!(
+            parse_fallbacks("a=b\na=c").is_err(),
+            "duplicate keys are a typo; last-wins would hide it"
+        );
+        assert!(parse_fallbacks("").expect("empty ok").is_empty());
     }
 
     #[test]

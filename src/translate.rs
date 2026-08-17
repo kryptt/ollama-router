@@ -63,6 +63,19 @@ pub fn ollama_chat_to_openai_request(bytes: &[u8]) -> Result<Vec<u8>, serde_json
     serde_json::to_vec(&root)
 }
 
+/// Overwrite the body's `model` field with `model`. Used when routing
+/// rewrote the requested model (escalation or backend-down fallback): the
+/// upstream must see the rewritten name, not the one the client sent —
+/// hosted backends 404 on unknown IDs and local ones would silently load
+/// the wrong model.
+pub fn rewrite_model_field(bytes: &[u8], model: &str) -> Result<Vec<u8>, serde_json::Error> {
+    let mut root: Value = serde_json::from_slice(bytes)?;
+    if let Some(obj) = root.as_object_mut() {
+        obj.insert("model".to_string(), Value::String(model.to_string()));
+    }
+    serde_json::to_vec(&root)
+}
+
 /// Build the common Ollama message frame shared by streaming deltas and
 /// non-streaming responses.  Callers merge additional fields (done,
 /// usage counters, etc.) into the returned object.
@@ -402,6 +415,16 @@ mod tests {
     fn parse_request(input: &[u8]) -> Value {
         let out = ollama_chat_to_openai_request(input).unwrap();
         serde_json::from_slice(&out).unwrap()
+    }
+
+    #[test]
+    fn rewrite_model_field_overwrites_only_model() {
+        let input = br#"{"model":"qwen3.6-medium","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+        let out = rewrite_model_field(input, "qwen/qwen3.8-27b").unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "qwen/qwen3.8-27b");
+        assert_eq!(v["stream"], true);
+        assert_eq!(v["messages"][0]["content"], "hi");
     }
 
     fn parse_response(input: &[u8], model: &str) -> Value {

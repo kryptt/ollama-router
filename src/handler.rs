@@ -96,7 +96,7 @@ pub async fn model_route(
     // in the registry, fall back to the original. Otherwise we'd 404 the
     // client with a name they never sent — particularly bad during the
     // 60-second discovery warmup or when an operator typos a `to_model`.
-    let lookup_model = if spilled.model != original_model && reg.lookup(&spilled.model).is_none() {
+    if spilled.model != original_model && reg.lookup(&spilled.model).is_none() {
         tracing::warn!(
             requested = %original_model,
             escalation_target = %spilled.model,
@@ -104,12 +104,9 @@ pub async fn model_route(
         );
         record_escalation_skip(&state.metrics, "target_not_found");
         spilled.model = original_model.clone();
-        &spilled.model
-    } else {
-        &spilled.model
-    };
+    }
 
-    if *lookup_model != original_model {
+    if spilled.model != original_model {
         // Escalation kept its rewrite: record it as a successful
         // escalation event in metrics + a single info log.
         state
@@ -117,17 +114,49 @@ pub async fn model_route(
             .escalations
             .get_or_create(&metrics::EscalationLabels {
                 from: original_model.clone(),
-                to: lookup_model.clone(),
+                to: spilled.model.clone(),
             })
             .inc();
         tracing::info!(
             from = %original_model,
-            to = %lookup_model,
+            to = %spilled.model,
             "escalating model due to estimated input size",
         );
     }
 
-    let backend_id = match reg.lookup(lookup_model) {
+    // Backend-down fallback: no reachable backend serves the requested
+    // model, but the operator fallback map names a stand-in (typically a
+    // hosted model covering for a powered-down local node). One hop, no
+    // chaining, and only when the stand-in is itself published — otherwise
+    // the normal unknown-model 404 below stays honest.
+    if reg.lookup(&spilled.model).is_none()
+        && let Some(target) = reg.fallback_for(&spilled.model).map(str::to_string)
+    {
+        if reg.lookup(&target).is_some() {
+            state
+                .metrics
+                .fallbacks
+                .get_or_create(&metrics::EscalationLabels {
+                    from: spilled.model.clone(),
+                    to: target.clone(),
+                })
+                .inc();
+            tracing::info!(
+                from = %spilled.model,
+                to = %target,
+                "no reachable backend serves model; applying fallback",
+            );
+            spilled.model = target;
+        } else {
+            tracing::warn!(
+                from = %spilled.model,
+                to = %target,
+                "fallback target not in registry; leaving request as-is",
+            );
+        }
+    }
+
+    let backend_id = match reg.lookup(&spilled.model) {
         Some(id) => id,
         None => {
             state.metrics.unknown_model_requests.inc();
@@ -138,11 +167,11 @@ pub async fn model_route(
             // to avoid cardinality blow-up if a misbehaving client
             // sprays unique names.
             tracing::warn!(
-                model = %lookup_model,
+                model = %spilled.model,
                 available = ?available,
                 "unknown model requested",
             );
-            return proxy::model_not_found(lookup_model, &available);
+            return proxy::model_not_found(&spilled.model, &available);
         }
     };
     let view = reg.backend(backend_id);
@@ -155,6 +184,27 @@ pub async fn model_route(
     let span = tracing::Span::current();
     span.record("model", spilled.model.as_str());
     span.record("backend", backend_name.as_str());
+
+    // Routing rewrote the model (escalation or fallback): the body still
+    // carries the client's original name, and the upstream must see the
+    // rewritten one — hosted backends 404 on unknown IDs and local ones
+    // would silently load the wrong model. Buffer and patch the field.
+    if spilled.model != original_model {
+        let body_bytes = match collect_body_to_bytes(spilled.body).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to buffer request body for model rewrite");
+                return proxy::bad_gateway("failed to buffer request body for model rewrite");
+            }
+        };
+        match translate::rewrite_model_field(&body_bytes, &spilled.model) {
+            Ok(rewritten) => spilled.body = Body::from(rewritten),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to rewrite model field");
+                return proxy::bad_request("body is not valid JSON");
+            }
+        }
+    }
 
     // Protocol translation: client speaks Ollama-native /api/chat but the
     // chosen backend only speaks OpenAI /v1/*. We rewrite the upstream URL

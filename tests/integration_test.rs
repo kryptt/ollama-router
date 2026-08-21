@@ -412,9 +412,15 @@ fn routes_default_stream_matches_path_protocol() {
 /// Build an `AppState` around `reg` with a short preflight timeout, and
 /// return it. Tests keep the state to inspect `state.metrics` afterwards.
 fn app_state(reg: &SharedRegistry) -> AppState {
+    app_state_with(reg, &Arc::new(Metrics::new()))
+}
+
+/// Like `app_state`, but sharing `metrics` with the discovery loop — the
+/// reload tests need to read the counters the loop writes.
+fn app_state_with(reg: &SharedRegistry, metrics: &Arc<Metrics>) -> AppState {
     AppState {
         registry: reg.clone(),
-        metrics: Arc::new(Metrics::new()),
+        metrics: Arc::clone(metrics),
         client: Arc::new(Client::new()),
         token_store: Arc::new(TokenStore::new(None)),
         heartbeat: HeartbeatConfig::from_secs(15, 2, 30),
@@ -903,4 +909,306 @@ async fn alias_attempts_all_candidates_when_none_reachable() {
     let text = state.metrics.encode().unwrap();
     // The candidate was attempted, not skipped: no "unreachable" advance.
     assert!(!text.contains(r#"reason="unreachable""#), "{text}");
+}
+
+// ─── Live policy reload ─────────────────────────────────────────────────────
+//
+// Everything below runs against real TCP mock backends and a real temp file,
+// on a 1-second discovery cycle, and edits the file the way an operator
+// would. The point of each is that a *routing decision* changes (or
+// pointedly does not) with no restart.
+
+/// One discovery cycle at the accelerated interval, with margin.
+const CYCLE: Duration = Duration::from_millis(1_600);
+
+/// A backend whose /api/chat sleeps before answering, so a test can edit the
+/// policy while a request is genuinely in flight upstream.
+async fn start_slow_backend(models: Vec<&str>, delay: Duration) -> MockBackend {
+    let chat_hits = Arc::new(AtomicUsize::new(0));
+    let hits = Arc::clone(&chat_hits);
+    let tags_json = serde_json::json!({
+        "models": models.iter().map(|m| serde_json::json!({"name": m})).collect::<Vec<_>>()
+    })
+    .to_string();
+    let app = Router::new()
+        .route(
+            "/api/tags",
+            get(move || {
+                let tags = tags_json.clone();
+                async move { (StatusCode::OK, tags) }
+            }),
+        )
+        .route(
+            "/api/chat",
+            post(move |payload: Bytes| async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+                (StatusCode::OK, format!("echoed: {}", payload.len()))
+            }),
+        )
+        .fallback(any(|| async { (StatusCode::NOT_FOUND, "nope") }));
+    let (url, handle) = spawn_test_server_abortable(app).await;
+    MockBackend {
+        url,
+        handle,
+        chat_hits,
+    }
+}
+
+/// A registry + router + shared metrics on a 1-second discovery cycle, with
+/// the first cycle already complete. Returns everything a reload test needs:
+/// the temp dir (keeps the file alive), the policy path, the state (for
+/// metrics), the registry, and the router's base URL.
+struct ReloadHarness {
+    _dir: tempfile::TempDir,
+    path: String,
+    state: AppState,
+    reg: SharedRegistry,
+    base: String,
+}
+
+async fn reload_harness(backends: &[(&str, &str)], extra: &str) -> ReloadHarness {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = policy_config(&dir, backends, extra);
+    config.discovery_interval_secs = 1;
+    let path = config.config_path.clone();
+    let reg = new_registry(&config);
+    let metrics = Arc::new(Metrics::new());
+    let state = app_state_with(&reg, &metrics);
+    let base = spawn_router(state.clone()).await;
+    spawn_discovery(&reg, &config, &metrics);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(reg.read().await.is_discovery_done());
+    ReloadHarness {
+        _dir: dir,
+        path,
+        state,
+        reg,
+        base,
+    }
+}
+
+impl ReloadHarness {
+    /// Overwrite the policy file and wait for the loop to reload and probe.
+    async fn edit(&self, doc: &str) {
+        std::fs::write(&self.path, doc).unwrap();
+        tokio::time::sleep(CYCLE).await;
+    }
+
+    /// Scrape `/metrics` through the real handler, so the registry-derived
+    /// gauges are refreshed exactly as Prometheus would see them.
+    async fn scrape(&self) -> String {
+        use http_body_util::BodyExt;
+        let resp = handler::metrics_route(axum::extract::State(self.state.clone())).await;
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn reorder_moves_a_colliding_model_to_the_new_first_backend() {
+    // Declaration order IS the spend boundary: the model map is
+    // first-writer-wins, so which table comes first decides who gets paid.
+    let b1 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+    let b2 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+    let h = reload_harness(&[("p1", &b1.url), ("p2", &b2.url)], "").await;
+
+    let client = Client::new();
+    assert_eq!(
+        post_chat(&client, &h.base, "m:latest", false)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!((b1.chat_hits(), b2.chat_hits()), (1, 0));
+
+    h.edit(&policy_doc(&[("p2", &b2.url), ("p1", &b1.url)], ""))
+        .await;
+
+    assert_eq!(
+        post_chat(&client, &h.base, "m:latest", false)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        (b1.chat_hits(), b2.chat_hits()),
+        (1, 1),
+        "the reorder must repoint routing with no restart"
+    );
+}
+
+#[tokio::test]
+async fn adding_a_backend_is_live_within_one_cycle() {
+    let b1 = start_counting_backend(vec!["a:latest"], StatusCode::OK).await;
+    let b2 = start_counting_backend(vec!["b:latest"], StatusCode::OK).await;
+    let h = reload_harness(&[("p1", &b1.url)], "").await;
+
+    let client = Client::new();
+    assert_eq!(
+        post_chat(&client, &h.base, "b:latest", false)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    // Discovery snapshots its targets from the registry *after* the reload,
+    // so the new backend is probed in the same cycle — not the next one.
+    h.edit(&policy_doc(&[("p1", &b1.url), ("p2", &b2.url)], ""))
+        .await;
+
+    assert_eq!(
+        post_chat(&client, &h.base, "b:latest", false)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(b2.chat_hits(), 1);
+}
+
+#[tokio::test]
+async fn removing_a_backend_is_live_and_drops_its_gauge() {
+    let b1 = start_counting_backend(vec!["a:latest"], StatusCode::OK).await;
+    let b2 = start_counting_backend(vec!["b:latest"], StatusCode::OK).await;
+    let h = reload_harness(&[("p1", &b1.url), ("p2", &b2.url)], "").await;
+
+    assert!(h.scrape().await.contains(r#"backend_up{backend="p2"}"#));
+
+    h.edit(&policy_doc(&[("p1", &b1.url)], "")).await;
+
+    let client = Client::new();
+    // No panic on a stale id, and the removed backend's model is gone.
+    assert_eq!(
+        post_chat(&client, &h.base, "b:latest", false)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        post_chat(&client, &h.base, "a:latest", false)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let text = h.scrape().await;
+    assert!(
+        !text.contains(r#"backend_up{backend="p2"}"#),
+        "a removed backend's gauge would otherwise freeze at 1 forever:\n{text}"
+    );
+    assert!(text.contains(r#"backend_up{backend="p1"}"#), "{text}");
+}
+
+#[tokio::test]
+async fn in_flight_request_survives_its_backends_removal() {
+    // Severing a live stream mid-token to honour a config edit would be
+    // worse than letting it finish: the request holds a URL and the shared
+    // client, not a BackendId.
+    let slow = start_slow_backend(vec!["m:latest"], Duration::from_millis(2_500)).await;
+    let h = reload_harness(&[("p1", &slow.url)], "").await;
+
+    let base = h.base.clone();
+    let inflight = tokio::spawn(async move {
+        let client = Client::new();
+        post_chat(&client, &base, "m:latest", true).await
+    });
+    // Let the request reach upstream before the roster changes.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Remove the only backend. `policy_doc` needs at least one table, so
+    // point the roster at a different (dead) address entirely.
+    h.edit(&policy_doc(&[("other", "http://127.0.0.1:1")], ""))
+        .await;
+    let names: Vec<String> = h
+        .reg
+        .read()
+        .await
+        .all_backends()
+        .map(|b| b.name.to_string())
+        .collect();
+    assert_eq!(names, vec!["other".to_string()], "p1 must be gone");
+
+    let resp = inflight.await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.text().await.unwrap().starts_with("echoed:"));
+}
+
+#[tokio::test]
+async fn garbage_file_keeps_the_previous_config_and_counts_a_rejection() {
+    let b1 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+    let h = reload_harness(&[("p1", &b1.url)], "").await;
+
+    h.edit("this is not toml {{{ \n").await;
+
+    let client = Client::new();
+    assert_eq!(
+        post_chat(&client, &h.base, "m:latest", false)
+            .await
+            .status(),
+        StatusCode::OK,
+        "a bad edit must keep the previous config, not fail open or shut"
+    );
+    let text = h.scrape().await;
+    assert!(
+        text.contains(r#"ollama_router_config_reloads_total{result="rejected"}"#),
+        "a rejected reload is otherwise completely silent:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn flipping_a_chained_backend_to_external_is_rejected_end_to_end() {
+    // The headline property: because backends and aliases validate in the
+    // same pass against the same roster, every reload re-proves the privacy
+    // pin. Un-pinning `local` is not something a single edit can do.
+    let b1 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+    const PINNED: &str = "[fallbacks]\n[aliases.secret]\nlocal = true\nchain = [\"p1/m:latest\"]\n";
+    let h = reload_harness(&[("p1", &b1.url)], PINNED).await;
+
+    let client = Client::new();
+    assert_eq!(
+        post_chat(&client, &h.base, "secret", false).await.status(),
+        StatusCode::OK
+    );
+
+    h.edit(&format!(
+        "[[backends]]\nname = \"p1\"\nurl = \"{}\"\nexternal = true\nallow = [\"*\"]\n\n{PINNED}",
+        b1.url
+    ))
+    .await;
+
+    // The whole file bounced, so the previous config — including the pin —
+    // is still what is serving.
+    assert_eq!(
+        post_chat(&client, &h.base, "secret", false).await.status(),
+        StatusCode::OK
+    );
+    let text = h.scrape().await;
+    assert!(
+        text.contains(r#"ollama_router_config_reloads_total{result="rejected"}"#),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn deleted_file_keeps_serving() {
+    // NFS plus a hand edit means "briefly absent" is a real state. It must
+    // read as "no new policy", never as "no policy".
+    let b1 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+    let h = reload_harness(&[("p1", &b1.url)], "").await;
+
+    std::fs::remove_file(&h.path).unwrap();
+    tokio::time::sleep(CYCLE).await;
+
+    let client = Client::new();
+    assert_eq!(
+        post_chat(&client, &h.base, "m:latest", false)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert!(
+        h.scrape()
+            .await
+            .contains(r#"ollama_router_config_reloads_total{result="rejected"}"#)
+    );
 }

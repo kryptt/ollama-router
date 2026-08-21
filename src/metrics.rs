@@ -66,6 +66,15 @@ pub struct Metrics {
     /// gauge left behind freezes at its last value and keeps claiming a
     /// deleted backend is up.
     pub backend_up: Family<BackendLabels, Gauge>,
+    /// 1 when bearer-token auth is configured, else 0. Set once at startup:
+    /// auth being *off* is a security state, and a state nothing else
+    /// reports — without this the only signal is the absence of 401s.
+    pub auth_enabled: Gauge,
+    /// Unix seconds of the last **successfully applied** policy reload.
+    /// Distinguishes a wedged discovery loop (timestamp stops advancing,
+    /// and `config_reloads_total` stops incrementing entirely) from a
+    /// healthy one — a wedge is otherwise indistinguishable from silence.
+    pub config_last_reload_timestamp_seconds: Gauge,
     /// Policy-file (`router.toml`) reload outcomes: `applied` | `rejected`.
     /// A rejected reload keeps the previous config and is otherwise silent,
     /// so this counter is the only signal that an edit never landed.
@@ -200,6 +209,20 @@ impl Metrics {
             backend_up.clone(),
         );
 
+        let auth_enabled = Gauge::default();
+        registry.register(
+            "ollama_router_auth_enabled",
+            "1 if bearer-token auth is configured, else 0",
+            auth_enabled.clone(),
+        );
+
+        let config_last_reload_timestamp_seconds = Gauge::default();
+        registry.register(
+            "ollama_router_config_last_reload_timestamp_seconds",
+            "Unix timestamp of the last successfully applied router.toml reload",
+            config_last_reload_timestamp_seconds.clone(),
+        );
+
         let config_reloads = Family::default();
         registry.register(
             "ollama_router_config_reloads",
@@ -237,6 +260,8 @@ impl Metrics {
             backends_reachable,
             backends_healthy,
             backend_up,
+            auth_enabled,
+            config_last_reload_timestamp_seconds,
             config_reloads,
             upstream_errors,
             heartbeat_engaged,

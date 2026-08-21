@@ -348,11 +348,20 @@ fn empty_config_path_is_rejected_like_an_absent_one() {
 }
 
 #[test]
-fn empty_tokens_file_disables_auth_rather_than_failing_closed() {
-    // `OLLAMA_ROUTER_TOKENS_FILE=""` is a natural manifest spelling of
-    // "no auth". Before the empty-filter it enabled the fail-closed token
-    // store against an unreadable path and 401'd every request.
-    let config = parse_with_vars(&[("OLLAMA_ROUTER_TOKENS_FILE", "  ")]);
+fn empty_tokens_file_is_a_hard_startup_error() {
+    // The two ways to be lenient here are not symmetric, and both are bad:
+    // treating "" as unset DISABLES AUTH ENTIRELY (a manifest whose
+    // valueFrom renders empty brings the router up wide open), while
+    // keeping "" points the fail-closed store at an unreadable path and
+    // 401s everything for no visible reason. So: refuse to start.
+    for empty in ["", "   "] {
+        assert_env_parse_error(&[("OLLAMA_ROUTER_TOKENS_FILE", empty)], "set but empty");
+    }
+}
+
+#[test]
+fn absent_tokens_file_is_the_only_way_to_disable_auth() {
+    let config = parse_with_vars(&[]);
     assert!(config.tokens_file.is_none());
 }
 

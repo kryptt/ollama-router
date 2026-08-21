@@ -187,13 +187,29 @@ impl Config {
         )?;
         let grace_multiplier =
             parse_env_u64("OLLAMA_ROUTER_GRACE_MULTIPLIER", DEFAULT_GRACE_MULTIPLIER)?;
-        // Empty-filtered like every other path var. Without this,
-        // `OLLAMA_ROUTER_TOKENS_FILE=""` (a natural way to write "no auth"
-        // in a manifest) enables the fail-closed token store against an
-        // unreadable path, and every request 401s.
-        let tokens_file = env::var("OLLAMA_ROUTER_TOKENS_FILE")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
+        // Deliberately NOT empty-filtered like the other path vars, because
+        // this one gates authentication and the two failure modes are not
+        // symmetric. Filtering an empty value to `None` disables auth
+        // entirely — a manifest whose `valueFrom` renders empty would bring
+        // the router up wide open, and anything that could reach it could
+        // spend metered credits. Keeping the empty string instead points the
+        // fail-closed token store at an unreadable path, so every request
+        // 401s for no visible reason.
+        //
+        // Neither is acceptable, so an empty-but-set value is a hard startup
+        // error. Only a genuinely *absent* variable disables auth.
+        let tokens_file = match env::var("OLLAMA_ROUTER_TOKENS_FILE") {
+            Ok(path) if path.trim().is_empty() => {
+                return Err(ConfigError::Invalid {
+                    key: "OLLAMA_ROUTER_TOKENS_FILE",
+                    reason: "is set but empty: set a path, or remove the variable to disable \
+                             authentication (an empty value would silently disable it)"
+                        .to_string(),
+                });
+            }
+            Ok(path) => Some(path),
+            Err(_) => None,
+        };
         let extra_ca_file = env::var("OLLAMA_ROUTER_EXTRA_CA_FILE")
             .ok()
             .filter(|s| !s.trim().is_empty());

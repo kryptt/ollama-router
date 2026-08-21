@@ -38,13 +38,12 @@ pub struct Metrics {
     /// that only speaks OpenAI). Label-free on purpose — cardinality.
     pub protocol_translations: Counter,
     /// Alias-chain failovers: while serving alias `alias`, the walk moved
-    /// past candidate backend `to` because of `reason`. `from` is the hop
-    /// the walk arrived from — the alias name itself before the first
-    /// candidate, else the previously tried candidate's backend name.
-    /// `reason` is one of: unreachable | connect | timeout | transport |
-    /// auth | rate_limited | model_missing | upstream_5xx. Cardinality is
-    /// bounded by the operator's alias file (aliases × chain length × 8
-    /// reasons).
+    /// past candidate backend `to` because of `reason`. The hop it came
+    /// from is implied by the chain order in the alias file, so it is not
+    /// a label. `reason` is one of: unreachable | connect | timeout |
+    /// transport | auth | rate_limited | model_missing | upstream_5xx.
+    /// Cardinality is bounded by the operator's alias file (aliases ×
+    /// chain length × 8 reasons).
     pub chain_advance: Family<ChainAdvanceLabels, Counter>,
     /// Alias chains that ran out of candidates without committing a
     /// response — every candidate was unreachable or failed.
@@ -275,7 +274,6 @@ pub struct EscalationSkipLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ChainAdvanceLabels {
     pub alias: String,
-    pub from: String,
     pub to: String,
     pub reason: String,
 }

@@ -498,35 +498,29 @@ fn snapshot_alias_chain(reg: &Registry, model: &str) -> Option<(String, Vec<Chai
     let candidates = alias
         .candidates
         .iter()
-        .map(|c| match reg.backend_id_by_name(&c.backend) {
-            Some(id) => {
-                let view = reg.backend(id);
-                ChainCandidate {
-                    model: c.model.clone(),
-                    reachable: view.healthy || view.in_grace_period,
-                    serves: view.serves(&c.model),
-                    target: AttemptTarget {
-                        url: view.url.to_string(),
-                        name: view.name.to_string(),
-                        protocol: view.protocol,
-                        strip_auth: view.strip_auth,
-                    },
-                }
-            }
+        .filter_map(|c| {
             // Parse-time validation pins candidate backends to the
-            // configured set, so this arm is defensive only: treat an
-            // unknown backend as unreachable rather than panic.
-            None => ChainCandidate {
+            // configured set, so a miss is impossible by construction; drop
+            // the candidate (loudly) rather than fabricate a fake one.
+            let Some(id) = reg.backend_id_by_name(&c.backend) else {
+                tracing::error!(
+                    backend = %c.backend,
+                    "alias candidate names an unconfigured backend; skipping",
+                );
+                return None;
+            };
+            let view = reg.backend(id);
+            Some(ChainCandidate {
                 model: c.model.clone(),
-                reachable: false,
-                serves: false,
+                reachable: view.healthy || view.in_grace_period,
+                serves: view.serves(&c.model),
                 target: AttemptTarget {
-                    url: String::new(),
-                    name: c.backend.clone(),
-                    protocol: BackendProtocol::Ollama,
-                    strip_auth: false,
+                    url: view.url.to_string(),
+                    name: view.name.to_string(),
+                    protocol: view.protocol,
+                    strip_auth: view.strip_auth,
                 },
-            },
+            })
         })
         .collect();
     Some((canonical.to_string(), candidates))
@@ -579,20 +573,9 @@ async fn route_alias_chain(
     let attempt_all = !candidates.iter().any(|c| c.reachable);
 
     let mut last_failure: Option<(Response, String)> = None;
-    // `from` label for chain_advance: the hop the walk arrived from — the
-    // alias name itself before the first candidate, then the backend name
-    // of the last candidate tried. `to` is the failing candidate's backend.
-    let mut from_hop = alias.clone();
     for cand in candidates {
         if !attempt_all && !cand.reachable {
-            record_chain_advance(
-                &ctx.state.metrics,
-                &alias,
-                &from_hop,
-                &cand.target.name,
-                "unreachable",
-            );
-            from_hop = cand.target.name;
+            record_chain_advance(&ctx.state.metrics, &alias, &cand.target.name, "unreachable");
             continue;
         }
 
@@ -608,11 +591,9 @@ async fn route_alias_chain(
             record_chain_advance(
                 &ctx.state.metrics,
                 &alias,
-                &from_hop,
                 &cand.target.name,
                 "model_missing",
             );
-            from_hop = cand.target.name;
             continue;
         }
 
@@ -664,18 +645,11 @@ async fn route_alias_chain(
                 };
                 match reason {
                     Some(reason) => {
-                        record_chain_advance(
-                            &ctx.state.metrics,
-                            &alias,
-                            &from_hop,
-                            &cand.target.name,
-                            reason,
-                        );
+                        record_chain_advance(&ctx.state.metrics, &alias, &cand.target.name, reason);
                         // Keep the failure (and whose it was) so an
                         // exhausted chain can relay the most recent honest
                         // upstream signal under honest labels.
                         last_failure = Some((response, cand.target.name.clone()));
-                        from_hop = cand.target.name;
                         continue;
                     }
                     None => {
@@ -692,14 +666,7 @@ async fn route_alias_chain(
                 }
             }
             AttemptOutcome::Failed(e) => {
-                record_chain_advance(
-                    &ctx.state.metrics,
-                    &alias,
-                    &from_hop,
-                    &cand.target.name,
-                    e.kind_str(),
-                );
-                from_hop = cand.target.name;
+                record_chain_advance(&ctx.state.metrics, &alias, &cand.target.name, e.kind_str());
                 continue;
             }
         }
@@ -748,17 +715,16 @@ fn record_fallback(metrics: &Metrics, from: &str, to: &str) {
 }
 
 /// Increment `chain_advance` and emit the matching structured log line.
-fn record_chain_advance(metrics: &Metrics, alias: &str, from: &str, to: &str, reason: &str) {
+fn record_chain_advance(metrics: &Metrics, alias: &str, to: &str, reason: &str) {
     metrics
         .chain_advance
         .get_or_create(&metrics::ChainAdvanceLabels {
             alias: alias.to_string(),
-            from: from.to_string(),
             to: to.to_string(),
             reason: reason.to_string(),
         })
         .inc();
-    tracing::info!(alias, from, to, reason, "alias chain advancing");
+    tracing::info!(alias, to, reason, "alias chain advancing");
 }
 
 /// Record span fields and request metrics for one answered request: the

@@ -448,11 +448,8 @@ async fn alias_chain_advances_past_rate_limited_candidate() {
         text.contains(r#"alias="ali""#) && text.contains(r#"reason="rate_limited""#),
         "expected a rate_limited chain_advance sample:\n{text}"
     );
-    // `from` for the first candidate is the alias itself; `to` the backend.
-    assert!(
-        text.contains(r#"from="ali""#) && text.contains(r#"to="p1""#),
-        "{text}"
-    );
+    // `to` names the candidate backend that was moved past.
+    assert!(text.contains(r#"to="p1""#), "{text}");
     // The committed request is recorded under concrete model+backend labels.
     assert!(
         text.contains(r#"backend="p2""#) && text.contains(r#"model="m:latest""#),

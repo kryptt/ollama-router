@@ -156,9 +156,9 @@ or 5xx response heads.
   kept and a warning logged.
 - There are deliberately no per-candidate retries or backoff — the chain
   advance *is* the retry.
-- Metrics: `ollama_router_chain_advance{alias,from,to,reason}` (reasons:
-  `unreachable|connect|timeout|transport|auth|rate_limited|model_missing|upstream_5xx`;
-  `from` is the previous hop — the alias name for the first candidate) and
+- Metrics: `ollama_router_chain_advance{alias,to,reason}` (`to` is the
+  candidate backend moved past; reasons:
+  `unreachable|connect|timeout|transport|auth|rate_limited|model_missing|upstream_5xx`) and
   `ollama_router_chain_exhausted{alias}`. An exhausted chain still records
   `requests_total` — alias as the model, and the backend whose failure was
   relayed (`"none"` when no candidate produced a response).

@@ -217,13 +217,13 @@ async fn model_routing_to_correct_backend() {
     let r = run_discovery_to_completion(&reg, &config).await;
 
     let cuda_id = r.lookup("fixt/home-3b-v3:latest").unwrap();
-    assert_eq!(r.backend(cuda_id).name, "cuda");
+    assert_eq!(r.backend(cuda_id).expect("live id").name, "cuda");
 
     let rocm_id = r.lookup("glm-4.7-flash:latest").unwrap();
-    assert_eq!(r.backend(rocm_id).name, "rocm");
+    assert_eq!(r.backend(rocm_id).expect("live id").name, "rocm");
 
     let prefix_id = r.lookup("glm-4.7-flash").unwrap();
-    assert_eq!(r.backend(prefix_id).name, "rocm");
+    assert_eq!(r.backend(prefix_id).expect("live id").name, "rocm");
 
     assert!(r.lookup("nonexistent").is_none());
 }

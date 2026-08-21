@@ -230,8 +230,13 @@ impl Registry {
     }
 
     /// Borrow a backend's view by id.
-    pub fn backend(&self, id: BackendId) -> BackendView<'_> {
-        self.backends[id.0].view()
+    ///
+    /// Checked, not `self.backends[id.0]`: `BackendId` is a raw index, and
+    /// once the roster is rebuilt on a config reload an id snapshotted from
+    /// an earlier read can name a slot that no longer exists. A stale id
+    /// must degrade to an error, not abort the process.
+    pub fn backend(&self, id: BackendId) -> Option<BackendView<'_>> {
+        self.backends.get(id.0).map(BackendState::view)
     }
 
     /// Iterate over all backends.
@@ -645,7 +650,7 @@ mod tests {
         let id = reg
             .backend_id_by_name("rocm")
             .expect("configured backend should resolve");
-        assert_eq!(reg.backend(id).name, "rocm");
+        assert_eq!(reg.backend(id).expect("live id").name, "rocm");
         assert!(reg.backend_id_by_name("typo").is_none());
     }
 
@@ -686,14 +691,14 @@ mod tests {
         let id = reg
             .lookup(model)
             .unwrap_or_else(|| panic!("lookup({model:?}) returned None"));
-        assert_eq!(reg.backend(id).name, expected_name);
+        assert_eq!(reg.backend(id).expect("live id").name, expected_name);
     }
 
     /// Collect backend names for all healthy backends serving `model`.
     fn backend_names_for<'a>(reg: &'a Registry, model: &str) -> Vec<&'a str> {
         reg.healthy_backends_for(model)
             .iter()
-            .map(|&id| reg.backend(id).name)
+            .filter_map(|&id| reg.backend(id).map(|b| b.name))
             .collect()
     }
 
@@ -881,13 +886,15 @@ mod tests {
     #[test]
     fn any_healthy_returns_first_healthy() {
         let reg = reg_health_only(true, true);
-        assert_eq!(reg.backend(reg.any_healthy().unwrap()).name, "cuda");
+        let id = reg.any_healthy().expect("a healthy backend");
+        assert_eq!(reg.backend(id).expect("live id").name, "cuda");
     }
 
     #[test]
     fn any_healthy_skips_unhealthy() {
         let reg = reg_health_only(false, true);
-        assert_eq!(reg.backend(reg.any_healthy().unwrap()).name, "rocm");
+        let id = reg.any_healthy().expect("a healthy backend");
+        assert_eq!(reg.backend(id).expect("live id").name, "rocm");
     }
 
     #[test]

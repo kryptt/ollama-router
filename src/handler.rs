@@ -201,7 +201,12 @@ pub async fn model_route(
             return proxy::model_not_found(&spilled.model, &available);
         }
     };
-    let view = reg.backend(backend_id);
+    // Checked lookup: `backend_id` came from `reg` under this same guard,
+    // so a miss is impossible here — but the id type cannot prove it, and a
+    // 502 beats a panic if that ever stops being true.
+    let Some(view) = reg.backend(backend_id) else {
+        return proxy::bad_gateway("backend vanished between lookup and dispatch");
+    };
     let backend_url = view.url.to_string();
     let backend_name = view.name.to_string();
     let backend_protocol = view.protocol;
@@ -509,7 +514,13 @@ fn snapshot_alias_chain(reg: &Registry, model: &str) -> Option<(String, Vec<Chai
                 );
                 return None;
             };
-            let view = reg.backend(id);
+            let Some(view) = reg.backend(id) else {
+                tracing::error!(
+                    backend = %c.backend,
+                    "alias candidate resolved to a stale backend id; skipping",
+                );
+                return None;
+            };
             Some(ChainCandidate {
                 model: c.model.clone(),
                 reachable: view.healthy || view.in_grace_period,
@@ -849,11 +860,8 @@ pub async fn passthrough_route(
 ) -> Response {
     let (target_url, strip_auth) = {
         let reg = state.registry.read().await;
-        match reg.any_healthy() {
-            Some(id) => {
-                let view = reg.backend(id);
-                (view.url.to_string(), view.strip_auth)
-            }
+        match reg.any_healthy().and_then(|id| reg.backend(id)) {
+            Some(view) => (view.url.to_string(), view.strip_auth),
             None => return proxy::bad_gateway("no healthy backends available"),
         }
     };

@@ -22,17 +22,6 @@ unsafe fn clear_env() {
         "OLLAMA_ROUTER_PREFLIGHT_TIMEOUT",
         "OLLAMA_ROUTER_LOADING_MAX_WAIT",
         "OLLAMA_ROUTER_ESCALATE",
-        "OLLAMA_ROUTER_MAX_RETRIES",
-        "OLLAMA_ROUTER_RETRY_BACKOFF_BASE_MS",
-        "OLLAMA_ROUTER_RETRY_JITTER_PCT",
-        "OLLAMA_ROUTER_RETRY_LATENCY_BUDGET",
-        "OLLAMA_ROUTER_BREAKER_5XX_THRESHOLD",
-        "OLLAMA_ROUTER_BREAKER_OPEN",
-        "OLLAMA_ROUTER_BACKEND_MAX_INFLIGHT",
-        "OLLAMA_ROUTER_CACHE_ENABLED",
-        "OLLAMA_ROUTER_CACHE_MAX_BYTES",
-        "OLLAMA_ROUTER_CACHE_MAX_ENTRY_BYTES",
-        "OLLAMA_ROUTER_CACHE_TTL",
     ] {
         unsafe { env::remove_var(key) };
     }
@@ -147,98 +136,18 @@ fn defaults_are_sane() {
     assert_eq!(config.loading_heartbeat_secs, 15);
     assert_eq!(config.preflight_timeout_secs, 10);
     assert_eq!(config.loading_max_wait_secs, 300);
-    // Resilience defaults (Unit 1).
-    assert_eq!(config.max_retries, 2);
-    assert_eq!(config.retry_backoff_base_ms, 100);
-    assert_eq!(config.retry_jitter_pct, 25);
-    assert_eq!(config.retry_latency_budget_secs, 30);
-    assert_eq!(config.breaker_5xx_threshold, 5);
-    assert_eq!(config.breaker_open_secs, 10);
-    assert_eq!(config.backend_max_inflight, 0);
-    // Cache defaults: off until validated.
-    assert!(!config.cache_enabled);
-    assert_eq!(config.cache_max_bytes, 64 * 1024 * 1024);
-    assert_eq!(config.cache_max_entry_bytes, 1024 * 1024);
-    assert_eq!(config.cache_ttl_secs, 3600);
-}
-
-#[test]
-fn resilience_knobs_parsed_from_env() {
-    let config = parse_with_vars(&[
-        ("OLLAMA_ROUTER_MAX_RETRIES", "4"),
-        ("OLLAMA_ROUTER_RETRY_BACKOFF_BASE_MS", "250"),
-        ("OLLAMA_ROUTER_RETRY_JITTER_PCT", "50"),
-        ("OLLAMA_ROUTER_RETRY_LATENCY_BUDGET", "60"),
-        ("OLLAMA_ROUTER_BREAKER_5XX_THRESHOLD", "8"),
-        ("OLLAMA_ROUTER_BREAKER_OPEN", "20"),
-        ("OLLAMA_ROUTER_BACKEND_MAX_INFLIGHT", "16"),
-    ]);
-    assert_eq!(config.max_retries, 4);
-    assert_eq!(config.retry_backoff_base_ms, 250);
-    assert_eq!(config.retry_jitter_pct, 50);
-    assert_eq!(config.retry_latency_budget_secs, 60);
-    assert_eq!(config.breaker_5xx_threshold, 8);
-    assert_eq!(config.breaker_open_secs, 20);
-    assert_eq!(config.backend_max_inflight, 16);
-}
-
-#[test]
-fn invalid_max_retries_fails() {
-    assert_env_parse_error(
-        &[("OLLAMA_ROUTER_MAX_RETRIES", "lots")],
-        "must be a positive integer",
-    );
-}
-
-#[test]
-fn cache_knobs_parsed_from_env() {
-    let config = parse_with_vars(&[
-        ("OLLAMA_ROUTER_CACHE_ENABLED", "true"),
-        ("OLLAMA_ROUTER_CACHE_MAX_BYTES", "1048576"),
-        ("OLLAMA_ROUTER_CACHE_MAX_ENTRY_BYTES", "4096"),
-        ("OLLAMA_ROUTER_CACHE_TTL", "120"),
-    ]);
-    assert!(config.cache_enabled);
-    assert_eq!(config.cache_max_bytes, 1_048_576);
-    assert_eq!(config.cache_max_entry_bytes, 4096);
-    assert_eq!(config.cache_ttl_secs, 120);
-}
-
-#[test]
-fn cache_enabled_accepts_bool_spellings() {
-    with_clean_env(|| {
-        for truthy in ["1", "on", "YES", "True"] {
-            unsafe { env::set_var("OLLAMA_ROUTER_CONFIG", CONFIG_PATH) };
-            unsafe { env::set_var("OLLAMA_ROUTER_CACHE_ENABLED", truthy) };
-            assert!(Config::from_env().unwrap().cache_enabled, "{truthy}");
-        }
-        for falsy in ["0", "off", "NO", "False"] {
-            unsafe { env::set_var("OLLAMA_ROUTER_CONFIG", CONFIG_PATH) };
-            unsafe { env::set_var("OLLAMA_ROUTER_CACHE_ENABLED", falsy) };
-            assert!(!Config::from_env().unwrap().cache_enabled, "{falsy}");
-        }
-    });
-}
-
-#[test]
-fn invalid_cache_enabled_fails() {
-    assert_env_parse_error(
-        &[("OLLAMA_ROUTER_CACHE_ENABLED", "maybe")],
-        "must be a boolean",
-    );
 }
 
 #[test]
 fn invalid_numeric_knobs_fail() {
     // Every numeric knob shares the parse_env_u64 error path; spot-check a
-    // representative spread rather than only OLLAMA_ROUTER_MAX_RETRIES.
+    // representative spread rather than a single key.
     for key in [
-        "OLLAMA_ROUTER_RETRY_BACKOFF_BASE_MS",
-        "OLLAMA_ROUTER_RETRY_LATENCY_BUDGET",
-        "OLLAMA_ROUTER_BREAKER_OPEN",
-        "OLLAMA_ROUTER_BACKEND_MAX_INFLIGHT",
-        "OLLAMA_ROUTER_CACHE_MAX_BYTES",
-        "OLLAMA_ROUTER_CACHE_TTL",
+        "OLLAMA_ROUTER_DISCOVERY_INTERVAL",
+        "OLLAMA_ROUTER_CONNECT_TIMEOUT",
+        "OLLAMA_ROUTER_REQUEST_TIMEOUT",
+        "OLLAMA_ROUTER_GRACE_MULTIPLIER",
+        "OLLAMA_ROUTER_LOADING_HEARTBEAT",
     ] {
         assert_env_parse_error(&[(key, "nope")], "must be a positive integer");
     }
@@ -246,51 +155,8 @@ fn invalid_numeric_knobs_fail() {
 
 #[test]
 fn numeric_knobs_trim_surrounding_whitespace() {
-    let config = parse_with_vars(&[("OLLAMA_ROUTER_MAX_RETRIES", "  4  ")]);
-    assert_eq!(config.max_retries, 4);
-}
-
-#[test]
-fn zero_sentinels_are_accepted() {
-    // Documented sentinels: 0 retries (single-shot), 0 in-flight cap
-    // (unlimited), 0 jitter, and 0 per-entry cap (no cap) are all valid.
-    let config = parse_with_vars(&[
-        ("OLLAMA_ROUTER_MAX_RETRIES", "0"),
-        ("OLLAMA_ROUTER_BACKEND_MAX_INFLIGHT", "0"),
-        ("OLLAMA_ROUTER_RETRY_JITTER_PCT", "0"),
-        ("OLLAMA_ROUTER_CACHE_MAX_ENTRY_BYTES", "0"),
-    ]);
-    assert_eq!(config.max_retries, 0);
-    assert_eq!(config.backend_max_inflight, 0);
-    assert_eq!(config.retry_jitter_pct, 0);
-    assert_eq!(config.cache_max_entry_bytes, 0);
-}
-
-#[test]
-fn jitter_pct_above_100_fails() {
-    assert_env_parse_error(&[("OLLAMA_ROUTER_RETRY_JITTER_PCT", "101")], "0\u{2013}100");
-    // The 0-100 boundary itself is valid.
-    let config = parse_with_vars(&[("OLLAMA_ROUTER_RETRY_JITTER_PCT", "100")]);
-    assert_eq!(config.retry_jitter_pct, 100);
-}
-
-#[test]
-fn breaker_threshold_zero_fails() {
-    assert_env_parse_error(
-        &[("OLLAMA_ROUTER_BREAKER_5XX_THRESHOLD", "0")],
-        "at least 1",
-    );
-}
-
-#[test]
-fn cache_entry_cap_above_total_fails() {
-    assert_env_parse_error(
-        &[
-            ("OLLAMA_ROUTER_CACHE_MAX_BYTES", "1000"),
-            ("OLLAMA_ROUTER_CACHE_MAX_ENTRY_BYTES", "2000"),
-        ],
-        "must not exceed",
-    );
+    let config = parse_with_vars(&[("OLLAMA_ROUTER_CONNECT_TIMEOUT", "  4  ")]);
+    assert_eq!(config.connect_timeout_secs, 4);
 }
 
 #[test]

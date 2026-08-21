@@ -49,17 +49,6 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_LOADING_HEARTBEAT_SECS: u64 = 15;
 const DEFAULT_PREFLIGHT_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_LOADING_MAX_WAIT_SECS: u64 = 300;
-const DEFAULT_MAX_RETRIES: u64 = 2;
-const DEFAULT_RETRY_BACKOFF_BASE_MS: u64 = 100;
-const DEFAULT_RETRY_JITTER_PCT: u64 = 25;
-const DEFAULT_RETRY_LATENCY_BUDGET_SECS: u64 = 30;
-const DEFAULT_BREAKER_5XX_THRESHOLD: u64 = 5;
-const DEFAULT_BREAKER_OPEN_SECS: u64 = 10;
-const DEFAULT_BACKEND_MAX_INFLIGHT: u64 = 0;
-const DEFAULT_CACHE_ENABLED: bool = false;
-const DEFAULT_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
-const DEFAULT_CACHE_MAX_ENTRY_BYTES: u64 = 1024 * 1024; // 1 MiB
-const DEFAULT_CACHE_TTL_SECS: u64 = 3600;
 
 /// Validated, immutable configuration.
 /// All parsing happens in `from_env`; once constructed, every field is valid.
@@ -99,41 +88,6 @@ pub struct Config {
     /// a bigger diff than the whole policy-file migration, for a feature
     /// that is unset in production.
     pub escalation_rules: Vec<EscalationRule>,
-
-    // --- Resilience: bounded retry-with-backoff (Unit 3) ---
-    /// Maximum retry attempts after the first try for a transient failure.
-    /// 0 disables retry (single-shot).
-    pub max_retries: u64,
-    /// Base delay for exponential backoff between retry attempts.
-    pub retry_backoff_base_ms: u64,
-    /// Random jitter added to each backoff, as a percentage of the computed
-    /// backoff (e.g. 25 = up to ±25%). 0 disables jitter. Validated to 0–100.
-    pub retry_jitter_pct: u64,
-    /// Hard wall-clock budget across all attempts for a single request. Once
-    /// exceeded, stop retrying and surface backpressure.
-    pub retry_latency_budget_secs: u64,
-
-    // --- Resilience: per-backend circuit breaker + admission (Unit 3) ---
-    /// Consecutive 5xx responses from a backend that trip its breaker open.
-    /// Must be at least 1 (the breaker is always on).
-    pub breaker_5xx_threshold: u64,
-    /// How long a backend's breaker stays open before a half-open probe.
-    pub breaker_open_secs: u64,
-    /// Per-backend in-flight request cap; over the cap sheds load as 503
-    /// rather than queueing. 0 = unlimited.
-    pub backend_max_inflight: u64,
-
-    // --- Embedding cache (Unit 4; off by default until validated) ---
-    /// Master switch for the embedding cache.
-    pub cache_enabled: bool,
-    /// Total byte budget for the cache across all entries.
-    pub cache_max_bytes: u64,
-    /// Skip caching any single body larger than this (avoid buffering the
-    /// multi-MB bulk-embed payloads). 0 = no per-entry cap. When non-zero,
-    /// must not exceed `cache_max_bytes`.
-    pub cache_max_entry_bytes: u64,
-    /// Time-to-live for a cached embedding.
-    pub cache_ttl_secs: u64,
 }
 
 impl Default for Config {
@@ -155,17 +109,6 @@ impl Default for Config {
             preflight_timeout_secs: DEFAULT_PREFLIGHT_TIMEOUT_SECS,
             loading_max_wait_secs: DEFAULT_LOADING_MAX_WAIT_SECS,
             escalation_rules: Vec::new(),
-            max_retries: DEFAULT_MAX_RETRIES,
-            retry_backoff_base_ms: DEFAULT_RETRY_BACKOFF_BASE_MS,
-            retry_jitter_pct: DEFAULT_RETRY_JITTER_PCT,
-            retry_latency_budget_secs: DEFAULT_RETRY_LATENCY_BUDGET_SECS,
-            breaker_5xx_threshold: DEFAULT_BREAKER_5XX_THRESHOLD,
-            breaker_open_secs: DEFAULT_BREAKER_OPEN_SECS,
-            backend_max_inflight: DEFAULT_BACKEND_MAX_INFLIGHT,
-            cache_enabled: DEFAULT_CACHE_ENABLED,
-            cache_max_bytes: DEFAULT_CACHE_MAX_BYTES,
-            cache_max_entry_bytes: DEFAULT_CACHE_MAX_ENTRY_BYTES,
-            cache_ttl_secs: DEFAULT_CACHE_TTL_SECS,
         }
     }
 }
@@ -247,59 +190,6 @@ impl Config {
             _ => Vec::new(),
         };
 
-        let max_retries = parse_env_u64("OLLAMA_ROUTER_MAX_RETRIES", DEFAULT_MAX_RETRIES)?;
-        let retry_backoff_base_ms = parse_env_u64(
-            "OLLAMA_ROUTER_RETRY_BACKOFF_BASE_MS",
-            DEFAULT_RETRY_BACKOFF_BASE_MS,
-        )?;
-        let retry_jitter_pct =
-            parse_env_u64("OLLAMA_ROUTER_RETRY_JITTER_PCT", DEFAULT_RETRY_JITTER_PCT)?;
-        let retry_latency_budget_secs = parse_env_u64(
-            "OLLAMA_ROUTER_RETRY_LATENCY_BUDGET",
-            DEFAULT_RETRY_LATENCY_BUDGET_SECS,
-        )?;
-        let breaker_5xx_threshold = parse_env_u64(
-            "OLLAMA_ROUTER_BREAKER_5XX_THRESHOLD",
-            DEFAULT_BREAKER_5XX_THRESHOLD,
-        )?;
-        let breaker_open_secs =
-            parse_env_u64("OLLAMA_ROUTER_BREAKER_OPEN", DEFAULT_BREAKER_OPEN_SECS)?;
-        let backend_max_inflight = parse_env_u64(
-            "OLLAMA_ROUTER_BACKEND_MAX_INFLIGHT",
-            DEFAULT_BACKEND_MAX_INFLIGHT,
-        )?;
-        let cache_enabled = parse_env_bool("OLLAMA_ROUTER_CACHE_ENABLED", DEFAULT_CACHE_ENABLED)?;
-        let cache_max_bytes =
-            parse_env_u64("OLLAMA_ROUTER_CACHE_MAX_BYTES", DEFAULT_CACHE_MAX_BYTES)?;
-        let cache_max_entry_bytes = parse_env_u64(
-            "OLLAMA_ROUTER_CACHE_MAX_ENTRY_BYTES",
-            DEFAULT_CACHE_MAX_ENTRY_BYTES,
-        )?;
-        let cache_ttl_secs = parse_env_u64("OLLAMA_ROUTER_CACHE_TTL", DEFAULT_CACHE_TTL_SECS)?;
-
-        // Semantic validation: catch misconfigurations at startup rather than
-        // deferring them to confusing runtime behavior in Units 3/4.
-        if retry_jitter_pct > 100 {
-            return Err(ConfigError::Invalid {
-                key: "OLLAMA_ROUTER_RETRY_JITTER_PCT",
-                reason: format!("must be 0–100, got {retry_jitter_pct}"),
-            });
-        }
-        if breaker_5xx_threshold == 0 {
-            return Err(ConfigError::Invalid {
-                key: "OLLAMA_ROUTER_BREAKER_5XX_THRESHOLD",
-                reason: "must be at least 1 (0 would trip the breaker permanently)".to_string(),
-            });
-        }
-        if cache_max_entry_bytes != 0 && cache_max_entry_bytes > cache_max_bytes {
-            return Err(ConfigError::Invalid {
-                key: "OLLAMA_ROUTER_CACHE_MAX_ENTRY_BYTES",
-                reason: format!(
-                    "must not exceed OLLAMA_ROUTER_CACHE_MAX_BYTES ({cache_max_bytes}), got {cache_max_entry_bytes}"
-                ),
-            });
-        }
-
         Ok(Config {
             config_path,
             discovery_interval_secs,
@@ -314,17 +204,6 @@ impl Config {
             preflight_timeout_secs,
             loading_max_wait_secs,
             escalation_rules,
-            max_retries,
-            retry_backoff_base_ms,
-            retry_jitter_pct,
-            retry_latency_budget_secs,
-            breaker_5xx_threshold,
-            breaker_open_secs,
-            backend_max_inflight,
-            cache_enabled,
-            cache_max_bytes,
-            cache_max_entry_bytes,
-            cache_ttl_secs,
         })
     }
 
@@ -392,11 +271,6 @@ pub enum ConfigError {
         key: &'static str,
         value: String,
     },
-    /// A value that should be a boolean failed to parse as one.
-    InvalidBool {
-        key: &'static str,
-        value: String,
-    },
     /// A value parsed but failed a semantic/range/cross-field constraint.
     Invalid {
         key: &'static str,
@@ -416,12 +290,6 @@ impl fmt::Display for ConfigError {
             }
             Self::InvalidValue { key, value } => {
                 write!(f, "{key} must be a positive integer, got '{value}'")
-            }
-            Self::InvalidBool { key, value } => {
-                write!(
-                    f,
-                    "{key} must be a boolean (true/false, 1/0, yes/no, on/off), got '{value}'"
-                )
             }
             Self::Invalid { key, reason } => {
                 write!(f, "{key} {reason}")
@@ -460,18 +328,5 @@ fn parse_env_u64(key: &'static str, default: u64) -> Result<u64, ConfigError> {
             key,
             value: s.to_string(),
         })
-    })
-}
-
-/// Parse a boolean env var. Accepts (case-insensitive, whitespace-trimmed)
-/// `true/false`, `1/0`, `yes/no`, `on/off`; anything else is rejected.
-fn parse_env_bool(key: &'static str, default: bool) -> Result<bool, ConfigError> {
-    parse_env(key, default, |s| match s.to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" | "on" => Ok(true),
-        "false" | "0" | "no" | "off" => Ok(false),
-        _ => Err(ConfigError::InvalidBool {
-            key,
-            value: s.to_string(),
-        }),
     })
 }

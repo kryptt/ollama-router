@@ -170,6 +170,9 @@ impl BackendView<'_> {
 ///
 /// Invariant: `model_map` keys stay in sync with `backends[*].models`
 /// via `rebuild_model_map`, called at the end of every discovery cycle.
+///
+/// `Default` is the empty roster — see `new_shared_empty`.
+#[derive(Default)]
 pub struct Registry {
     backends: Vec<BackendState>,
     model_map: HashMap<String, BackendId>,
@@ -538,13 +541,7 @@ pub fn new_shared(validated: Validated) -> SharedRegistry {
 /// (see `Registry::is_ready`), so the Service simply has no endpoints and
 /// the pod self-heals the moment the file becomes readable.
 pub fn new_shared_empty() -> SharedRegistry {
-    Arc::new(RwLock::new(Registry {
-        backends: Vec::new(),
-        model_map: HashMap::new(),
-        fallbacks: HashMap::new(),
-        aliases: HashMap::new(),
-        discovery_done: false,
-    }))
+    Arc::new(RwLock::new(Registry::default()))
 }
 
 /// Long-running discovery loop. Runs the first cycle immediately, then
@@ -591,9 +588,12 @@ async fn reload_policy(path: &str, registry: &SharedRegistry, metrics: &Metrics)
                 // freezes at its last value forever.
                 metrics.backend_up.remove(&BackendLabels { backend });
             }
-            metrics
-                .config_last_reload_timestamp_seconds
-                .set(unix_now_secs());
+            metrics.config_last_reload_timestamp_seconds.set(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+            );
             "applied"
         }
         Err(e) => {
@@ -656,14 +656,6 @@ where
             after: budget,
         }),
     }
-}
-
-/// Seconds since the Unix epoch, or 0 if the clock is before it.
-fn unix_now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// The outcome of probing one backend, paired with its name by the caller.

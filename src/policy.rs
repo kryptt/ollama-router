@@ -251,13 +251,12 @@ impl FileConfig {
         // Sorted iteration over both maps so that a file with several
         // problems always reports the same one — a nondeterministic error
         // message on a hand-edited file is a bad debugging experience.
-        let mut fallback_keys: Vec<&String> = fallbacks.keys().collect();
-        fallback_keys.sort();
-        for from in fallback_keys {
+        let mut fallback_entries: Vec<(&String, &String)> = fallbacks.iter().collect();
+        fallback_entries.sort();
+        for (from, to) in fallback_entries {
             // `to` is deliberately NOT checked against the published
             // catalogue: its backend may simply be down right now, and it
             // is unprovable at all against an `allow = ["*"]` backend.
-            let to = fallbacks.get(from).map(String::as_str).unwrap_or_default();
             if from.trim().is_empty() || to.trim().is_empty() {
                 return invalid(format!("fallback '{from}' = '{to}' has an empty side"));
             }
@@ -268,13 +267,10 @@ impl FileConfig {
             }
         }
 
-        let mut alias_names: Vec<&String> = aliases.keys().collect();
-        alias_names.sort();
+        let mut alias_entries: Vec<(&String, &RawAlias)> = aliases.iter().collect();
+        alias_entries.sort_by(|a, b| a.0.cmp(b.0));
         let mut validated_aliases = HashMap::with_capacity(aliases.len());
-        for name in alias_names {
-            let Some(raw) = aliases.get(name) else {
-                continue;
-            };
+        for (name, raw) in alias_entries {
             let alias = validate_alias(name, raw, &specs, &external)?;
             validated_aliases.insert(name.clone(), alias);
         }

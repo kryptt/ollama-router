@@ -323,23 +323,6 @@ Notes on escalation:
   the router falls back to the original model and tracks it under
   `reason="target_not_found"`.
 
-Resilience and caching (validated at startup; retry/breaker/cache logic ships
-in a later release):
-
-| Var | Default | Purpose |
-|---|---|---|
-| `OLLAMA_ROUTER_MAX_RETRIES` | `2` | Maximum retry attempts after the first try for a transient failure. `0` disables retry (single-shot). |
-| `OLLAMA_ROUTER_RETRY_BACKOFF_BASE_MS` | `100` | Base delay (milliseconds) for exponential backoff between retry attempts. |
-| `OLLAMA_ROUTER_RETRY_JITTER_PCT` | `25` | Random jitter as a percentage of the computed backoff (`25` = up to ±25%). `0` disables jitter; must be 0--100. |
-| `OLLAMA_ROUTER_RETRY_LATENCY_BUDGET` | `30` | Hard wall-clock budget (seconds) across all attempts for a single request. |
-| `OLLAMA_ROUTER_BREAKER_5XX_THRESHOLD` | `5` | Consecutive 5xx responses that trip a backend's circuit breaker open. Must be at least 1. |
-| `OLLAMA_ROUTER_BREAKER_OPEN` | `10` | How long (seconds) a backend's breaker stays open before a half-open probe. |
-| `OLLAMA_ROUTER_BACKEND_MAX_INFLIGHT` | `0` | Per-backend in-flight request cap; over the cap sheds load as 503 rather than queueing. `0` = unlimited. |
-| `OLLAMA_ROUTER_CACHE_ENABLED` | `false` | Master switch for the embedding cache. Accepts `true/false`, `1/0`, `yes/no`, `on/off`. |
-| `OLLAMA_ROUTER_CACHE_MAX_BYTES` | `67108864` | Total byte budget for the cache across all entries (64 MiB). |
-| `OLLAMA_ROUTER_CACHE_MAX_ENTRY_BYTES` | `1048576` | Skip caching any single body larger than this, in bytes (1 MiB); avoids buffering multi-MB bulk embeds. `0` = no per-entry cap. When non-zero, must not exceed `OLLAMA_ROUTER_CACHE_MAX_BYTES`. |
-| `OLLAMA_ROUTER_CACHE_TTL` | `3600` | Time-to-live (seconds) for a cached embedding. |
-
 Tracing (optional — unset disables OTLP export, leaving structured logs only):
 
 | Var | Default | Purpose |
@@ -373,12 +356,12 @@ Internal router (`OLLAMA_ROUTER_INTERNAL_PORT`):
 
 ## Roadmap
 
-The resilience and embedding-cache environment variables above
-(`OLLAMA_ROUTER_MAX_RETRIES`, the `…_BREAKER_*` / `…_BACKEND_MAX_INFLIGHT`
-knobs, and the `…_CACHE_*` knobs) are **parsed and validated today but not yet
-active** — the machinery that consumes them is in progress. The internal
-plumbing it builds on has already landed: `proxy::execute` returns a typed
-outcome (connect / timeout / transport vs. response), the registry can
+Retry/circuit-breaker/embedding-cache knobs were removed in 0.15.1: they were
+parsed and validated but never read by any code path, and alias chains have
+since taken over the job they were meant to do — a chain advance *is* the
+retry, decided on the response head so it is streaming-safe. The plumbing they
+would build on is still in place if that changes: `proxy::execute` returns a
+typed outcome (connect / timeout / transport vs. response), the registry can
 enumerate the healthy backends serving a model, and handlers live in a library
 module with a clean injection point.
 

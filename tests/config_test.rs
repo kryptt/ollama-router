@@ -346,3 +346,24 @@ fn empty_config_path_is_rejected_like_an_absent_one() {
         assert!(Config::from_env().is_err());
     });
 }
+
+#[test]
+fn empty_tokens_file_disables_auth_rather_than_failing_closed() {
+    // `OLLAMA_ROUTER_TOKENS_FILE=""` is a natural manifest spelling of
+    // "no auth". Before the empty-filter it enabled the fail-closed token
+    // store against an unreadable path and 401'd every request.
+    let config = parse_with_vars(&[("OLLAMA_ROUTER_TOKENS_FILE", "  ")]);
+    assert!(config.tokens_file.is_none());
+}
+
+#[test]
+fn unreadable_extra_ca_is_fatal_at_startup_for_the_discovery_client() {
+    // Symmetry with the proxy client. The old asymmetry — fatal for the
+    // proxy, a warning that silently disabled discovery — produced a router
+    // that came up Ready, published nothing, and 404'd everything.
+    let config = parse_with_vars(&[("OLLAMA_ROUTER_EXTRA_CA_FILE", "/nonexistent/ca.pem")]);
+    let err = config
+        .discovery_client()
+        .expect_err("an unreadable CA bundle must fail");
+    assert!(err.to_string().contains("could not be read"), "{err}");
+}

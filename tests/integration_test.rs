@@ -42,7 +42,8 @@ fn spawn_discovery(reg: &SharedRegistry, config: &Config, metrics: &Arc<Metrics>
         let reg = reg.clone();
         let config = config.clone();
         let metrics = Arc::clone(metrics);
-        async move { registry::discovery_loop(reg, config, metrics).await }
+        let client = config.discovery_client().expect("discovery client");
+        async move { registry::discovery_loop(reg, config, metrics, client).await }
     });
 }
 

@@ -115,11 +115,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         escalation_rules,
     };
 
+    // Built here so a bad EXTRA_CA_FILE is fatal at startup rather than a
+    // warning that silently disables discovery from a spawned task.
+    let discovery_client = config.discovery_client()?;
     tokio::spawn({
         let registry = Arc::clone(&registry);
         let metrics = Arc::clone(&metrics);
         let config = config.clone();
-        async move { registry::discovery_loop(registry, config, metrics).await }
+        async move { registry::discovery_loop(registry, config, metrics, discovery_client).await }
     });
 
     // One shutdown notify shared by both servers and the background tasks. A

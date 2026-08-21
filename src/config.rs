@@ -1,6 +1,7 @@
 use std::env;
 use std::fmt;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 /// A "if a request for `from_model` looks bigger than this model's
 /// per-slot context, transparently rewrite it to `to_model`" rule.
@@ -186,7 +187,13 @@ impl Config {
         )?;
         let grace_multiplier =
             parse_env_u64("OLLAMA_ROUTER_GRACE_MULTIPLIER", DEFAULT_GRACE_MULTIPLIER)?;
-        let tokens_file = env::var("OLLAMA_ROUTER_TOKENS_FILE").ok();
+        // Empty-filtered like every other path var. Without this,
+        // `OLLAMA_ROUTER_TOKENS_FILE=""` (a natural way to write "no auth"
+        // in a manifest) enables the fail-closed token store against an
+        // unreadable path, and every request 401s.
+        let tokens_file = env::var("OLLAMA_ROUTER_TOKENS_FILE")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
         let extra_ca_file = env::var("OLLAMA_ROUTER_EXTRA_CA_FILE")
             .ok()
             .filter(|s| !s.trim().is_empty());
@@ -307,6 +314,23 @@ impl Config {
 
     pub fn grace_period_secs(&self) -> u64 {
         self.discovery_interval_secs * self.grace_multiplier
+    }
+
+    /// Build the discovery loop's HTTP client.
+    ///
+    /// Constructed here, at startup, rather than inside `discovery_loop`:
+    /// an unreadable or malformed `EXTRA_CA_FILE` used to be fatal for the
+    /// proxy client but only a warning on the discovery side, which
+    /// *silently disabled discovery entirely* — the router would come up
+    /// Ready, publish nothing, and 404 every request. One construction
+    /// site, one failure mode, and it fails the process at startup.
+    pub fn discovery_client(&self) -> Result<reqwest::Client, ConfigError> {
+        self.apply_extra_ca(reqwest::Client::builder().timeout(Duration::from_secs(10)))?
+            .build()
+            .map_err(|e| ConfigError::Invalid {
+                key: "OLLAMA_ROUTER_EXTRA_CA_FILE",
+                reason: format!("could not build the discovery HTTP client: {e}"),
+            })
     }
 
     /// Add `extra_ca_file`'s certificates to an outbound HTTP client.

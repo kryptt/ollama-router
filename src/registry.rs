@@ -498,25 +498,12 @@ pub fn new_shared(validated: Validated) -> SharedRegistry {
 /// not help anyway: the file lives on NFS and is edited on the server, and
 /// an NFS client receives no events for changes made elsewhere. A watcher
 /// would sit silent forever while looking like it worked.
-pub async fn discovery_loop(registry: SharedRegistry, config: Config, metrics: Arc<Metrics>) {
-    let builder = match config.apply_extra_ca(Client::builder().timeout(Duration::from_secs(10))) {
-        Ok(builder) => builder,
-        Err(e) => {
-            warn!(error = %e, "invalid extra CA for discovery client; discovery disabled");
-            return;
-        }
-    };
-    let client = match builder.build() {
-        Ok(client) => client,
-        Err(e) => {
-            // Discovery can't run without an HTTP client. Log and bail out of
-            // this background task rather than aborting the whole process —
-            // the router can still proxy to statically-configured backends.
-            warn!(error = %e, "failed to build discovery HTTP client; discovery disabled");
-            return;
-        }
-    };
-
+pub async fn discovery_loop(
+    registry: SharedRegistry,
+    config: Config,
+    metrics: Arc<Metrics>,
+    client: Client,
+) {
     let interval = Duration::from_secs(config.discovery_interval_secs);
     let grace_duration = Duration::from_secs(config.grace_period_secs());
 

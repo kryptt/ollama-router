@@ -37,6 +37,17 @@ pub struct Metrics {
     /// `/api/chat` from a client → `/v1/chat/completions` to a backend
     /// that only speaks OpenAI). Label-free on purpose — cardinality.
     pub protocol_translations: Counter,
+    /// Alias-chain failovers: while serving alias `alias`, the walk moved
+    /// past candidate backend `to` because of `reason`. `from` is the hop
+    /// the walk arrived from — the alias name itself before the first
+    /// candidate, else the previously tried candidate's backend name.
+    /// `reason` is one of: unreachable | connect | timeout | transport |
+    /// rate_limited | model_missing | upstream_5xx. Cardinality is bounded
+    /// by the operator's alias file (aliases × chain length × 7 reasons).
+    pub chain_advance: Family<ChainAdvanceLabels, Counter>,
+    /// Alias chains that ran out of candidates without committing a
+    /// response — every candidate was unreachable or failed.
+    pub chain_exhausted: Family<ChainLabels, Counter>,
 
     // --- Self-health (set at startup / refreshed at scrape time) ---
     /// Process start time as a Unix timestamp (seconds). A sawtooth that
@@ -133,6 +144,20 @@ impl Metrics {
             protocol_translations.clone(),
         );
 
+        let chain_advance = Family::default();
+        registry.register(
+            "ollama_router_chain_advance",
+            "Alias-chain candidate failovers (per alias/from/to/reason)",
+            chain_advance.clone(),
+        );
+
+        let chain_exhausted = Family::default();
+        registry.register(
+            "ollama_router_chain_exhausted",
+            "Alias chains exhausted without any candidate serving the request",
+            chain_exhausted.clone(),
+        );
+
         let start_time_seconds = Gauge::default();
         registry.register(
             "ollama_router_start_time_seconds",
@@ -191,6 +216,8 @@ impl Metrics {
             escalations_skipped,
             fallbacks,
             protocol_translations,
+            chain_advance,
+            chain_exhausted,
             start_time_seconds,
             ready,
             backends_reachable,
@@ -242,6 +269,19 @@ pub struct EscalationLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct EscalationSkipLabels {
     pub reason: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ChainAdvanceLabels {
+    pub alias: String,
+    pub from: String,
+    pub to: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ChainLabels {
+    pub alias: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]

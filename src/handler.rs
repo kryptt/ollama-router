@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::{OriginalUri, Path, State};
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use serde_json::json;
@@ -68,6 +68,59 @@ pub async fn model_route(
             return proxy::bad_gateway("failed to read request body");
         }
     };
+
+    // Alias chains are their own namespace, resolved before escalation and
+    // fallback: an alias request never escalates and never takes the
+    // single-hop fallback — the chain itself is the failover mechanism.
+    // Candidates are snapshotted out of the registry here so no lock is
+    // held across any upstream I/O during the walk.
+    let alias_chain: Option<Vec<ChainCandidate>> = {
+        let reg = state.registry.read().await;
+        reg.alias_for(&spilled.model).map(|alias| {
+            alias
+                .candidates
+                .iter()
+                .map(|c| match reg.backend_id_by_name(&c.backend) {
+                    Some(id) => {
+                        let view = reg.backend(id);
+                        ChainCandidate {
+                            model: c.model.clone(),
+                            reachable: view.healthy || view.in_grace_period,
+                            target: AttemptTarget {
+                                url: view.url.to_string(),
+                                name: view.name.to_string(),
+                                protocol: view.protocol,
+                                strip_auth: view.strip_auth,
+                            },
+                        }
+                    }
+                    // Parse-time validation pins candidate backends to the
+                    // configured set, so this arm is defensive only: treat
+                    // an unknown backend as unreachable rather than panic.
+                    None => ChainCandidate {
+                        model: c.model.clone(),
+                        reachable: false,
+                        target: AttemptTarget {
+                            url: String::new(),
+                            name: c.backend.clone(),
+                            protocol: BackendProtocol::Ollama,
+                            strip_auth: false,
+                        },
+                    },
+                })
+                .collect()
+        })
+    };
+    if let Some(candidates) = alias_chain {
+        let ctx = AttemptContext {
+            state: &state,
+            method: &method,
+            uri: &uri,
+            headers: &headers,
+            stream: spilled.stream,
+        };
+        return route_alias_chain(&ctx, spilled.model, spilled.body, candidates).await;
+    }
 
     // Escalate to a higher-context sibling when input is too big for the
     // requested model's per-slot budget.
@@ -160,7 +213,11 @@ pub async fn model_route(
         Some(id) => id,
         None => {
             state.metrics.unknown_model_requests.inc();
-            let available = reg.available_model_names();
+            // Aliases are requestable names too, so the "known models" hint
+            // must include them alongside the concrete catalogue.
+            let mut available = reg.available_model_names();
+            available.extend(reg.alias_names());
+            let available = available;
             // Emit the requested model name as a structured field so
             // operators can grep Loki for which clients are sending
             // bogus model names. The metric itself stays label-free
@@ -206,6 +263,122 @@ pub async fn model_route(
         }
     }
 
+    let start = Instant::now();
+
+    let ctx = AttemptContext {
+        state: &state,
+        method: &method,
+        uri: &uri,
+        headers: &headers,
+        stream: spilled.stream,
+    };
+    let target = AttemptTarget {
+        url: backend_url,
+        name: backend_name,
+        protocol: backend_protocol,
+        strip_auth: backend_strip_auth,
+    };
+
+    let outcome = match execute_attempt(&ctx, &spilled.model, spilled.body, &target).await {
+        Ok(o) => o,
+        Err(resp) => return resp,
+    };
+    let response = match outcome {
+        AttemptOutcome::Committed(r) => r,
+        AttemptOutcome::Upstream {
+            response,
+            needs_translation,
+        } => {
+            finish_upstream_response(
+                response,
+                needs_translation,
+                spilled.stream,
+                spilled.model.clone(),
+            )
+            .await
+        }
+        AttemptOutcome::Failed(e) => e.into_response(),
+    };
+
+    let duration = start.elapsed().as_secs_f64();
+    let status_code = response.status().as_u16();
+    span.record("http.response.status_code", status_code);
+
+    // The `stream` label means "this request will actually stream the
+    // response back" — i.e. spilled.stream AND the path's protocol
+    // supports streaming. For /api/embed and /api/show this is always
+    // false even when the body's stream flag (defaulted) reads true,
+    // because those endpoints return a single JSON regardless.
+    let actually_streams = spilled.stream && StreamProtocol::from_path(uri.path()).is_some();
+
+    record_request_metrics(
+        &state.metrics,
+        spilled.model,
+        target.name,
+        status_code,
+        method.as_str(),
+        actually_streams,
+        duration,
+    );
+
+    response
+}
+
+// ---------------------------------------------------------------------------
+// Shared forwarding attempt (legacy single-backend path + alias chain)
+// ---------------------------------------------------------------------------
+
+/// Inputs shared by every forwarding attempt of one client request.
+struct AttemptContext<'a> {
+    state: &'a AppState,
+    method: &'a Method,
+    uri: &'a Uri,
+    headers: &'a HeaderMap,
+    /// Effective `stream` flag from the spilled body.
+    stream: bool,
+}
+
+/// The single chosen backend for one forwarding attempt, snapshotted out of
+/// the registry so no lock is held across upstream I/O.
+struct AttemptTarget {
+    url: String,
+    name: String,
+    protocol: BackendProtocol,
+    strip_auth: bool,
+}
+
+/// Outcome of one forwarding attempt against one backend.
+enum AttemptOutcome {
+    /// The heartbeat path engaged: a `200 OK` was committed to the client
+    /// before upstream replied, so there is no failover left to do — the
+    /// response is final (and already translated when translation applies).
+    Committed(Response),
+    /// Upstream produced a response head. Not yet translated and its body
+    /// not yet forwarded: the caller inspects the status to decide whether
+    /// this commits (then `finish_upstream_response`) or — on the alias
+    /// chain path — signals an advance to the next candidate.
+    Upstream {
+        response: Response,
+        needs_translation: bool,
+    },
+    /// No response could be obtained at all (connect / timeout / transport).
+    Failed(proxy::ProxyError),
+}
+
+/// Run one fully-decided forwarding attempt: request-side protocol
+/// translation, the heartbeat-or-plain-proxy decision, and the upstream
+/// send. Extracted so the legacy single-backend path and the alias-chain
+/// walk share one implementation and cannot drift.
+///
+/// `Err(response)` is a request-side failure (unreadable or non-JSON body)
+/// that goes straight back to the client — trying another backend cannot
+/// fix the client's own body.
+async fn execute_attempt(
+    ctx: &AttemptContext<'_>,
+    model: &str,
+    body: Body,
+    target: &AttemptTarget,
+) -> Result<AttemptOutcome, Response> {
     // Protocol translation: client speaks Ollama-native /api/chat but the
     // chosen backend only speaks OpenAI /v1/*. We rewrite the upstream URL
     // and the request body in-flight, then reshape the response back to
@@ -220,41 +393,34 @@ pub async fn model_route(
     //     ollama-compat shim that answers /api/tags but its /api/chat
     //     hangs forever — discovery thinks it's Ollama-protocol but it
     //     can't actually handle the chat path.
-    let backend_kind = models::classify(&backend_name);
-    let needs_translation = uri.path() == "/api/chat"
-        && (backend_protocol == BackendProtocol::OpenAi
+    let backend_kind = models::classify(&target.name);
+    let needs_translation = ctx.uri.path() == "/api/chat"
+        && (target.protocol == BackendProtocol::OpenAi
             || matches!(
                 backend_kind,
                 models::BackendKind::LlamaSwap | models::BackendKind::AlwaysResident
             ));
 
+    let mut body = body;
     if needs_translation {
         tracing::info!(
-            backend = %backend_name,
-            requested_model = %spilled.model,
+            backend = %target.name,
+            requested_model = %model,
             "translating /api/chat → /v1/chat/completions"
         );
-        state.metrics.protocol_translations.inc();
+        ctx.state.metrics.protocol_translations.inc();
 
         // Buffer the request body then translate Ollama → OpenAI.
-        let body_bytes = collect_body_to_bytes(spilled.body).await.map_err(|e| {
+        let body_bytes = collect_body_to_bytes(body).await.map_err(|e| {
             tracing::warn!(error = %e, "failed to buffer request body for translation");
-        });
-        let body_bytes = match body_bytes {
-            Ok(b) => b,
-            Err(()) => return proxy::bad_gateway("failed to buffer request body for translation"),
-        };
+            proxy::bad_gateway("failed to buffer request body for translation")
+        })?;
         let translated = translate::ollama_chat_to_openai_request(&body_bytes).map_err(|e| {
             tracing::warn!(error = %e, "failed to translate /api/chat body");
-        });
-        let translated = match translated {
-            Ok(b) => b,
-            Err(()) => return proxy::bad_request("body is not valid JSON"),
-        };
-        spilled.body = Body::from(translated);
+            proxy::bad_request("body is not valid JSON")
+        })?;
+        body = Body::from(translated);
     }
-
-    let start = Instant::now();
 
     // Decide between hot-path proxy and heartbeat-wrapped proxy.
     //
@@ -265,10 +431,10 @@ pub async fn model_route(
     // Compute the path's streaming protocol once; the heartbeat decision and
     // the heartbeat branch both consume this single value, so the protocol is
     // never re-derived (and never needs an "infallible" unwrap downstream).
-    let protocol = StreamProtocol::from_path(uri.path());
-    let use_heartbeat = spilled.stream
+    let protocol = StreamProtocol::from_path(ctx.uri.path());
+    let use_heartbeat = ctx.stream
         && protocol.is_some()
-        && !preflight_model_loaded(&state, &backend_url, &backend_name, &spilled.model).await;
+        && !preflight_model_loaded(ctx.state, &target.url, &target.name, model).await;
 
     let upstream_path: Option<&str> = if needs_translation {
         Some("/v1/chat/completions")
@@ -277,73 +443,269 @@ pub async fn model_route(
     };
 
     let proxy_req = proxy::ProxyRequest {
-        client: &state.client,
-        backend_url: &backend_url,
-        path: uri.path(),
+        client: &ctx.state.client,
+        backend_url: &target.url,
+        path: ctx.uri.path(),
         override_path: upstream_path,
-        query: uri.query(),
-        method: method.clone(),
-        headers: &headers,
-        body: spilled.body,
-        strip_auth: backend_strip_auth,
+        query: ctx.uri.query(),
+        method: ctx.method.clone(),
+        headers: ctx.headers,
+        body,
+        strip_auth: target.strip_auth,
     };
 
-    let response = if let (true, Some(protocol)) = (use_heartbeat, protocol) {
-        state.metrics.heartbeat_engaged.inc();
+    if let (true, Some(protocol)) = (use_heartbeat, protocol) {
+        ctx.state.metrics.heartbeat_engaged.inc();
         tracing::info!(
-            model = %spilled.model,
-            backend = %backend_name,
-            path = uri.path(),
+            model = %model,
+            backend = %target.name,
+            path = ctx.uri.path(),
             "heartbeat path engaged (model not hot)"
         );
         let translator: Option<heartbeat::BodyTranslator> = if needs_translation {
-            let model = spilled.model.clone();
+            let model = model.to_string();
             Some(Box::new(move |s| {
                 translate::translate_streaming_response(s, model)
             }))
         } else {
             None
         };
-        heartbeat::execute(heartbeat::HeartbeatRequest {
-            proxy: proxy_req,
-            protocol,
-            model: spilled.model.clone(),
-            config: state.heartbeat,
-            translate: translator,
-        })
-        .await
+        Ok(AttemptOutcome::Committed(
+            heartbeat::execute(heartbeat::HeartbeatRequest {
+                proxy: proxy_req,
+                protocol,
+                model: model.to_string(),
+                config: ctx.state.heartbeat,
+                translate: translator,
+            })
+            .await,
+        ))
     } else {
-        let raw = proxy_with_metrics(proxy_req, &state.metrics).await;
+        match proxy::execute(proxy_req).await {
+            Ok(response) => Ok(AttemptOutcome::Upstream {
+                response,
+                needs_translation,
+            }),
+            Err(e) => {
+                record_upstream_error(&ctx.state.metrics, &e);
+                Ok(AttemptOutcome::Failed(e))
+            }
+        }
+    }
+}
 
-        if needs_translation {
-            translate_proxy_response(raw, spilled.stream, spilled.model.clone()).await
-        } else {
-            raw
+/// Apply response-side protocol translation when the attempt needed it;
+/// pass the upstream response through untouched otherwise.
+async fn finish_upstream_response(
+    response: Response,
+    needs_translation: bool,
+    stream: bool,
+    model: String,
+) -> Response {
+    if needs_translation {
+        translate_proxy_response(response, stream, model).await
+    } else {
+        response
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Alias chain walk
+// ---------------------------------------------------------------------------
+
+/// One alias-chain candidate with its backend state snapshotted out of the
+/// registry, so the walk holds no lock.
+struct ChainCandidate {
+    model: String,
+    /// healthy || in grace period, at snapshot time. Unreachable candidates
+    /// are skipped without an upstream attempt.
+    reachable: bool,
+    target: AttemptTarget,
+}
+
+/// Walk an alias's candidate chain in priority order and commit to the
+/// first candidate that answers.
+///
+/// Failure classification per candidate: transport-level errors (connect /
+/// timeout / transport) and retryable statuses (429 / 404 / 5xx) advance to
+/// the next candidate — the status decision is made on the response head
+/// only, before any body byte is forwarded, so advancing is streaming-safe.
+/// Any other status (2xx, other 4xx) commits and is returned exactly as the
+/// single-backend path would return it. A heartbeat engagement also commits:
+/// a positive preflight proved the backend alive and loading, and the
+/// heartbeat path has already sent `200 OK` — there is no failover left.
+///
+/// NOTE: there are deliberately no per-candidate retries or backoff here.
+/// The chain advance IS the retry; the (still-inert) Unit-3 retry knobs
+/// (`OLLAMA_ROUTER_MAX_RETRIES`, backoff, jitter, latency budget) stay
+/// inert on this path too.
+async fn route_alias_chain(
+    ctx: &AttemptContext<'_>,
+    alias: String,
+    body: Body,
+    candidates: Vec<ChainCandidate>,
+) -> Response {
+    let span = tracing::Span::current();
+    span.record("model", alias.as_str());
+
+    let start = Instant::now();
+
+    // Buffer the whole body once; each candidate gets a fresh copy with its
+    // own model name patched in (same pattern as the escalation/fallback
+    // model-field rewrite on the single-backend path).
+    let body_bytes = match collect_body_to_bytes(body).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, alias = %alias, "failed to buffer request body for alias chain");
+            return proxy::bad_gateway("failed to buffer request body for alias chain");
         }
     };
 
-    let duration = start.elapsed().as_secs_f64();
+    let mut last_failure: Option<Response> = None;
+    // `from` label for chain_advance: the hop the walk arrived from — the
+    // alias name itself before the first candidate, then the backend name
+    // of the last candidate tried. `to` is the failing candidate's backend.
+    let mut from_hop = alias.clone();
+    for cand in candidates {
+        if !cand.reachable {
+            record_chain_advance(
+                &ctx.state.metrics,
+                &alias,
+                &from_hop,
+                &cand.target.name,
+                "unreachable",
+            );
+            from_hop = cand.target.name;
+            continue;
+        }
+
+        let rewritten = match translate::rewrite_model_field(&body_bytes, &cand.model) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, alias = %alias, "failed to rewrite model field for alias candidate");
+                return proxy::bad_request("body is not valid JSON");
+            }
+        };
+
+        let outcome =
+            match execute_attempt(ctx, &cand.model, Body::from(rewritten), &cand.target).await {
+                Ok(o) => o,
+                // Request-side failure — no other candidate can fix the
+                // client's own body.
+                Err(resp) => return resp,
+            };
+        match outcome {
+            AttemptOutcome::Committed(response) => {
+                record_chain_commit(ctx, &response, cand.model, cand.target.name, start);
+                return response;
+            }
+            AttemptOutcome::Upstream {
+                response,
+                needs_translation,
+            } => {
+                let status = response.status();
+                let reason = match status {
+                    StatusCode::TOO_MANY_REQUESTS => Some("rate_limited"),
+                    StatusCode::NOT_FOUND => Some("model_missing"),
+                    s if s.is_server_error() => Some("upstream_5xx"),
+                    _ => None,
+                };
+                match reason {
+                    Some(reason) => {
+                        record_chain_advance(
+                            &ctx.state.metrics,
+                            &alias,
+                            &from_hop,
+                            &cand.target.name,
+                            reason,
+                        );
+                        // Keep the failure so an exhausted chain can relay
+                        // the most recent honest upstream signal.
+                        last_failure = Some(response);
+                        from_hop = cand.target.name;
+                        continue;
+                    }
+                    None => {
+                        let response = finish_upstream_response(
+                            response,
+                            needs_translation,
+                            ctx.stream,
+                            cand.model.clone(),
+                        )
+                        .await;
+                        record_chain_commit(ctx, &response, cand.model, cand.target.name, start);
+                        return response;
+                    }
+                }
+            }
+            AttemptOutcome::Failed(e) => {
+                record_chain_advance(
+                    &ctx.state.metrics,
+                    &alias,
+                    &from_hop,
+                    &cand.target.name,
+                    e.kind_str(),
+                );
+                from_hop = cand.target.name;
+                continue;
+            }
+        }
+    }
+
+    ctx.state
+        .metrics
+        .chain_exhausted
+        .get_or_create(&metrics::ChainLabels {
+            alias: alias.clone(),
+        })
+        .inc();
+    tracing::warn!(alias = %alias, "alias chain exhausted; no candidate served the request");
+    match last_failure {
+        // Relay the last upstream failure verbatim — the most honest signal
+        // available (e.g. a 429 the client can back off from).
+        Some(resp) => resp,
+        None => proxy::bad_gateway("alias chain exhausted: no reachable candidate"),
+    }
+}
+
+/// Increment `chain_advance` and emit the matching structured log line.
+fn record_chain_advance(metrics: &Metrics, alias: &str, from: &str, to: &str, reason: &str) {
+    metrics
+        .chain_advance
+        .get_or_create(&metrics::ChainAdvanceLabels {
+            alias: alias.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+            reason: reason.to_string(),
+        })
+        .inc();
+    tracing::info!(alias, from, to, reason, "alias chain advancing");
+}
+
+/// Record span fields and request metrics for the committed chain candidate,
+/// under its concrete model + backend labels. Committed-via-heartbeat goes
+/// through here too.
+fn record_chain_commit(
+    ctx: &AttemptContext<'_>,
+    response: &Response,
+    model: String,
+    backend: String,
+    start: Instant,
+) {
     let status_code = response.status().as_u16();
+    let span = tracing::Span::current();
+    span.record("backend", backend.as_str());
     span.record("http.response.status_code", status_code);
-
-    // The `stream` label means "this request will actually stream the
-    // response back" — i.e. spilled.stream AND the path's protocol
-    // supports streaming. For /api/embed and /api/show this is always
-    // false even when the body's stream flag (defaulted) reads true,
-    // because those endpoints return a single JSON regardless.
-    let actually_streams = spilled.stream && protocol.is_some();
-
+    let actually_streams = ctx.stream && StreamProtocol::from_path(ctx.uri.path()).is_some();
     record_request_metrics(
-        &state.metrics,
-        spilled.model,
-        backend_name,
+        &ctx.state.metrics,
+        model,
+        backend,
         status_code,
-        method.as_str(),
+        ctx.method.as_str(),
         actually_streams,
-        duration,
+        start.elapsed().as_secs_f64(),
     );
-
-    response
 }
 
 /// Return `true` if `/api/ps` on `backend_url` confirms the model is loaded,
@@ -600,15 +962,20 @@ async fn proxy_with_metrics(req: proxy::ProxyRequest<'_>, metrics: &Metrics) -> 
     match proxy::execute(req).await {
         Ok(r) => r,
         Err(e) => {
-            metrics
-                .upstream_errors
-                .get_or_create(&metrics::UpstreamErrorLabels {
-                    kind: e.kind_str().to_string(),
-                })
-                .inc();
+            record_upstream_error(metrics, &e);
             e.into_response()
         }
     }
+}
+
+/// Increment the transport-failure counter for one `ProxyError`.
+fn record_upstream_error(metrics: &Metrics, e: &proxy::ProxyError) {
+    metrics
+        .upstream_errors
+        .get_or_create(&metrics::UpstreamErrorLabels {
+            kind: e.kind_str().to_string(),
+        })
+        .inc();
 }
 
 /// Increment the `escalations_skipped` counter with a caller-supplied reason label.

@@ -21,13 +21,51 @@ const PS_FANOUT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Build a merged `/api/tags` response from the registry's discovery cache.
 /// Deduplicates by model name, preferring the first backend encountered.
+/// Configured aliases are appended as synthesised entries so clients can
+/// discover and request them like any concrete model.
 pub fn api_tags_response(reg: &Registry) -> Response {
-    models_response(reg.reachable_models())
+    let mut models: Vec<Value> = reg
+        .reachable_models()
+        .into_iter()
+        .filter_map(|m| serde_json::to_value(m).ok())
+        .collect();
+    models.extend(sorted_alias_names(reg).into_iter().map(alias_tag_entry));
+    models_response(models)
+}
+
+/// Alias names in sorted order, so the synthesised listing entries are
+/// deterministic across requests (HashMap iteration order is not).
+fn sorted_alias_names(reg: &Registry) -> Vec<&str> {
+    let mut names: Vec<&str> = reg.alias_names().collect();
+    names.sort_unstable();
+    names
+}
+
+/// Synthesise a `/api/tags` entry for an alias. Same shape as the sanitised
+/// concrete entries (see `sanitize_model_entry`), so pydantic-strict clients
+/// (HA's ollama integration) parse the merged list cleanly.
+fn alias_tag_entry(name: &str) -> Value {
+    json!({
+        "name": name,
+        "model": name,
+        "modified_at": crate::translate::FIXED_TIMESTAMP,
+        "size": 0,
+    })
 }
 
 /// Build a merged `/v1/models` response (OpenAI-compatible list).
+/// Configured aliases are appended with `owned_by: "router-alias"` so
+/// they're distinguishable from discovered concrete models.
 pub fn v1_models_response(reg: &Registry) -> Response {
-    let models = v1_model_objects(reg);
+    let mut models = v1_model_objects(reg);
+    models.extend(sorted_alias_names(reg).into_iter().map(|name| {
+        json!({
+            "id": name,
+            "object": "model",
+            "created": 0,
+            "owned_by": "router-alias",
+        })
+    }));
     json_ok(json!({ "object": "list", "data": models }))
 }
 

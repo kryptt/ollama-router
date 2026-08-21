@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -5,22 +7,33 @@ use axum::body::Bytes;
 use axum::http::StatusCode;
 use axum::routing::{any, get, post};
 use reqwest::Client;
+use serde_json::json;
 use tokio::net::TcpListener;
 
 use ollama_router::auth::TokenStore;
 use ollama_router::config::{Backend, Config};
+use ollama_router::handler::{self, AppState};
+use ollama_router::heartbeat::HeartbeatConfig;
+use ollama_router::metrics::Metrics;
 use ollama_router::registry::{self, Registry, SharedRegistry};
 use ollama_router::routes::{ROUTED_PATHS, default_stream_for_path};
 
 // ─── Test helpers ────────────────────────────────────────────────────────────
 
 async fn spawn_test_server(app: Router) -> String {
+    spawn_test_server_abortable(app).await.0
+}
+
+/// Like `spawn_test_server`, but also returns the serve task's handle so a
+/// test can abort it — dropping the listener and refusing later connects,
+/// which simulates a backend dying between discovery cycles.
+async fn spawn_test_server_abortable(app: Router) -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), handle)
 }
 
 fn spawn_discovery(reg: &SharedRegistry, config: &Config) {
@@ -49,6 +62,72 @@ fn single_backend_config(name: &str, url: &str) -> (Config, SharedRegistry) {
     let config = Config::from_backends(vec![Backend::for_test(name, url)]);
     let reg = registry::new_shared(&config);
     (config, reg)
+}
+
+/// A controllable mock backend: configurable /api/chat status, a hit
+/// counter on /api/chat, and an abort handle to kill it mid-test.
+struct MockBackend {
+    url: String,
+    handle: tokio::task::JoinHandle<()>,
+    chat_hits: Arc<AtomicUsize>,
+}
+
+impl MockBackend {
+    fn chat_hits(&self) -> usize {
+        self.chat_hits.load(Ordering::SeqCst)
+    }
+}
+
+/// Build the mock-backend router shared by `start_mock_backend` and
+/// `start_counting_backend`: advertises `models` on /api/tags, answers
+/// /api/chat with `chat_status` (counting hits), catch-all for the rest.
+fn mock_backend_router(
+    models: Vec<&str>,
+    chat_status: StatusCode,
+    chat_hits: Arc<AtomicUsize>,
+) -> Router {
+    let tags_json = serde_json::json!({
+        "models": models.iter().map(|m| serde_json::json!({"name": m})).collect::<Vec<_>>()
+    })
+    .to_string();
+
+    let tags_handler = get({
+        let tags = tags_json.clone();
+        move || {
+            let tags = tags.clone();
+            async move { (StatusCode::OK, tags) }
+        }
+    });
+    let chat_handler = post(move |payload: Bytes| async move {
+        chat_hits.fetch_add(1, Ordering::SeqCst);
+        (chat_status, format!("echoed: {}", payload.len()))
+    });
+    let version_handler = get(|| async { (StatusCode::OK, r#"{"version":"0.9.0"}"#) });
+    let catch_all = any(|uri: axum::extract::OriginalUri, body: Bytes| async move {
+        (
+            StatusCode::OK,
+            format!("fallback: {} {}", uri.0.path(), body.len()),
+        )
+    });
+
+    Router::new()
+        .route("/api/tags", tags_handler)
+        .route("/api/chat", chat_handler)
+        .route("/api/version", version_handler)
+        .fallback(catch_all)
+}
+
+/// Start a mock backend whose /api/chat answers with `chat_status`.
+async fn start_counting_backend(models: Vec<&str>, chat_status: StatusCode) -> MockBackend {
+    let chat_hits = Arc::new(AtomicUsize::new(0));
+    let (url, handle) =
+        spawn_test_server_abortable(mock_backend_router(models, chat_status, chat_hits.clone()))
+            .await;
+    MockBackend {
+        url,
+        handle,
+        chat_hits,
+    }
 }
 
 /// Build a mock Ollama backend that advertises `models` on /api/tags,
@@ -282,4 +361,336 @@ fn routes_default_stream_matches_path_protocol() {
             entry.path,
         );
     }
+}
+
+// ─── Alias / priority-chain tests ───────────────────────────────────────────
+
+/// Build an `AppState` around `reg` with a short preflight timeout, and
+/// return it. Tests keep the state to inspect `state.metrics` afterwards.
+fn app_state(reg: &SharedRegistry) -> AppState {
+    AppState {
+        registry: reg.clone(),
+        metrics: Arc::new(Metrics::new()),
+        client: Arc::new(Client::new()),
+        token_store: Arc::new(TokenStore::new(None)),
+        heartbeat: HeartbeatConfig::from_secs(15, 2, 30),
+        escalation_rules: Arc::new(Vec::new()),
+    }
+}
+
+/// Serve the production model-routing surface (every ROUTED_PATHS entry →
+/// `model_route`, plus the listing GETs) behind a real TCP port.
+async fn spawn_router(state: AppState) -> String {
+    let mut router = Router::new();
+    for entry in ROUTED_PATHS {
+        router = router.route(entry.path, post(handler::model_route));
+    }
+    let router = router
+        .route("/api/tags", get(handler::tags_route))
+        .route("/v1/models", get(handler::v1_models_route))
+        .with_state(state);
+    spawn_test_server(router).await
+}
+
+/// Write `content` to a temp aliases file; the TempDir keeps it alive.
+fn write_aliases_file(content: &str) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aliases");
+    std::fs::write(&path, content).unwrap();
+    let path = path.to_str().unwrap().to_string();
+    (dir, path)
+}
+
+/// POST an /api/chat request for `model` (non-streaming unless told
+/// otherwise) and return the response.
+async fn post_chat(client: &Client, base: &str, model: &str, stream: bool) -> reqwest::Response {
+    client
+        .post(format!("{base}/api/chat"))
+        .json(&json!({"model": model, "stream": stream, "messages": []}))
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn alias_chain_advances_past_rate_limited_candidate() {
+    let b1 = start_counting_backend(vec!["m:latest"], StatusCode::TOO_MANY_REQUESTS).await;
+    let b2 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+    let b3 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+
+    let mut config = Config::from_backends(vec![
+        Backend::for_test("p1", &b1.url),
+        Backend::for_test("p2", &b2.url),
+        Backend::for_test("p3", &b3.url),
+    ]);
+    let (_dir, path) = write_aliases_file("ali = p1/m:latest | p2/m:latest | p3/m:latest\n");
+    config.aliases_file = Some(path);
+
+    let reg = registry::new_shared(&config);
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+
+    let client = Client::new();
+    let resp = post_chat(&client, &base, "ali", false).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    assert!(body.starts_with("echoed:"), "{body}");
+
+    // First candidate was tried and rate-limited; second served; third idle.
+    assert_eq!(b1.chat_hits(), 1);
+    assert_eq!(b2.chat_hits(), 1);
+    assert_eq!(b3.chat_hits(), 0);
+
+    let text = state.metrics.encode().unwrap();
+    assert!(
+        text.contains(r#"alias="ali""#) && text.contains(r#"reason="rate_limited""#),
+        "expected a rate_limited chain_advance sample:\n{text}"
+    );
+    // `from` for the first candidate is the alias itself; `to` the backend.
+    assert!(
+        text.contains(r#"from="ali""#) && text.contains(r#"to="p1""#),
+        "{text}"
+    );
+    // The committed request is recorded under concrete model+backend labels.
+    assert!(
+        text.contains(r#"backend="p2""#) && text.contains(r#"model="m:latest""#),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn alias_chain_advances_on_connect_error_without_discovery_wait() {
+    let b1 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+    let b2 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+
+    let mut config = Config::from_backends(vec![
+        Backend::for_test("p1", &b1.url),
+        Backend::for_test("p2", &b2.url),
+    ]);
+    let (_dir, path) = write_aliases_file("ali = p1/m:latest | p2/m:latest\n");
+    config.aliases_file = Some(path);
+
+    let reg = registry::new_shared(&config);
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+
+    // Kill p1 AFTER discovery marked it healthy: the registry still says
+    // reachable, so the chain must discover the death via the connect error
+    // — not wait a discovery cycle.
+    b1.handle.abort();
+    // Give the runtime a moment to actually drop the listener.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = Client::new();
+    let resp = post_chat(&client, &base, "ali", false).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    assert_eq!(b2.chat_hits(), 1);
+    let text = state.metrics.encode().unwrap();
+    assert!(
+        text.contains(r#"reason="connect""#),
+        "expected a connect chain_advance sample:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn alias_chain_exhausted_relays_last_failure() {
+    let b1 = start_counting_backend(vec!["m:latest"], StatusCode::INTERNAL_SERVER_ERROR).await;
+    let b2 = start_counting_backend(vec!["m:latest"], StatusCode::INTERNAL_SERVER_ERROR).await;
+
+    let mut config = Config::from_backends(vec![
+        Backend::for_test("p1", &b1.url),
+        Backend::for_test("p2", &b2.url),
+    ]);
+    let (_dir, path) = write_aliases_file("ali = p1/m:latest | p2/m:latest\n");
+    config.aliases_file = Some(path);
+
+    let reg = registry::new_shared(&config);
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+
+    let client = Client::new();
+    let resp = post_chat(&client, &base, "ali", false).await;
+    // The last upstream failure is relayed verbatim.
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(b1.chat_hits(), 1);
+    assert_eq!(b2.chat_hits(), 1);
+
+    let text = state.metrics.encode().unwrap();
+    assert!(
+        text.contains("ollama_router_chain_exhausted_total") && text.contains(r#"alias="ali""#),
+        "expected a chain_exhausted sample:\n{text}"
+    );
+    assert!(text.contains(r#"reason="upstream_5xx""#), "{text}");
+}
+
+#[tokio::test]
+async fn alias_streaming_request_commits_on_first_healthy_candidate() {
+    let b1 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+    let b2 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+
+    let mut config = Config::from_backends(vec![
+        Backend::for_test("p1", &b1.url),
+        Backend::for_test("p2", &b2.url),
+    ]);
+    let (_dir, path) = write_aliases_file("ali = p1/m:latest | p2/m:latest\n");
+    config.aliases_file = Some(path);
+
+    let reg = registry::new_shared(&config);
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+
+    let client = Client::new();
+    let resp = post_chat(&client, &base, "ali", true).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.unwrap();
+    assert!(body.starts_with("echoed:"), "{body}");
+
+    assert_eq!(b1.chat_hits(), 1);
+    assert_eq!(b2.chat_hits(), 0);
+    let text = state.metrics.encode().unwrap();
+    assert!(
+        !text.contains("ollama_router_chain_advance_total{"),
+        "streaming happy path must record zero advances:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn local_alias_never_reaches_external_backend() {
+    // The external backend is healthy and even serves the same model; the
+    // local candidate is hard-down. A `local` alias must exhaust rather
+    // than let a single request escape to the external backend.
+    let ext = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+
+    let mut config = Config::from_backends(vec![
+        Backend::for_test("loc", "http://127.0.0.1:1"),
+        Backend::for_test("ext", &ext.url),
+    ]);
+    config.external_backends = std::collections::HashSet::from(["ext".to_string()]);
+    let (_dir, path) = write_aliases_file("local secret = loc/m:latest\n");
+    config.aliases_file = Some(path);
+
+    let reg = registry::new_shared(&config);
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+
+    let client = Client::new();
+    let resp = post_chat(&client, &base, "secret", false).await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+    // The external backend saw ZERO chat requests.
+    assert_eq!(ext.chat_hits(), 0);
+    let text = state.metrics.encode().unwrap();
+    assert!(text.contains(r#"alias="secret""#), "{text}");
+    assert!(
+        text.contains("ollama_router_chain_exhausted_total"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn aliases_listed_in_v1_models_and_api_tags() {
+    let b1 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+
+    let mut config = Config::from_backends(vec![Backend::for_test("p1", &b1.url)]);
+    let (_dir, path) = write_aliases_file("ali = p1/m:latest\n");
+    config.aliases_file = Some(path);
+
+    let reg = registry::new_shared(&config);
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+
+    let client = Client::new();
+
+    let v1: serde_json::Value = client
+        .get(format!("{base}/v1/models"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let data = v1["data"].as_array().unwrap();
+    let alias_entry = data
+        .iter()
+        .find(|m| m["id"] == "ali")
+        .expect("alias listed in /v1/models");
+    assert_eq!(alias_entry["owned_by"], "router-alias");
+    // Concrete models keep listing (":latest" stripped for exact-id match).
+    assert!(data.iter().any(|m| m["id"] == "m"), "{data:?}");
+
+    let tags: serde_json::Value = client
+        .get(format!("{base}/api/tags"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let models = tags["models"].as_array().unwrap();
+    let alias_tag = models
+        .iter()
+        .find(|m| m["name"] == "ali")
+        .expect("alias listed in /api/tags");
+    // Shape-compatible with sanitised concrete entries (pydantic clients).
+    assert_eq!(alias_tag["model"], "ali");
+    assert!(alias_tag["modified_at"].is_string());
+    assert!(alias_tag["size"].is_u64());
+    assert!(models.iter().any(|m| m["name"] == "m:latest"), "{models:?}");
+
+    // The unknown-model 404 hint includes the alias.
+    let resp = post_chat(&client, &base, "nope", false).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let available = body["available_models"].as_array().unwrap();
+    assert!(available.iter().any(|m| m == "ali"), "{available:?}");
+}
+
+#[tokio::test]
+async fn concrete_models_and_fallbacks_route_unchanged_alongside_aliases() {
+    let b1 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+
+    let mut config = Config::from_backends(vec![Backend::for_test("p1", &b1.url)]);
+    let (_adir, apath) = write_aliases_file("ali = p1/m:latest\n");
+    config.aliases_file = Some(apath);
+    // Fallback map for a non-alias name: still works.
+    let fdir = tempfile::tempdir().unwrap();
+    let fpath = fdir.path().join("fallbacks");
+    std::fs::write(&fpath, "ghost=m:latest\n").unwrap();
+    config.fallback_file = Some(fpath.to_str().unwrap().to_string());
+
+    let reg = registry::new_shared(&config);
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+
+    let client = Client::new();
+
+    // Concrete model routes exactly as before.
+    let resp = post_chat(&client, &base, "m:latest", false).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.text().await.unwrap().starts_with("echoed:"));
+
+    // Single-hop fallback still applies to non-alias names.
+    let resp = post_chat(&client, &base, "ghost", false).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.text().await.unwrap().starts_with("echoed:"));
+
+    assert_eq!(b1.chat_hits(), 2);
+    let text = state.metrics.encode().unwrap();
+    // Neither request walked an alias chain.
+    assert!(
+        !text.contains("ollama_router_chain_advance_total{"),
+        "{text}"
+    );
+    assert!(
+        text.contains(r#"ollama_router_fallbacks_total{from="ghost",to="m:latest"}"#),
+        "{text}"
+    );
 }

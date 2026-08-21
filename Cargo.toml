@@ -1,6 +1,6 @@
 [package]
 name = "ollama-router"
-version = "0.14.1"
+version = "0.15.0"
 edition = "2024"
 
 [dependencies]
@@ -20,6 +20,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["io"] }
+toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1"
 tracing-opentelemetry = "0.28"

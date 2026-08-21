@@ -6,6 +6,7 @@ pub mod handler;
 pub mod heartbeat;
 pub mod metrics;
 pub mod models;
+pub mod policy;
 pub mod proxy;
 pub mod registry;
 pub mod response;

@@ -1,0 +1,165 @@
+# ollama-router policy — THE ONE FILE. Backends, spend boundary, failover
+# and alias chains, all live.
+#
+# Out-of-band on purpose: this lives on NFS at
+# /swarm/main/ai/ollama-router/router.toml (hostPath -> /etc/ollama-router),
+# NOT in git. The spend boundary sits outside the deploy mechanism so
+# tightening it never waits on a Fleet reconcile.
+#
+# Re-read every discovery cycle (60s) — edits land live, backend roster
+# included. A file that fails to parse or validate keeps the PREVIOUS
+# config entirely (never a partial apply, never fails open) and increments
+# ollama_router_config_reloads_total{result="rejected"}.
+# Write atomically: `cp router.toml router.toml.new && mv router.toml.new
+# router.toml` — a torn read is a rejected reload.
+#
+# Which keys are live and which need a restart: see README.md
+# "## Configuration".
+
+# ── backends: DOCUMENT ORDER IS ROUTING PRIORITY ───────────────────────────
+# The model map is first-writer-wins, so the backend declared first wins a
+# colliding model name. Local, unmetered backends therefore come first and
+# the metered/hosted ones last — reordering these tables moves the spend
+# boundary.
+
+# hr-main (CUDA): arctic-embed2, GLM-4.6V, gemma4 e2b/e4b.
+[[backends]]
+name = "llama-swap-cuda"
+url = "http://llama-swap-cuda.ai:8080"
+allow = ["*"]                            # on-LAN, unmetered: publish everything
+
+# rh-anine (Vulkan): qwen3.6, gpt-oss, gemma4:26b.
+[[backends]]
+name = "llama-swap"
+url = "http://llama-swap.ai:8080"
+allow = ["*"]                            # on-LAN, unmetered: publish everything
+
+# Nous Portal — hosted and metered, reached through postern, which injects
+# the API key so this pod holds no credential.
+[[backends]]
+name = "nous"
+url = "https://inference-api.nousresearch.com"
+external = true                          # => can never appear in a `local` alias
+# The inbound router token means nothing to Nous; forwarding it would leak
+# it to a third party and leave postern reconciling two auth headers.
+strip_auth = true
+# THE SPEND BOUNDARY. Everything not named here 404s. Exact-match ids (no
+# prefix/glob matching); a typo silently drops the model rather than
+# erroring. Prices per M tokens (in/out), verified against the live catalog
+# 2026-08-17.
+allow = [
+  "nousresearch/hermes-4-70b",           # 0.05 / 0.20
+  "nousresearch/hermes-4-405b",          # 0.09 / 0.37
+  "meta/muse-glimmer-30b",               # 0.28 / 1.20
+  "deepseek/deepseek-v4-pro-0813",       # 0.53 / 1.58 (time-of-day varying)
+  "z-ai/glm-5.2",                        # 0.25 / 0.77
+  "nvidia/nemotron-3-ultra-550b-a55b",   # 0.48 / 2.88
+  "moonshotai/kimi-k3",                  # 2.40 / 12.00 — deliberate outlier
+  "qwen/qwen3.8-27b",                    # 0.36 / 2.56
+  "qwen/qwen3.8-max",                    # 1.60 / 4.80
+  # Fallback stand-ins (see [fallbacks] below) — cheap hosted twins of the
+  # local models, published so the fallback hop can resolve them.
+  "openai/gpt-oss-120b",                 # 0.02 / 0.14
+  "google/gemma-4-26b-a4b-it",           # 0.06 / 0.27
+  "nvidia/nemotron-3-super-120b-a12b",   # 0.07 / 0.32
+  "z-ai/glm-4.6v",                       # 0.24 / 0.72 (vision)
+]
+
+# freellmapi aggregates free-tier hosted providers (its provider keys also
+# live behind postern). Declared LAST on purpose: an earlier slot would let
+# a colliding hosted model name silently steal traffic from the local
+# backends. `allow = ["*"]` makes its unfiltered publish explicit — it is
+# free-tier, so there is no spend to bound, only rate limits.
+[[backends]]
+name = "freellmapi"
+url = "http://freellmapi.ai:3001"
+external = true                          # => can never appear in a `local` alias
+allow = ["*"]
+
+# ── fallbacks: local-model -> hosted stand-in ──────────────────────────────
+# When no reachable backend serves the local model (rh-anine or hr-main down
+# past the ~3 min grace period), the router rewrites the request — routing
+# AND the body's model field — to the stand-in. One hop, applied only if the
+# stand-in is published above. Local serving resumes on recovery.
+# Embedding/ASR/TTS models (jina-code, qwen3-embedding-4b, whisper-*,
+# qwen3-asr, chatterbox) have no hosted twin on Nous — left out.
+#
+# QUOTE EVERY KEY: every model name contains a `.`, and a bare
+# `qwen3.6-low = "x"` is a TOML *dotted key* meaning `qwen3 = { "6-low" = ... }`.
+[fallbacks]
+# llama-swap (rh-anine, vulkan)
+"qwen3.6-low" = "qwen/qwen3.8-27b"
+"qwen3.6-medium" = "qwen/qwen3.8-27b"
+"qwen3.6-high" = "qwen/qwen3.8-max"
+"qwen3.6-ultra" = "qwen/qwen3.8-max"
+"gpt-oss:latest" = "openai/gpt-oss-120b"
+"gpt-oss" = "openai/gpt-oss-120b"
+"gemma4:26b" = "google/gemma-4-26b-a4b-it"
+"nemotron3-super" = "nvidia/nemotron-3-super-120b-a12b"
+"glm-5.2-rivoli" = "z-ai/glm-5.2"
+# llama-swap-cuda (hr-main)
+"gemma4:e2b" = "google/gemma-4-26b-a4b-it"
+"gemma4:e4b" = "google/gemma-4-26b-a4b-it"
+"gemma4" = "google/gemma-4-26b-a4b-it"
+"haervwe/GLM-4.6V-Flash-9B:latest" = "z-ai/glm-4.6v"
+"haervwe/GLM-4.6V-Flash-9B" = "z-ai/glm-4.6v"
+
+# ── alias chains: client-facing names walking a priority queue ─────────────
+# free (freellmapi) -> local GPU -> paid (nous). Each candidate is
+# `<backend>/<model>`, split on the FIRST `/` so model ids keep their own
+# slashes. Unreachable candidates are skipped (the freellmapi hops
+# self-activate once its provider keys land — until then chains start at the
+# local hop).
+
+# ---- privacy-pinned: this data never leaves the cluster ----
+# `local = true` is re-proved on EVERY reload against the roster above:
+# flipping a chained backend to `external = true` rejects the whole file.
+
+# financial: receipt-ledger (bank statements, receipts). Small models,
+#            cheapest first; batch workload, cold-loads are fine.
+[aliases.financial]
+local = true
+chain = [
+  "llama-swap-cuda/gemma4:e2b",
+  "llama-swap-cuda/gemma4:e4b",
+  "llama-swap/qwen3.6-low",
+]
+
+# memory: hindsight + hr-home-palace (personal memory, financial
+#         classification). qwen3.6-medium first to match tuned timeouts.
+[aliases.memory]
+local = true
+chain = [
+  "llama-swap/qwen3.6-medium",
+  "llama-swap-cuda/gemma4:e4b",
+]
+
+# ---- general chains: free -> local -> paid ----
+# TODO(A2): swap the freellmapi model ids for real advertised ids (or
+# auto:<profile> names) once provider keys exist.
+[aliases.chat]
+chain = [
+  "freellmapi/auto:fast",
+  "llama-swap/qwen3.6-medium",
+  "nous/nousresearch/hermes-4-70b",
+]
+
+[aliases.chat-smart]
+chain = [
+  "freellmapi/auto:smart",
+  "llama-swap/qwen3.6-high",
+  "nous/nousresearch/hermes-4-405b",
+]
+
+[aliases.coder]
+chain = [
+  "freellmapi/auto:coding",
+  "llama-swap/qwen3.6-high",
+  "nous/qwen/qwen3.8-max",
+]
+
+[aliases.vision]
+chain = [
+  "llama-swap-cuda/haervwe/GLM-4.6V-Flash-9B:latest",
+  "nous/z-ai/glm-4.6v",
+]

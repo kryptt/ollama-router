@@ -28,6 +28,11 @@ compatible inference endpoints behind a single OpenAI-compatible API.
   incoming request is too large for the requested model's per-slot context,
   routing it to a configured higher-context sibling. Rules chain and are
   cycle-safe. See `OLLAMA_ROUTER_ESCALATE` below.
+- **One live policy file.** Backends, the per-backend spend boundary, alias
+  chains and the fallback map all live in a single TOML document that is
+  re-read and re-validated every discovery cycle — backend roster included,
+  so adding, removing or reordering a backend needs no restart. A rejected
+  edit keeps the previous config *entirely*.
 - **Strict-client compatibility.** Normalises malformed `/api/tags` fields
   (empty `modified_at` / `size`) that otherwise crash pydantic-based clients
   such as Home Assistant's Ollama integration — one bad model no longer takes
@@ -46,7 +51,9 @@ compatible inference endpoints behind a single OpenAI-compatible API.
   and unknown-model requests; plus **self-health series** for diagnosing the
   router itself: `start_time_seconds` (a sawtooth here = pod churn), `ready`,
   `backends_reachable` / `backends_healthy` / per-backend `backend_up`,
-  `upstream_errors{kind=connect|timeout|transport}`, and `heartbeat_engaged`.
+  `upstream_errors{kind=connect|timeout|transport}`, `heartbeat_engaged`, and
+  `config_reloads_total{result}` (a rejected policy reload is otherwise
+  completely silent — alert on it).
 - **OpenTelemetry tracing (opt-in).** When `OTEL_EXPORTER_OTLP_ENDPOINT` is
   set, per-request spans (`model_route` / `passthrough_route`, with `model`,
   `backend`, and status attributes) are batch-exported over OTLP/HTTP to Tempo
@@ -69,41 +76,131 @@ Or via Docker:
 
 ## Configuration
 
-All configuration is via environment variables. Listening / discovery /
-backend wiring:
+Two surfaces, split by lifecycle:
 
-| Var | Default | Purpose |
+| Live — `router.toml`, picked up within one discovery cycle (≤60 s) | Restart-scoped — environment |
+|---|---|
+| backend roster, URLs, **declaration order (= routing priority)** | connect / request timeouts, `OLLAMA_ROUTER_EXTRA_CA_FILE` (frozen inside the two reqwest clients) |
+| per-backend `allow` (the spend boundary) | ports (bound listeners) |
+| `external`, `strip_auth` | `OLLAMA_ROUTER_TOKENS_FILE` (its own 60 s reloader) |
+| alias chains and their `local` pins | discovery interval, grace multiplier, heartbeat knobs |
+| the fallback map | `OLLAMA_ROUTER_ESCALATE`, the inert retry / breaker / cache knobs, `OTEL_*`, `RUST_LOG` |
+
+The rule has no exceptions: **everything in the file is live, everything in
+the environment needs a restart.** Escalation rules stay in the environment
+because making them live would mean moving them into the registry and taking
+a lock on the request hot path — a bigger change than the whole policy-file
+migration, for a feature that is unset in production.
+
+### The policy file
+
+`OLLAMA_ROUTER_CONFIG` names a TOML document holding the backend roster, the
+per-backend model allowlist, alias chains, and the fallback map. It is
+**required and has no default**: the roster and the spend boundary both live
+in it, so a router without one has nothing to route to.
+
+```toml
+# Document order is routing priority: the model map is first-writer-wins,
+# so the backend declared first wins a colliding model name. Local,
+# unmetered backends therefore come first and metered ones last.
+[[backends]]
+name  = "llama-swap-cuda"
+url   = "http://llama-swap-cuda.ai:8080"
+allow = ["*"]                      # on-LAN, unmetered: publish everything
+
+[[backends]]
+name  = "nous"
+url   = "https://inference-api.nousresearch.com"
+external   = true                  # => can never appear in a `local` alias
+strip_auth = true                  # our inbound token is not a Nous credential
+allow = [                          # THE SPEND BOUNDARY — prices per M tok (in/out)
+  "nousresearch/hermes-4-70b",     # 0.05 / 0.20
+  "qwen/qwen3.8-max",              # 1.60 / 4.80
+]
+
+[fallbacks]                        # QUOTE EVERY KEY — see the dotted-key trap
+"qwen3.6-low" = "qwen/qwen3.8-27b"
+
+[aliases.financial]
+local = true                       # privacy pin, re-proved on every reload
+chain = ["llama-swap-cuda/gemma4:e2b", "llama-swap/qwen3.6-low"]
+```
+
+**Backends** (`[[backends]]`, an array of tables — *not* a map, because the
+order is a security boundary and a map would lose it):
+
+| Key | Required | Purpose |
 |---|---|---|
-| `OLLAMA_ROUTER_BACKENDS` | `ollama=http://localhost:11434` | Comma-separated `name=url` pairs. Models are routed first-writer-wins across this list in declaration order. |
-| `OLLAMA_ROUTER_PUBLIC_PORT` | `11434` | Port for the public OpenAI/Ollama-compat surface. |
-| `OLLAMA_ROUTER_INTERNAL_PORT` | `9090` | Port for `/health`, `/status`, `/metrics`, `/auth`. |
-| `OLLAMA_ROUTER_DISCOVERY_INTERVAL` | `60` | Seconds between backend model-list refreshes. |
-| `OLLAMA_ROUTER_GRACE_MULTIPLIER` | `3` | Multiplied by discovery interval to compute the grace period in which an unreachable backend's discovered models stay routable. |
-| `OLLAMA_ROUTER_CONNECT_TIMEOUT` | `10` | Connect-timeout (seconds) for upstream requests. |
-| `OLLAMA_ROUTER_REQUEST_TIMEOUT` | `300` | End-to-end request timeout (seconds) for upstream requests. Long enough for streaming LLM responses. |
-| `OLLAMA_ROUTER_TOKENS_FILE` | (unset, no auth) | Path to a newline-separated file of valid bearer tokens. Reloaded every 60 s without restart. |
-| `OLLAMA_ROUTER_MODEL_ALLOW` | (unset, publish everything) | Per-backend discovery allowlist: `backend=model1\|model2,other=model3`. A backend not named here publishes its full catalogue, so this is purely additive. Naming a backend that isn't in `OLLAMA_ROUTER_BACKENDS`, or an entry with no models, fails at startup. |
-| `OLLAMA_ROUTER_MODEL_ALLOW_FILE` | (unset) | Path to a file with the same grammar as `OLLAMA_ROUTER_MODEL_ALLOW`, plus newlines-as-commas and `#` comments. Re-read every discovery cycle, so an edited mounted ConfigMap lands without a restart; a bad edit keeps the previous cycle's filters. Mutually exclusive with `OLLAMA_ROUTER_MODEL_ALLOW`; an unreadable file fails at startup. |
-| `OLLAMA_ROUTER_FALLBACK_FILE` | (unset, no fallback) | Path to a file of `local-model=stand-in-model` lines (`#` comments allowed). When no reachable backend serves a requested model, the request is transparently rewritten (routing *and* body `model` field) to the stand-in — one hop, applied only if the stand-in is itself published (or is an alias, in which case the request enters the alias chain). Re-read every discovery cycle. Metrics: `ollama_router_fallbacks{from,to}`. |
-| `OLLAMA_ROUTER_ALIASES_FILE` | (unset, no aliases) | Path to an alias/priority-chain file: `[local] alias = backend/model \| backend/model \| ...` per line (`#` comments allowed). Requests for the alias walk the chain in order and commit to the first candidate that answers; see [Aliases](#aliases-priority-chains). Re-read every discovery cycle; a bad edit keeps the previous cycle's table. Fatal at startup on parse/validation errors. |
-| `OLLAMA_ROUTER_EXTERNAL_BACKENDS` | (unset) | Comma-separated backend names considered "external" (hosted, off-LAN), e.g. `nous,freellmapi`. A `local`-prefixed alias whose chain names one of these is rejected at parse time — the privacy pin. Every name must be in `OLLAMA_ROUTER_BACKENDS` (a typo here would silently un-pin privacy). |
-| `OLLAMA_ROUTER_EXTRA_CA_FILE` | (unset, built-in roots only) | Path to a PEM bundle of additional root certificates to trust on outbound requests. Needed when a backend is reached through a TLS-intercepting egress proxy whose CA is private. Applied to both the proxy and discovery clients. |
-| `OLLAMA_ROUTER_STRIP_AUTH` | (unset, forward everything) | Comma-separated backend names whose upstream requests should have the client's `authorization` header dropped. Use for backends whose credential is attached downstream (by an egress proxy): the inbound token is a *router* token, useless to the backend and not something to send to a third party. |
+| `name` | yes | Routing key. Unique; what alias chains and metric labels refer to. |
+| `url` | yes | `http(s)://host[:port]`; any trailing slash is stripped. |
+| `allow` | yes | Discovery allowlist of exact model ids, or `["*"]` to publish everything. Mixing `"*"` with ids, or an empty list, is rejected. |
+| `external` | no (`false`) | Hosted / off-LAN. A `local` alias whose chain touches an `external` backend rejects the whole file. |
+| `strip_auth` | no (`false`) | Drop the client's `authorization` header before forwarding. For backends whose credential is injected downstream by an egress proxy: the inbound token is a *router* token, useless to the backend and not something to hand a third party. |
 
-Notes on the model allowlist:
+Notes on `allow`:
 
 - It exists for **hosted aggregator backends**. A local llama-swap serves a
   handful of models and wants none of this; a hosted endpoint may advertise
   hundreds, which buries the local models in every consumer's picker.
 - It is also the **spend boundary**. Anything that can reach the router can
-  request any model the router publishes. For a metered backend, the allowlist
-  is what stops a client from putting a frontier model on your bill.
+  request any model the router publishes. For a metered backend, `allow` is
+  what stops a client from putting a frontier model on your bill.
 - Filtering happens at discovery, so an excluded model is not merely hidden —
-  it never enters the model map and requests for it 404 like any unknown model.
+  it never enters the model map and requests for it 404 like any unknown
+  model.
+- It is required rather than optional on purpose: making it optional means a
+  deleted line is a *successful* parse that silently removes a backend's
+  spend boundary.
+
+**Fallbacks** (`[fallbacks]`, `local-model = "hosted-stand-in"`): when no
+reachable backend serves a requested model, the request is transparently
+rewritten — routing *and* the body's `model` field — to the stand-in. One
+hop, and only for concrete (non-alias) names. Metric:
+`ollama_router_fallbacks{from,to}`.
+
+> **Quote every fallback key.** Model names contain `.`, and a bare
+> `qwen3.6-low = "x"` is a valid TOML *dotted key* meaning
+> `qwen3 = { "6-low" = "x" }`. The target type is a string map, so the nested
+> table fails deserialisation loudly rather than mis-keying silently — but the
+> quotes are what you actually want. Keys containing `:` or `/` are outright
+> syntax errors unquoted.
+
+**Aliases**: see [Aliases](#aliases-priority-chains) below.
+
+Validation is **all-or-nothing**, and backends and aliases are checked in the
+same pass against the same roster. Rejected outright: an unreadable or
+unparseable file; an unknown field (`stip_auth = true` must be a rejection,
+not a shrug — the file is hand-edited and has no CI in front of it); absent
+or empty `backends`; a duplicate backend name; an empty name or non-`http(s)`
+url; an absent, empty, or wildcard-mixed `allow`; an alias naming an
+unconfigured backend; a `local` alias whose chain touches an `external`
+backend; an alias named `local`; an empty chain; a malformed candidate; and a
+fallback that maps to itself or has an empty side.
+
+At **startup** a rejected file is fatal — with `maxUnavailable: 0` the
+previous pod keeps serving, so a bad file stalls the rollout instead of
+breaking production. At **reload** it warns (`config reload rejected`), keeps
+the previous config *entirely*, and increments
+`ollama_router_config_reloads_total{result="rejected"}`. A rejected reload is
+otherwise completely silent, so alert on that counter.
+
+Write the file atomically (`cp router.toml router.toml.new && mv
+router.toml.new router.toml`): a torn read is simply a rejected reload, but
+there is no reason to take the cycle.
+
+### Why polling, and not a file watcher
+
+The policy file lives on NFS and is edited on the NFS *server*. inotify is a
+local-VFS mechanism: an NFS client receives no events for changes made on the
+server or by another client, so a watcher would sit silent forever while
+looking like it worked — strictly worse than polling. The discovery loop's
+existing interval is the reload trigger, and because each iteration reloads
+*before* snapshotting its probe targets, a backend added by an edit is
+probed in the same cycle rather than the next one.
 
 ### Aliases (priority chains)
 
-`OLLAMA_ROUTER_ALIASES_FILE` defines **routing aliases**: stable client-facing
+`[aliases.<name>]` tables define **routing aliases**: stable client-facing
 model names that fan out over an ordered chain of concrete `backend/model`
 candidates. The router walks the chain top to bottom and commits to the first
 candidate that answers; transport failures (connect/timeout/transport) and
@@ -111,10 +208,13 @@ retryable statuses (429 rate-limit, 404 model-missing, 5xx) advance to the
 next candidate. The advance decision is made on the response head, before any
 body byte is forwarded, so streaming requests fail over cleanly too.
 
-```
-# one alias per line: [local] <alias> = <backend>/<model> | <backend>/<model> | ...
-fast  = llama-swap/qwen3.6:latest | freellmapi/groq/llama-3.3-70b | nous/Hermes-4-405B
-local secret = llama-swap/qwen3.6:latest | rivoli/glm-5.2
+```toml
+[aliases.fast]
+chain = ["llama-swap/qwen3.6:latest", "freellmapi/groq/llama-3.3-70b", "nous/Hermes-4-405B"]
+
+[aliases.secret]
+local = true
+chain = ["llama-swap/qwen3.6:latest", "rivoli/glm-5.2"]
 ```
 
 Advance reasons per candidate: unreachable in the registry, connect/timeout/
@@ -129,11 +229,17 @@ or 5xx response heads.
   resolves under both spellings (`fast` and `fast:latest`), with metrics
   labelled by the canonical configured name. Only a trailing `:latest` is
   normalised; an alias literally named `foo:latest` always wins exactly.
-- The `local` keyword privacy-pins an alias: if any candidate's backend is
-  named in `OLLAMA_ROUTER_EXTERNAL_BACKENDS`, the file is rejected. By
-  construction, traffic for a `local` alias can never leave the local
-  backends — even when every local candidate is down, the chain exhausts
-  (client gets the last upstream failure, or 502) rather than escaping.
+- `local = true` privacy-pins an alias: if any candidate's backend is marked
+  `external`, the file is rejected. Because backends and aliases validate in
+  the same pass against the same roster, **every reload re-proves the pin** —
+  flipping a chained backend to `external` bounces the whole file rather than
+  silently un-pinning it. By construction, traffic for a `local` alias can
+  never leave the local backends: even when every local candidate is down the
+  chain exhausts (client gets the last upstream failure, or 502) rather than
+  escaping.
+- A candidate's model does **not** have to appear in that backend's `allow`
+  list. Chains skip non-serving candidates by design, and a placeholder
+  candidate for a not-yet-provisioned provider is a deliberate pattern.
 - Aliases are a **distinct namespace**, resolved before — and shadowing —
   concrete model lookup. Escalation and the single-hop fallback map are
   skipped entirely for alias requests: the chain is the failover mechanism.
@@ -151,9 +257,6 @@ or 5xx response heads.
   dead ones instead of returning a blind 502.
 - Aliases appear in `/v1/models` (`owned_by: "router-alias"`) and `/api/tags`
   (synthesised, pydantic-safe entries); concrete models keep listing.
-- Unknown backend names, duplicate aliases, empty chains, and an alias named
-  `local` are all rejected. Fatal at startup; at reload the previous table is
-  kept and a warning logged.
 - There are deliberately no per-candidate retries or backoff — the chain
   advance *is* the retry.
 - Metrics: `ollama_router_chain_advance{alias,to,reason}` (`to` is the
@@ -162,6 +265,20 @@ or 5xx response heads.
   `ollama_router_chain_exhausted{alias}`. An exhausted chain still records
   `requests_total` — alias as the model, and the backend whose failure was
   relayed (`"none"` when no candidate produced a response).
+
+### Environment
+
+| Var | Default | Purpose |
+|---|---|---|
+| `OLLAMA_ROUTER_CONFIG` | **required** | Path to the `router.toml` policy file above. |
+| `OLLAMA_ROUTER_PUBLIC_PORT` | `11434` | Port for the public OpenAI/Ollama-compat surface. |
+| `OLLAMA_ROUTER_INTERNAL_PORT` | `9090` | Port for `/health`, `/status`, `/metrics`, `/auth`. |
+| `OLLAMA_ROUTER_DISCOVERY_INTERVAL` | `60` | Seconds between cycles. Each cycle re-reads `router.toml` and *then* probes, so a backend added by an edit is probed in that same cycle. |
+| `OLLAMA_ROUTER_GRACE_MULTIPLIER` | `3` | Multiplied by the discovery interval to compute the grace period in which an unreachable backend's discovered models stay routable. |
+| `OLLAMA_ROUTER_CONNECT_TIMEOUT` | `10` | Connect-timeout (seconds) for upstream requests. |
+| `OLLAMA_ROUTER_REQUEST_TIMEOUT` | `300` | End-to-end request timeout (seconds). Long enough for streaming LLM responses. |
+| `OLLAMA_ROUTER_TOKENS_FILE` | (unset, no auth) | Path to a newline-separated file of valid bearer tokens. Reloaded every 60 s without restart. Empty / whitespace = unset. |
+| `OLLAMA_ROUTER_EXTRA_CA_FILE` | (unset, built-in roots only) | Path to a PEM bundle of additional root certificates to trust on outbound requests. Needed when a backend is reached through a TLS-intercepting egress proxy whose CA is private. Applied to both the proxy and discovery clients, and fatal at startup if unreadable. |
 
 Cold-load heartbeat (kicks in when an upstream model isn't loaded):
 
@@ -255,11 +372,10 @@ Planned, in priority order:
 - **Embedding cache** — a memory-bounded, model-versioned cache for repeated
   small embedding requests, flushed on backend rediscovery (off by default).
 
-Note: for **aliased** traffic, the chain failover shipped with
-`OLLAMA_ROUTER_ALIASES_FILE` supersedes the single-hop
-`OLLAMA_ROUTER_FALLBACK_FILE` mechanism — alias requests never consult the
-fallback map. The fallback map remains the mechanism for concrete
-(non-alias) model names.
+Note: for **aliased** traffic, chain failover supersedes the single-hop
+`[fallbacks]` mechanism — alias requests never consult the fallback map.
+The fallback map remains the mechanism for concrete (non-alias) model
+names.
 
 See `docs/plans/` for the design and rationale.
 

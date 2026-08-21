@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Alias, Config};
 
 /// Opaque index into the backends array. Not constructable outside this module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -111,6 +111,11 @@ pub struct Registry {
     /// serves the requested model. Refreshed from `OLLAMA_ROUTER_FALLBACK_FILE`
     /// each discovery cycle; empty when the file isn't configured.
     fallbacks: HashMap<String, String>,
+    /// Alias → priority chain of `backend/model` candidates. Refreshed from
+    /// `OLLAMA_ROUTER_ALIASES_FILE` each discovery cycle; empty when the
+    /// file isn't configured. A distinct namespace from `model_map`: an
+    /// alias is resolved before (and shadows) any concrete model lookup.
+    aliases: HashMap<String, Alias>,
     discovery_done: bool,
 }
 
@@ -135,6 +140,7 @@ impl Registry {
             backends,
             model_map: HashMap::new(),
             fallbacks: HashMap::new(),
+            aliases: HashMap::new(),
             discovery_done: false,
         }
     }
@@ -143,6 +149,26 @@ impl Registry {
     /// the hop applies (only when `model` itself resolves to no backend).
     pub fn fallback_for(&self, model: &str) -> Option<&str> {
         self.fallbacks.get(model).map(String::as_str)
+    }
+
+    /// The alias chain registered under `name`, if any.
+    pub fn alias_for(&self, name: &str) -> Option<&Alias> {
+        self.aliases.get(name)
+    }
+
+    /// All configured alias names, in arbitrary order.
+    pub fn alias_names(&self) -> impl Iterator<Item = &str> {
+        self.aliases.keys().map(String::as_str)
+    }
+
+    /// Look up a backend by its configured name. Backend membership is fixed
+    /// at startup, so for names validated against the config (alias
+    /// candidates) this always resolves.
+    pub fn backend_id_by_name(&self, name: &str) -> Option<BackendId> {
+        self.backends
+            .iter()
+            .position(|b| b.name == name)
+            .map(BackendId)
     }
 
     /// Look up a model by exact name, then by prefix (before `:`) if no exact match.
@@ -307,6 +333,14 @@ async fn reload_file_config(config: &mut crate::config::Config, registry: &Share
             Ok(fallbacks) => registry.write().await.fallbacks = fallbacks,
             Err(e) => {
                 warn!(error = %e, file = %path, "failed to reload fallback file; keeping previous fallbacks");
+            }
+        }
+    }
+    if let Some(path) = config.aliases_file.clone() {
+        match crate::config::load_aliases_file(&path, &config.backends, &config.external_backends) {
+            Ok(aliases) => registry.write().await.aliases = aliases,
+            Err(e) => {
+                warn!(error = %e, file = %path, "failed to reload aliases file; keeping previous aliases");
             }
         }
     }
@@ -556,6 +590,62 @@ mod tests {
         assert_eq!(reg.fallback_for("qwen3.6-medium"), Some("qwen/qwen3.8-27b"));
         assert_lookup_name(&reg, "qwen/qwen3.8-27b", "cuda");
         assert_eq!(reg.fallback_for("unmapped"), None);
+    }
+
+    #[test]
+    fn alias_for_and_backend_id_by_name() {
+        let mut reg = Registry::new(&test_config());
+        reg.aliases = HashMap::from([(
+            "fast".to_string(),
+            Alias {
+                local_only: false,
+                candidates: vec![crate::config::AliasCandidate {
+                    backend: "cuda".to_string(),
+                    model: "qwen3.6:latest".to_string(),
+                }],
+            },
+        )]);
+
+        let alias = reg.alias_for("fast").expect("alias should resolve");
+        assert_eq!(alias.candidates[0].backend, "cuda");
+        assert!(reg.alias_for("qwen3.6:latest").is_none());
+        assert_eq!(reg.alias_names().collect::<Vec<_>>(), vec!["fast"]);
+
+        let id = reg
+            .backend_id_by_name("rocm")
+            .expect("configured backend should resolve");
+        assert_eq!(reg.backend(id).name, "rocm");
+        assert!(reg.backend_id_by_name("typo").is_none());
+    }
+
+    #[tokio::test]
+    async fn alias_reload_keeps_previous_on_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("aliases");
+        std::fs::write(&path, "fast = cuda/qwen3.6:latest | rocm/glm-5.2\n").expect("write");
+
+        let mut config = test_config();
+        config.aliases_file = Some(path.to_string_lossy().into_owned());
+        let registry = new_shared(&config);
+
+        reload_file_config(&mut config, &registry).await;
+        assert_eq!(
+            registry
+                .read()
+                .await
+                .alias_for("fast")
+                .expect("alias loaded")
+                .candidates
+                .len(),
+            2
+        );
+
+        // A bad edit (unknown backend) must keep the previous chain intact.
+        std::fs::write(&path, "fast = typo/qwen3.6:latest\n").expect("write");
+        reload_file_config(&mut config, &registry).await;
+        let reg = registry.read().await;
+        let alias = reg.alias_for("fast").expect("previous alias survives");
+        assert_eq!(alias.candidates[0].backend, "cuda");
     }
 
     /// Assert that `model` resolves to a backend named `expected_name`.

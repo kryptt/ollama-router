@@ -182,7 +182,17 @@ previous pod keeps serving, so a bad file stalls the rollout instead of
 breaking production. At **reload** it warns (`config reload rejected`), keeps
 the previous config *entirely*, and increments
 `ollama_router_config_reloads_total{result="rejected"}`. A rejected reload is
-otherwise completely silent, so alert on that counter.
+otherwise completely silent, so alert on that counter — and on
+`ollama_router_config_last_reload_timestamp_seconds` going stale, which is
+what a wedged loop looks like (the counter stops moving rather than
+counting).
+
+The read itself runs on a blocking thread under a 10 s budget. The file is on
+NFS, where a hard mount against an unreachable server blocks *indefinitely*;
+run inline that would freeze the discovery loop entirely — no probes, no
+grace expiry, and no reload counting, so the alert above would never fire
+while `/health` answered from a frozen snapshot. A read past its budget is
+just another rejected reload.
 
 Write the file atomically (`cp router.toml router.toml.new && mv
 router.toml.new router.toml`): a torn read is simply a rejected reload, but

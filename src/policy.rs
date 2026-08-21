@@ -145,6 +145,14 @@ pub enum PolicyError {
         path: String,
         source: std::io::Error,
     },
+    /// The read did not finish in time. Its own variant because the cause is
+    /// categorically different from every other error here: the file is on
+    /// NFS, and a hard mount against an unreachable server blocks forever
+    /// rather than returning an error.
+    ReadTimeout {
+        path: String,
+        after: std::time::Duration,
+    },
     /// Syntax error, unknown field, or type mismatch. `toml`'s own message
     /// already carries the line/column and a source excerpt.
     Parse(toml::de::Error),
@@ -158,6 +166,11 @@ impl fmt::Display for PolicyError {
             Self::Read { path, source } => {
                 write!(f, "router config: could not read '{path}': {source}")
             }
+            Self::ReadTimeout { path, after } => write!(
+                f,
+                "router config: reading '{path}' timed out after {after:?} \
+                 (is the filesystem hung?)"
+            ),
             Self::Parse(e) => write!(f, "router config: {e}"),
             Self::Invalid(reason) => write!(f, "router config: {reason}"),
         }
@@ -169,7 +182,7 @@ impl std::error::Error for PolicyError {
         match self {
             Self::Read { source, .. } => Some(source),
             Self::Parse(e) => Some(e),
-            Self::Invalid(_) => None,
+            Self::ReadTimeout { .. } | Self::Invalid(_) => None,
         }
     }
 }

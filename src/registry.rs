@@ -9,7 +9,13 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::metrics::{BackendLabels, ConfigReloadLabels, Metrics};
-use crate::policy::{Alias, BackendSpec, FileConfig, Validated};
+use crate::policy::{Alias, BackendSpec, FileConfig, PolicyError, Validated};
+
+/// Ceiling on a single policy-file read. Matches the discovery client's
+/// timeout: both are "this filesystem/host is not answering" budgets, and a
+/// reload that takes longer than a full round of backend probes is wedged,
+/// not slow.
+const POLICY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Opaque index into the backends array. Not constructable outside this module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -463,6 +469,26 @@ impl Registry {
         self.discovery_done
     }
 
+    /// True when this router can actually serve something.
+    ///
+    /// The `!backends.is_empty()` half is not redundant with "some backend is
+    /// reachable": a cycle over an *empty* roster completes successfully with
+    /// nothing to probe and flips `discovery_done`, so without this the
+    /// no-policy-file state would report Ready, take Service endpoints, and
+    /// 404 every request as an unknown model — which looks healthy and is
+    /// strictly worse than crash-looping. A router with no configured
+    /// backends is never Ready.
+    pub fn is_ready(&self) -> bool {
+        self.discovery_done
+            && !self.backends.is_empty()
+            && self.backends.iter().any(BackendState::is_reachable)
+    }
+
+    /// True when the roster is empty — no policy file has ever applied.
+    pub fn has_no_backends(&self) -> bool {
+        self.backends.is_empty()
+    }
+
     fn rebuild_model_map(&mut self) {
         self.model_map.clear();
         for (idx, backend) in self.backends.iter().enumerate() {
@@ -486,6 +512,26 @@ pub type SharedRegistry = Arc<RwLock<Registry>>;
 
 pub fn new_shared(validated: Validated) -> SharedRegistry {
     Arc::new(RwLock::new(Registry::new(validated)))
+}
+
+/// A registry with **no backends**: the state a router boots into when its
+/// policy file is unreadable at startup.
+///
+/// Deliberately not a fatal error. Before 0.15.0 the roster came from the
+/// environment, so a bad policy file could never stop the process starting;
+/// now that the roster lives only in the file, aborting would turn any
+/// unrelated restart during an NFS blip — OOMKill, drain, eviction — into a
+/// CrashLoopBackOff with no way back. An empty roster can never be Ready
+/// (see `Registry::is_ready`), so the Service simply has no endpoints and
+/// the pod self-heals the moment the file becomes readable.
+pub fn new_shared_empty() -> SharedRegistry {
+    Arc::new(RwLock::new(Registry {
+        backends: Vec::new(),
+        model_map: HashMap::new(),
+        fallbacks: HashMap::new(),
+        aliases: HashMap::new(),
+        discovery_done: false,
+    }))
 }
 
 /// Long-running discovery loop. Runs the first cycle immediately, then
@@ -523,7 +569,7 @@ pub async fn discovery_loop(
 /// also counted: `config_reloads_total{result="rejected"}` is what the
 /// alert fires on.
 async fn reload_policy(path: &str, registry: &SharedRegistry, metrics: &Metrics) {
-    let result = match FileConfig::load(path) {
+    let result = match load_policy(path).await {
         Ok(validated) => {
             let removed = registry.write().await.apply_file_config(validated);
             for backend in removed {
@@ -532,6 +578,9 @@ async fn reload_policy(path: &str, registry: &SharedRegistry, metrics: &Metrics)
                 // freezes at its last value forever.
                 metrics.backend_up.remove(&BackendLabels { backend });
             }
+            metrics
+                .config_last_reload_timestamp_seconds
+                .set(unix_now_secs());
             "applied"
         }
         Err(e) => {
@@ -545,6 +594,63 @@ async fn reload_policy(path: &str, registry: &SharedRegistry, metrics: &Metrics)
             result: result.to_string(),
         })
         .inc();
+}
+
+/// Read and validate the policy file **off** the async runtime.
+///
+/// `FileConfig::load` is a synchronous `read_to_string` on a file that lives
+/// on NFS. Calling it directly from the discovery task means a hard mount
+/// against an unreachable server blocks that worker indefinitely: probes
+/// stop, grace periods stop expiring, and — worst of all — reloads stop
+/// *counting*, so `config_reloads_total` goes quiet instead of recording
+/// rejections and the alert that exists for exactly this never fires, while
+/// `/health` keeps answering Ready off a frozen snapshot.
+///
+/// `spawn_blocking` plus a timeout bounds it: a hung filesystem becomes a
+/// rejected reload like any other bad file, and the loop keeps running. The
+/// blocked thread does leak (nothing can cancel a stuck syscall), but it
+/// leaks into the blocking pool where it costs a thread rather than the
+/// router's liveness, and the alert fires long before the pool is a concern.
+async fn load_policy(path: &str) -> Result<Validated, PolicyError> {
+    let owned = path.to_string();
+    load_off_runtime(path, POLICY_READ_TIMEOUT, move || FileConfig::load(&owned)).await
+}
+
+/// Run `read` on the blocking pool under `budget`.
+///
+/// Split from [`load_policy`] so the two properties that matter can be
+/// tested without a filesystem that actually hangs: that the read does not
+/// stall the runtime, and that exceeding the budget surfaces as an error
+/// (and therefore as a *counted* rejected reload) rather than as silence.
+async fn load_off_runtime<R>(
+    path: &str,
+    budget: Duration,
+    read: R,
+) -> Result<Validated, PolicyError>
+where
+    R: FnOnce() -> Result<Validated, PolicyError> + Send + 'static,
+{
+    let handle = tokio::task::spawn_blocking(read);
+    match tokio::time::timeout(budget, handle).await {
+        Ok(Ok(result)) => result,
+        // The blocking task itself failed (panic or runtime shutdown).
+        Ok(Err(e)) => Err(PolicyError::Read {
+            path: path.to_string(),
+            source: std::io::Error::other(e),
+        }),
+        Err(_elapsed) => Err(PolicyError::ReadTimeout {
+            path: path.to_string(),
+            after: budget,
+        }),
+    }
+}
+
+/// Seconds since the Unix epoch, or 0 if the clock is before it.
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// The outcome of probing one backend, paired with its name by the caller.
@@ -692,6 +798,11 @@ fn mark_down(backend: &mut BackendState, now: Instant, grace_duration: Duration)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The smallest valid policy document, for tests that only need *some*
+    /// successfully-parsed value.
+    const MINIMAL_POLICY: &str = "[[backends]]\nname = \"a\"\nurl = \"http://a:1\"\n\
+                                  allow = [\"*\"]\n[fallbacks]\n[aliases]\n";
 
     /// Parse a policy document, or fail the test with the validator's own
     /// error — every registry test goes through the real validator, so a
@@ -1371,5 +1482,85 @@ mod tests {
         assert!(!reg.backends[0].healthy);
         assert!(reg.backends[0].grace_deadline.is_some(), "grace starts");
         assert!(reg.backends[1].healthy);
+    }
+
+    // ── the policy read must never stall the discovery loop ──────────────
+
+    #[tokio::test]
+    async fn policy_read_runs_off_the_runtime() {
+        // The file is on NFS; a hard mount against a dead server blocks
+        // `read_to_string` indefinitely. Run inline on the discovery task,
+        // that freezes the whole loop: no probes, no grace expiry, and —
+        // worst — `config_reloads_total` stops incrementing instead of
+        // counting rejections, so the alert for exactly this never fires
+        // while /health answers Ready off a frozen snapshot.
+        //
+        // This is a current-thread runtime, so if the read is not moved to
+        // the blocking pool the timer below can never fire.
+        let ticked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&ticked);
+        let ticker = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let result = load_off_runtime("/x", Duration::from_secs(30), || {
+            std::thread::sleep(Duration::from_millis(300));
+            FileConfig::parse(MINIMAL_POLICY)
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert!(
+            ticked.load(std::sync::atomic::Ordering::SeqCst),
+            "the runtime must keep polling tasks while the policy read blocks"
+        );
+        ticker.await.expect("ticker");
+    }
+
+    #[tokio::test]
+    async fn policy_read_past_its_budget_is_an_error_not_silence() {
+        // A wedged read has to become a *rejected reload* — something the
+        // counter records and the alert can see — rather than a loop that
+        // quietly stops reporting.
+        let result = load_off_runtime("/hung", Duration::from_millis(20), || {
+            std::thread::sleep(Duration::from_millis(400));
+            FileConfig::parse(MINIMAL_POLICY)
+        })
+        .await;
+
+        let err = result.expect_err("expected a timeout");
+        assert!(
+            matches!(err, PolicyError::ReadTimeout { .. }),
+            "expected ReadTimeout, got {err:?}"
+        );
+        assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    // ── a router with no backends is never ready ─────────────────────────
+
+    #[test]
+    fn empty_roster_is_never_ready() {
+        // A cycle over zero backends completes successfully — there is
+        // nothing to probe — and flips `discovery_done`. Readiness must
+        // still be false: taking Service endpoints and 404-ing every
+        // request looks healthy and is worse than being visibly down.
+        let mut reg = Registry {
+            backends: Vec::new(),
+            model_map: HashMap::new(),
+            fallbacks: HashMap::new(),
+            aliases: HashMap::new(),
+            discovery_done: false,
+        };
+        assert!(!reg.is_ready());
+        reg.apply_fetch_results(Vec::new(), Instant::now(), Duration::from_secs(60));
+        assert!(reg.is_discovery_done(), "an empty cycle still completes");
+        assert!(reg.has_no_backends());
+        assert!(!reg.is_ready(), "no backends can never be ready");
+
+        // ...and a roster that appears later becomes ready normally.
+        reg.apply_file_config(test_policy());
+        apply(&mut reg, vec![("cuda", ok_result(&["m:v1"]))]);
+        assert!(reg.is_ready());
     }
 }

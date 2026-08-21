@@ -887,6 +887,7 @@ pub async fn passthrough_route(
 // Internal handlers
 // ---------------------------------------------------------------------------
 
+/// Readiness: 503 unless this router can actually serve a request.
 pub async fn health_route(State(state): State<AppState>) -> Response {
     let snapshot = state.registry.read().await;
 
@@ -897,11 +898,20 @@ pub async fn health_route(State(state): State<AppState>) -> Response {
         );
     }
 
-    let any_reachable = snapshot
-        .all_backends()
-        .any(|b| b.healthy || b.in_grace_period);
+    // An empty roster means no policy file has ever applied. Checked
+    // explicitly, before reachability, because a discovery cycle over zero
+    // backends *succeeds* — there is nothing to probe — and flips
+    // `discovery_done`. Reporting Ready there would take Service endpoints
+    // and 404 every request while looking healthy, which is strictly worse
+    // than being visibly down.
+    if snapshot.has_no_backends() {
+        return json_status(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"status": "unhealthy", "reason": "no backends configured"}),
+        );
+    }
 
-    if any_reachable {
+    if snapshot.is_ready() {
         json_status(StatusCode::OK, json!({"status": "ok"}))
     } else {
         json_status(
@@ -909,6 +919,16 @@ pub async fn health_route(State(state): State<AppState>) -> Response {
             json!({"status": "unhealthy", "reason": "all backends unreachable"}),
         )
     }
+}
+
+/// Liveness: 200 for as long as the process is running and serving.
+///
+/// Deliberately separate from `/health`. Readiness is 503 whenever the
+/// router cannot serve — including while its policy file is unreadable —
+/// and pointing a liveness probe at that would kill the very pod that is
+/// waiting to self-heal the moment the file comes back.
+pub async fn live_route() -> Response {
+    json_status(StatusCode::OK, json!({"status": "alive"}))
 }
 
 pub async fn status_route(State(state): State<AppState>) -> Response {
@@ -949,8 +969,9 @@ pub async fn metrics_route(State(state): State<AppState>) -> Response {
             .filter(|b| b.healthy || b.in_grace_period)
             .count();
         let healthy = reg.all_backends().filter(|b| b.healthy).count();
-        let ready = reg.is_discovery_done() && reachable > 0;
-        state.metrics.ready.set(ready as i64);
+        // Same predicate as /health, so the gauge and the probe can never
+        // disagree about what "ready" means.
+        state.metrics.ready.set(reg.is_ready() as i64);
         state.metrics.backends_reachable.set(reachable as i64);
         state.metrics.backends_healthy.set(healthy as i64);
         for b in reg.all_backends() {

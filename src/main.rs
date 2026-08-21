@@ -45,14 +45,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = Config::from_env()?;
-    // Fatal on a bad policy file. With `maxUnavailable: 0` the previous pod
-    // keeps serving, so a rejected config stalls the rollout instead of
-    // breaking production.
-    let policy = FileConfig::load(&config.config_path)?;
+
+    // A bad or unreadable policy file starts the router unready, NOT dead.
+    // The roster now lives only in this file, so aborting would turn any
+    // unrelated restart during an NFS blip — OOMKill, drain, eviction — into
+    // a CrashLoopBackOff with no way back. Unready means the Service has no
+    // endpoints (clients get connection-refused, never a misroute) and the
+    // discovery loop retries every cycle, so the pod self-heals as soon as
+    // the file is readable again.
+    let (registry, backend_count) = match FileConfig::load(&config.config_path) {
+        Ok(policy) => {
+            let count = policy.backends.len();
+            (registry::new_shared(policy), count)
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                file = %config.config_path,
+                "policy file unusable at startup; starting UNREADY with no backends — \
+                 the discovery loop will retry every cycle",
+            );
+            (registry::new_shared_empty(), 0)
+        }
+    };
 
     info!(
         config = %config.config_path,
-        backends = policy.backends.len(),
+        backends = backend_count,
         discovery_interval = config.discovery_interval_secs,
         connect_timeout = config.connect_timeout_secs,
         request_timeout = config.request_timeout_secs,
@@ -64,7 +83,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "starting ollama-router"
     );
 
-    let registry = registry::new_shared(policy);
     let metrics = Arc::new(Metrics::new());
     metrics.start_time_seconds.set(
         SystemTime::now()
@@ -73,6 +91,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(0),
     );
     let token_store = Arc::new(TokenStore::new(config.tokens_file.as_deref()));
+    // Auth being off is a security state, and one nothing else reports: the
+    // only other signal is the absence of 401s. Log it and expose it so it
+    // can be alerted on.
+    let auth_enabled = token_store.is_enabled();
+    metrics.auth_enabled.set(auth_enabled as i64);
+    if auth_enabled {
+        info!(auth_enabled = true, "bearer-token auth enabled");
+    } else {
+        tracing::warn!(
+            auth_enabled = false,
+            "bearer-token auth DISABLED (OLLAMA_ROUTER_TOKENS_FILE unset): \
+             anything that can reach this router can use any published model",
+        );
+    }
     let client = Arc::new(
         config
             .apply_extra_ca(
@@ -179,6 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let internal_router = Router::new()
         .route("/health", get(handler::health_route))
+        .route("/live", get(handler::live_route))
         .route("/status", get(handler::status_route))
         .route("/metrics", get(handler::metrics_route))
         .route("/auth", any(handler::auth_route))

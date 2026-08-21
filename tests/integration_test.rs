@@ -1212,3 +1212,95 @@ async fn deleted_file_keeps_serving() {
             .contains(r#"ollama_router_config_reloads_total{result="rejected"}"#)
     );
 }
+
+// ─── Startup with an unusable policy file ───────────────────────────────────
+
+/// GET a JSON endpoint through the internal router and return
+/// `(status, body)`.
+async fn probe(state: &AppState, which: &str) -> (StatusCode, serde_json::Value) {
+    use http_body_util::BodyExt;
+    let resp = match which {
+        "health" => handler::health_route(axum::extract::State(state.clone())).await,
+        _ => handler::live_route().await,
+    };
+    let status = resp.status();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+#[tokio::test]
+async fn unreadable_policy_at_startup_serves_unready_then_self_heals() {
+    // The whole point of not aborting: an NFS blip during pod start must not
+    // become a CrashLoopBackOff, and must not look healthy either.
+    let dir = tempfile::tempdir().unwrap();
+    let path = policy_path(&dir);
+    let mut config = Config {
+        config_path: path.clone(),
+        ..Config::default()
+    };
+    config.discovery_interval_secs = 1;
+
+    // The file does not exist yet — exactly the startup-during-outage case.
+    let reg = registry::new_shared_empty();
+    let metrics = Arc::new(Metrics::new());
+    let state = app_state_with(&reg, &metrics);
+
+    assert_eq!(
+        probe(&state, "health").await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+
+    spawn_discovery(&reg, &config, &metrics);
+    // Let a full cycle run against the empty roster.
+    tokio::time::sleep(CYCLE).await;
+
+    // A cycle over zero backends completes successfully and flips
+    // `discovery_done` — so this is precisely where a naive readiness check
+    // would start reporting Ready, take Service endpoints, and 404 every
+    // request while looking healthy.
+    assert!(
+        reg.read().await.is_discovery_done(),
+        "the cycle should have completed; the point is that it is still not Ready"
+    );
+    let (status, body) = probe(&state, "health").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["reason"], "no backends configured");
+    assert!(!reg.read().await.is_ready());
+
+    // Liveness must still pass, or the kubelet kills the pod that is
+    // waiting to self-heal.
+    let (status, body) = probe(&state, "live").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "alive");
+
+    // The `ready` gauge must agree with the probe.
+    let text = {
+        use http_body_util::BodyExt;
+        let resp = handler::metrics_route(axum::extract::State(state.clone())).await;
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(body.to_vec()).unwrap()
+    };
+    assert!(text.contains("ollama_router_ready 0"), "{text}");
+
+    // Now the file appears — the pod self-heals on the next cycle, no
+    // restart involved.
+    let b1 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+    std::fs::write(&path, policy_doc(&[("p1", &b1.url)], "")).unwrap();
+    tokio::time::sleep(CYCLE).await;
+
+    let (status, body) = probe(&state, "health").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(reg.read().await.is_ready());
+}
+
+#[tokio::test]
+async fn empty_roster_is_never_ready_even_with_discovery_done() {
+    // The invariant on its own, without the timing: a router with nothing
+    // configured can never serve anything, so it must never be Ready.
+    let reg = registry::new_shared_empty();
+    let state = app_state(&reg);
+    let (status, body) = probe(&state, "health").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["reason"], "awaiting first discovery");
+    assert!(!reg.read().await.is_ready());
+}

@@ -32,7 +32,8 @@ compatible inference endpoints behind a single OpenAI-compatible API.
   chains and the fallback map all live in a single TOML document that is
   re-read and re-validated every discovery cycle — backend roster included,
   so adding, removing or reordering a backend needs no restart. A rejected
-  edit keeps the previous config *entirely*.
+  edit keeps the previous config *entirely*; an unreadable file at startup
+  leaves the router alive but **unready**, retrying, rather than crash-looping.
 - **Strict-client compatibility.** Normalises malformed `/api/tags` fields
   (empty `modified_at` / `size`) that otherwise crash pydantic-based clients
   such as Home Assistant's Ollama integration — one bad model no longer takes
@@ -177,15 +178,22 @@ unconfigured backend; a `local` alias whose chain touches an `external`
 backend; an alias named `local`; an empty chain; a malformed candidate; and a
 fallback that maps to itself or has an empty side.
 
-At **startup** a rejected file is fatal — with `maxUnavailable: 0` the
-previous pod keeps serving, so a bad file stalls the rollout instead of
-breaking production. At **reload** it warns (`config reload rejected`), keeps
-the previous config *entirely*, and increments
+At **reload** a rejected file warns (`config reload rejected`), keeps the
+previous config *entirely*, and increments
 `ollama_router_config_reloads_total{result="rejected"}`. A rejected reload is
 otherwise completely silent, so alert on that counter — and on
 `ollama_router_config_last_reload_timestamp_seconds` going stale, which is
 what a wedged loop looks like (the counter stops moving rather than
 counting).
+
+At **startup** a rejected file does *not* abort. The roster lives only in
+this file, so aborting would turn any unrelated restart during a filesystem
+blip — OOMKill, drain, eviction — into a `CrashLoopBackOff` with no way back.
+Instead the router starts with an empty roster: alive (`/live` 200), never
+ready (`/health` 503, `no backends configured`), so the Service has no
+endpoints and clients get connection-refused rather than a misroute. The
+discovery loop retries every cycle, and the pod self-heals the moment the
+file is readable.
 
 The read itself runs on a blocking thread under a 10 s budget. The file is on
 NFS, where a hard mount against an unreachable server blocks *indefinitely*;
@@ -282,7 +290,7 @@ or 5xx response heads.
 |---|---|---|
 | `OLLAMA_ROUTER_CONFIG` | **required** | Path to the `router.toml` policy file above. |
 | `OLLAMA_ROUTER_PUBLIC_PORT` | `11434` | Port for the public OpenAI/Ollama-compat surface. |
-| `OLLAMA_ROUTER_INTERNAL_PORT` | `9090` | Port for `/health`, `/status`, `/metrics`, `/auth`. |
+| `OLLAMA_ROUTER_INTERNAL_PORT` | `9090` | Port for `/health`, `/live`, `/status`, `/metrics`, `/auth`. |
 | `OLLAMA_ROUTER_DISCOVERY_INTERVAL` | `60` | Seconds between cycles. Each cycle re-reads `router.toml` and *then* probes, so a backend added by an edit is probed in that same cycle. |
 | `OLLAMA_ROUTER_GRACE_MULTIPLIER` | `3` | Multiplied by the discovery interval to compute the grace period in which an unreachable backend's discovered models stay routable. |
 | `OLLAMA_ROUTER_CONNECT_TIMEOUT` | `10` | Connect-timeout (seconds) for upstream requests. |
@@ -357,7 +365,8 @@ Internal router (`OLLAMA_ROUTER_INTERNAL_PORT`):
 
 | Path | Purpose |
 |---|---|
-| `GET /health` | 200 once first discovery cycle has completed and at least one backend is reachable. |
+| `GET /health` | **Readiness.** 200 once the first discovery cycle has completed, at least one backend is *configured*, and at least one is reachable. A router whose policy file has never loaded reports `503 {"reason": "no backends configured"}` — it can serve nothing, so it must never take Service endpoints. |
+| `GET /live` | **Liveness.** 200 for as long as the process is serving. Separate from `/health` on purpose: readiness is 503 while the policy file is unreadable, and pointing a liveness probe at that would kill the pod that is waiting to self-heal. |
 | `GET /status` | JSON dump of every backend's current health, models, and grace state. |
 | `GET /metrics` | Prometheus text-format exposition. |
 | `ANY /auth` | Token-validation endpoint for Traefik / NGINX `forwardAuth` middleware. |

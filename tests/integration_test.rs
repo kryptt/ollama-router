@@ -11,10 +11,11 @@ use serde_json::json;
 use tokio::net::TcpListener;
 
 use ollama_router::auth::TokenStore;
-use ollama_router::config::{Backend, Config};
+use ollama_router::config::Config;
 use ollama_router::handler::{self, AppState};
 use ollama_router::heartbeat::HeartbeatConfig;
 use ollama_router::metrics::Metrics;
+use ollama_router::policy::FileConfig;
 use ollama_router::registry::{self, Registry, SharedRegistry};
 use ollama_router::routes::{ROUTED_PATHS, default_stream_for_path};
 
@@ -36,11 +37,12 @@ async fn spawn_test_server_abortable(app: Router) -> (String, tokio::task::JoinH
     (format!("http://{addr}"), handle)
 }
 
-fn spawn_discovery(reg: &SharedRegistry, config: &Config) {
+fn spawn_discovery(reg: &SharedRegistry, config: &Config, metrics: &Arc<Metrics>) {
     tokio::spawn({
         let reg = reg.clone();
         let config = config.clone();
-        async move { registry::discovery_loop(reg, config).await }
+        let metrics = Arc::clone(metrics);
+        async move { registry::discovery_loop(reg, config, metrics).await }
     });
 }
 
@@ -50,18 +52,64 @@ async fn run_discovery_to_completion<'a>(
     reg: &'a SharedRegistry,
     config: &Config,
 ) -> tokio::sync::RwLockReadGuard<'a, Registry> {
-    spawn_discovery(reg, config);
+    spawn_discovery(reg, config, &Arc::new(Metrics::new()));
     tokio::time::sleep(Duration::from_millis(500)).await;
     let guard = reg.read().await;
     assert!(guard.is_discovery_done());
     guard
 }
 
-/// Create a single-backend config pointing at `url` and its shared registry.
-fn single_backend_config(name: &str, url: &str) -> (Config, SharedRegistry) {
-    let config = Config::from_backends(vec![Backend::for_test(name, url)]);
-    let reg = registry::new_shared(&config);
-    (config, reg)
+/// Render a `router.toml` naming `backends` in declaration order — each
+/// publishing everything — followed by `extra` (fallback and alias tables).
+/// `[fallbacks]` / `[aliases]` are appended when `extra` does not open them:
+/// both are required tables, so an absent one is a rejection, not an
+/// implicit empty.
+fn policy_doc(backends: &[(&str, &str)], extra: &str) -> String {
+    let mut doc = String::new();
+    for (name, url) in backends {
+        doc.push_str(&format!(
+            "[[backends]]\nname = \"{name}\"\nurl = \"{url}\"\nallow = [\"*\"]\n\n"
+        ));
+    }
+    if !extra.contains("[fallbacks]") {
+        doc.push_str("[fallbacks]\n");
+    }
+    if !extra.contains("[aliases") {
+        doc.push_str("[aliases]\n");
+    }
+    doc.push_str(extra);
+    doc
+}
+
+/// Write a policy file into `dir` and return a `Config` pointing at it.
+/// Rewriting the same path is how the live-reload tests edit the policy.
+fn policy_config(dir: &tempfile::TempDir, backends: &[(&str, &str)], extra: &str) -> Config {
+    let path = policy_path(dir);
+    std::fs::write(&path, policy_doc(backends, extra)).unwrap();
+    Config {
+        config_path: path,
+        ..Config::default()
+    }
+}
+
+fn policy_path(dir: &tempfile::TempDir) -> String {
+    dir.path().join("router.toml").to_str().unwrap().to_string()
+}
+
+/// Build a registry from `config`'s policy file the way `main` does.
+fn new_registry(config: &Config) -> SharedRegistry {
+    registry::new_shared(FileConfig::load(&config.config_path).expect("valid test policy"))
+}
+
+/// The common case: one temp dir, one policy file, one registry.
+fn policy_setup(
+    backends: &[(&str, &str)],
+    extra: &str,
+) -> (tempfile::TempDir, Config, SharedRegistry) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = policy_config(&dir, backends, extra);
+    let reg = new_registry(&config);
+    (dir, config, reg)
 }
 
 /// A controllable mock backend: configurable /api/chat status, a hit
@@ -208,12 +256,7 @@ async fn model_routing_to_correct_backend() {
     let cuda_url = start_mock_backend(vec!["fixt/home-3b-v3:latest"]).await;
     let rocm_url = start_mock_backend(vec!["glm-4.7-flash:latest"]).await;
 
-    let backends = vec![
-        Backend::for_test("cuda", &cuda_url),
-        Backend::for_test("rocm", &rocm_url),
-    ];
-    let config = Config::from_backends(backends);
-    let reg = registry::new_shared(&config);
+    let (_dir, config, reg) = policy_setup(&[("cuda", &cuda_url), ("rocm", &rocm_url)], "");
     let r = run_discovery_to_completion(&reg, &config).await;
 
     let cuda_id = r.lookup("fixt/home-3b-v3:latest").unwrap();
@@ -230,14 +273,14 @@ async fn model_routing_to_correct_backend() {
 
 #[tokio::test]
 async fn health_before_discovery_is_not_ready() {
-    let (_config, reg) = single_backend_config("test", "http://127.0.0.1:1");
+    let (_dir, _config, reg) = policy_setup(&[("test", "http://127.0.0.1:1")], "");
     let r = reg.read().await;
     assert!(!r.is_discovery_done());
 }
 
 #[tokio::test]
 async fn discovery_marks_unreachable_backend_down() {
-    let (config, reg) = single_backend_config("dead", "http://127.0.0.1:1");
+    let (_dir, config, reg) = policy_setup(&[("dead", "http://127.0.0.1:1")], "");
     let r = run_discovery_to_completion(&reg, &config).await;
     assert!(r.any_healthy().is_none());
     assert!(r.available_model_names().is_empty());
@@ -393,13 +436,14 @@ async fn spawn_router(state: AppState) -> String {
     spawn_test_server(router).await
 }
 
-/// Write `content` to a temp aliases file; the TempDir keeps it alive.
-fn write_aliases_file(content: &str) -> (tempfile::TempDir, String) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("aliases");
-    std::fs::write(&path, content).unwrap();
-    let path = path.to_str().unwrap().to_string();
-    (dir, path)
+/// An `[aliases.<name>]` table with the given `backend/model` chain.
+fn alias_toml(name: &str, chain: &[&str]) -> String {
+    let chain = chain
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[aliases.{name}]\nchain = [{chain}]\n")
 }
 
 /// POST an /api/chat request for `model` (non-streaming unless told
@@ -419,15 +463,10 @@ async fn alias_chain_advances_past_rate_limited_candidate() {
     let b2 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
     let b3 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
 
-    let mut config = Config::from_backends(vec![
-        Backend::for_test("p1", &b1.url),
-        Backend::for_test("p2", &b2.url),
-        Backend::for_test("p3", &b3.url),
-    ]);
-    let (_dir, path) = write_aliases_file("ali = p1/m:latest | p2/m:latest | p3/m:latest\n");
-    config.aliases_file = Some(path);
-
-    let reg = registry::new_shared(&config);
+    let (_dir, config, reg) = policy_setup(
+        &[("p1", &b1.url), ("p2", &b2.url), ("p3", &b3.url)],
+        &alias_toml("ali", &["p1/m:latest", "p2/m:latest", "p3/m:latest"]),
+    );
     let state = app_state(&reg);
     let base = spawn_router(state.clone()).await;
     drop(run_discovery_to_completion(&reg, &config).await);
@@ -462,14 +501,10 @@ async fn alias_chain_advances_on_connect_error_without_discovery_wait() {
     let b1 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
     let b2 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
 
-    let mut config = Config::from_backends(vec![
-        Backend::for_test("p1", &b1.url),
-        Backend::for_test("p2", &b2.url),
-    ]);
-    let (_dir, path) = write_aliases_file("ali = p1/m:latest | p2/m:latest\n");
-    config.aliases_file = Some(path);
-
-    let reg = registry::new_shared(&config);
+    let (_dir, config, reg) = policy_setup(
+        &[("p1", &b1.url), ("p2", &b2.url)],
+        &alias_toml("ali", &["p1/m:latest", "p2/m:latest"]),
+    );
     let state = app_state(&reg);
     let base = spawn_router(state.clone()).await;
     drop(run_discovery_to_completion(&reg, &config).await);
@@ -498,14 +533,10 @@ async fn alias_chain_exhausted_relays_last_failure() {
     let b1 = start_counting_backend(vec!["m:latest"], StatusCode::INTERNAL_SERVER_ERROR).await;
     let b2 = start_counting_backend(vec!["m:latest"], StatusCode::INTERNAL_SERVER_ERROR).await;
 
-    let mut config = Config::from_backends(vec![
-        Backend::for_test("p1", &b1.url),
-        Backend::for_test("p2", &b2.url),
-    ]);
-    let (_dir, path) = write_aliases_file("ali = p1/m:latest | p2/m:latest\n");
-    config.aliases_file = Some(path);
-
-    let reg = registry::new_shared(&config);
+    let (_dir, config, reg) = policy_setup(
+        &[("p1", &b1.url), ("p2", &b2.url)],
+        &alias_toml("ali", &["p1/m:latest", "p2/m:latest"]),
+    );
     let state = app_state(&reg);
     let base = spawn_router(state.clone()).await;
     drop(run_discovery_to_completion(&reg, &config).await);
@@ -537,14 +568,10 @@ async fn alias_streaming_request_commits_on_first_healthy_candidate() {
     let b1 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
     let b2 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
 
-    let mut config = Config::from_backends(vec![
-        Backend::for_test("p1", &b1.url),
-        Backend::for_test("p2", &b2.url),
-    ]);
-    let (_dir, path) = write_aliases_file("ali = p1/m:latest | p2/m:latest\n");
-    config.aliases_file = Some(path);
-
-    let reg = registry::new_shared(&config);
+    let (_dir, config, reg) = policy_setup(
+        &[("p1", &b1.url), ("p2", &b2.url)],
+        &alias_toml("ali", &["p1/m:latest", "p2/m:latest"]),
+    );
     let state = app_state(&reg);
     let base = spawn_router(state.clone()).await;
     drop(run_discovery_to_completion(&reg, &config).await);
@@ -571,15 +598,23 @@ async fn local_alias_never_reaches_external_backend() {
     // than let a single request escape to the external backend.
     let ext = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
 
-    let mut config = Config::from_backends(vec![
-        Backend::for_test("loc", "http://127.0.0.1:1"),
-        Backend::for_test("ext", &ext.url),
-    ]);
-    config.external_backends = std::collections::HashSet::from(["ext".to_string()]);
-    let (_dir, path) = write_aliases_file("local secret = loc/m:latest\n");
-    config.aliases_file = Some(path);
-
-    let reg = registry::new_shared(&config);
+    let dir = tempfile::tempdir().unwrap();
+    let path = policy_path(&dir);
+    std::fs::write(
+        &path,
+        format!(
+            "[[backends]]\nname = \"loc\"\nurl = \"http://127.0.0.1:1\"\nallow = [\"*\"]\n\n\
+             [[backends]]\nname = \"ext\"\nurl = \"{}\"\nexternal = true\nallow = [\"*\"]\n\n\
+             [fallbacks]\n[aliases.secret]\nlocal = true\nchain = [\"loc/m:latest\"]\n",
+            ext.url
+        ),
+    )
+    .unwrap();
+    let config = Config {
+        config_path: path,
+        ..Config::default()
+    };
+    let reg = new_registry(&config);
     let state = app_state(&reg);
     let base = spawn_router(state.clone()).await;
     drop(run_discovery_to_completion(&reg, &config).await);
@@ -602,11 +637,8 @@ async fn local_alias_never_reaches_external_backend() {
 async fn aliases_listed_in_v1_models_and_api_tags() {
     let b1 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
 
-    let mut config = Config::from_backends(vec![Backend::for_test("p1", &b1.url)]);
-    let (_dir, path) = write_aliases_file("ali = p1/m:latest\n");
-    config.aliases_file = Some(path);
-
-    let reg = registry::new_shared(&config);
+    let (_dir, config, reg) =
+        policy_setup(&[("p1", &b1.url)], &alias_toml("ali", &["p1/m:latest"]));
     let state = app_state(&reg);
     let base = spawn_router(state.clone()).await;
     drop(run_discovery_to_completion(&reg, &config).await);
@@ -680,16 +712,15 @@ async fn aliases_listed_in_v1_models_and_api_tags() {
 async fn concrete_models_and_fallbacks_route_unchanged_alongside_aliases() {
     let b1 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
 
-    let mut config = Config::from_backends(vec![Backend::for_test("p1", &b1.url)]);
-    let (_adir, apath) = write_aliases_file("ali = p1/m:latest\n");
-    config.aliases_file = Some(apath);
-    // Fallback map for a non-alias name: still works.
-    let fdir = tempfile::tempdir().unwrap();
-    let fpath = fdir.path().join("fallbacks");
-    std::fs::write(&fpath, "ghost=m:latest\n").unwrap();
-    config.fallback_file = Some(fpath.to_str().unwrap().to_string());
-
-    let reg = registry::new_shared(&config);
+    // Fallback map for a non-alias name: still works, and now lives in the
+    // same document as the alias it sits beside.
+    let (_dir, config, reg) = policy_setup(
+        &[("p1", &b1.url)],
+        &format!(
+            "[fallbacks]\n\"ghost\" = \"m:latest\"\n{}",
+            alias_toml("ali", &["p1/m:latest"])
+        ),
+    );
     let state = app_state(&reg);
     let base = spawn_router(state.clone()).await;
     drop(run_discovery_to_completion(&reg, &config).await);
@@ -726,14 +757,10 @@ async fn alias_chain_advances_on_auth_error() {
     let b1 = start_counting_backend(vec!["m:latest"], StatusCode::UNAUTHORIZED).await;
     let b2 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
 
-    let mut config = Config::from_backends(vec![
-        Backend::for_test("p1", &b1.url),
-        Backend::for_test("p2", &b2.url),
-    ]);
-    let (_dir, path) = write_aliases_file("ali = p1/m:latest | p2/m:latest\n");
-    config.aliases_file = Some(path);
-
-    let reg = registry::new_shared(&config);
+    let (_dir, config, reg) = policy_setup(
+        &[("p1", &b1.url), ("p2", &b2.url)],
+        &alias_toml("ali", &["p1/m:latest", "p2/m:latest"]),
+    );
     let state = app_state(&reg);
     let base = spawn_router(state.clone()).await;
     drop(run_discovery_to_completion(&reg, &config).await);
@@ -761,14 +788,10 @@ async fn alias_chain_skips_llama_swap_missing_model_without_send() {
     let swap = start_counting_backend(vec!["other:latest"], StatusCode::OK).await;
     let b2 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
 
-    let mut config = Config::from_backends(vec![
-        Backend::for_test("llama-swap", &swap.url),
-        Backend::for_test("p2", &b2.url),
-    ]);
-    let (_dir, path) = write_aliases_file("ali = llama-swap/m:latest | p2/m:latest\n");
-    config.aliases_file = Some(path);
-
-    let reg = registry::new_shared(&config);
+    let (_dir, config, reg) = policy_setup(
+        &[("llama-swap", &swap.url), ("p2", &b2.url)],
+        &alias_toml("ali", &["llama-swap/m:latest", "p2/m:latest"]),
+    );
     let state = app_state(&reg);
     let base = spawn_router(state.clone()).await;
     drop(run_discovery_to_completion(&reg, &config).await);
@@ -795,11 +818,8 @@ async fn alias_resolves_latest_normalized_name() {
     // in metric labels.
     let b1 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
 
-    let mut config = Config::from_backends(vec![Backend::for_test("p1", &b1.url)]);
-    let (_dir, path) = write_aliases_file("ali = p1/m:latest\n");
-    config.aliases_file = Some(path);
-
-    let reg = registry::new_shared(&config);
+    let (_dir, config, reg) =
+        policy_setup(&[("p1", &b1.url)], &alias_toml("ali", &["p1/m:latest"]));
     let state = app_state(&reg);
     let base = spawn_router(state.clone()).await;
     drop(run_discovery_to_completion(&reg, &config).await);
@@ -818,15 +838,13 @@ async fn fallback_to_alias_stand_in_enters_chain() {
     // dropped as "target not in registry".
     let b1 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
 
-    let mut config = Config::from_backends(vec![Backend::for_test("p1", &b1.url)]);
-    let (_adir, apath) = write_aliases_file("ali = p1/m:latest\n");
-    config.aliases_file = Some(apath);
-    let fdir = tempfile::tempdir().unwrap();
-    let fpath = fdir.path().join("fallbacks");
-    std::fs::write(&fpath, "ghost=ali\n").unwrap();
-    config.fallback_file = Some(fpath.to_str().unwrap().to_string());
-
-    let reg = registry::new_shared(&config);
+    let (_dir, config, reg) = policy_setup(
+        &[("p1", &b1.url)],
+        &format!(
+            "[fallbacks]\n\"ghost\" = \"ali\"\n{}",
+            alias_toml("ali", &["p1/m:latest"])
+        ),
+    );
     let state = app_state(&reg);
     let base = spawn_router(state.clone()).await;
     drop(run_discovery_to_completion(&reg, &config).await);
@@ -869,11 +887,7 @@ async fn alias_attempts_all_candidates_when_none_reachable() {
         }));
     let url = spawn_test_server(app).await;
 
-    let mut config = Config::from_backends(vec![Backend::for_test("p1", &url)]);
-    let (_dir, path) = write_aliases_file("ali = p1/m:latest\n");
-    config.aliases_file = Some(path);
-
-    let reg = registry::new_shared(&config);
+    let (_dir, config, reg) = policy_setup(&[("p1", &url)], &alias_toml("ali", &["p1/m:latest"]));
     let state = app_state(&reg);
     let base = spawn_router(state.clone()).await;
     drop(run_discovery_to_completion(&reg, &config).await);

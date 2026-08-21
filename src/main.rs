@@ -12,6 +12,7 @@ use tracing::info;
 use ollama_router::handler::{self, AppState};
 use ollama_router::heartbeat::HeartbeatConfig;
 use ollama_router::metrics::Metrics;
+use ollama_router::policy::FileConfig;
 use ollama_router::registry;
 use ollama_router::routes::ROUTED_PATHS;
 use ollama_router::{auth::TokenStore, config::Config};
@@ -44,9 +45,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let config = Config::from_env()?;
+    // Fatal on a bad policy file. With `maxUnavailable: 0` the previous pod
+    // keeps serving, so a rejected config stalls the rollout instead of
+    // breaking production.
+    let policy = FileConfig::load(&config.config_path)?;
 
     info!(
-        backends = config.backends.len(),
+        config = %config.config_path,
+        backends = policy.backends.len(),
         discovery_interval = config.discovery_interval_secs,
         connect_timeout = config.connect_timeout_secs,
         request_timeout = config.request_timeout_secs,
@@ -58,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "starting ollama-router"
     );
 
-    let registry = registry::new_shared(&config);
+    let registry = registry::new_shared(policy);
     let metrics = Arc::new(Metrics::new());
     metrics.start_time_seconds.set(
         SystemTime::now()
@@ -111,8 +117,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::spawn({
         let registry = Arc::clone(&registry);
+        let metrics = Arc::clone(&metrics);
         let config = config.clone();
-        async move { registry::discovery_loop(registry, config).await }
+        async move { registry::discovery_loop(registry, config, metrics).await }
     });
 
     // One shutdown notify shared by both servers and the background tasks. A

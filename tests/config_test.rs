@@ -9,10 +9,11 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 // not thread-safe. Each test holds ENV_LOCK to serialize access.
 unsafe fn clear_env() {
     for key in [
-        "OLLAMA_ROUTER_BACKENDS",
+        "OLLAMA_ROUTER_CONFIG",
         "OLLAMA_ROUTER_DISCOVERY_INTERVAL",
         "OLLAMA_ROUTER_GRACE_MULTIPLIER",
         "OLLAMA_ROUTER_TOKENS_FILE",
+        "OLLAMA_ROUTER_EXTRA_CA_FILE",
         "OLLAMA_ROUTER_PUBLIC_PORT",
         "OLLAMA_ROUTER_INTERNAL_PORT",
         "OLLAMA_ROUTER_CONNECT_TIMEOUT",
@@ -32,8 +33,6 @@ unsafe fn clear_env() {
         "OLLAMA_ROUTER_CACHE_MAX_BYTES",
         "OLLAMA_ROUTER_CACHE_MAX_ENTRY_BYTES",
         "OLLAMA_ROUTER_CACHE_TTL",
-        "OLLAMA_ROUTER_ALIASES_FILE",
-        "OLLAMA_ROUTER_EXTERNAL_BACKENDS",
     ] {
         unsafe { env::remove_var(key) };
     }
@@ -61,11 +60,17 @@ unsafe fn inject_vars(vars: &[(&str, &str)]) {
     }
 }
 
+/// A placeholder policy-file path. `Config::from_env` only records the
+/// path — loading and validating the document is `policy::FileConfig`'s job
+/// and is covered by its own tests — so it never has to exist.
+const CONFIG_PATH: &str = "/etc/ollama-router/router.toml";
+
 /// Set the given env vars, call `Config::from_env`, and return the parsed config.
 /// Runs inside `with_clean_env` so the environment is pristine.
 fn parse_with_vars(vars: &[(&str, &str)]) -> Config {
     let mut result = None;
     with_clean_env(|| {
+        unsafe { env::set_var("OLLAMA_ROUTER_CONFIG", CONFIG_PATH) };
         unsafe { inject_vars(vars) };
         result = Some(Config::from_env().unwrap());
     });
@@ -76,6 +81,7 @@ fn parse_with_vars(vars: &[(&str, &str)]) -> Config {
 /// an error message containing `expected_substring`.
 fn assert_env_parse_error(vars: &[(&str, &str)], expected_substring: &str) {
     with_clean_env(|| {
+        unsafe { env::set_var("OLLAMA_ROUTER_CONFIG", CONFIG_PATH) };
         unsafe { inject_vars(vars) };
         let err = Config::from_env().unwrap_err();
         assert!(
@@ -130,9 +136,7 @@ fn escalation_zero_threshold_fails() {
 #[test]
 fn defaults_are_sane() {
     let config = parse_with_vars(&[]);
-    assert_eq!(config.backends.len(), 1);
-    assert_eq!(config.backends[0].name, "ollama");
-    assert_eq!(config.backends[0].url, "http://localhost:11434");
+    assert_eq!(config.config_path, CONFIG_PATH);
     assert_eq!(config.discovery_interval_secs, 60);
     assert_eq!(config.grace_period_secs(), 180);
     assert!(config.tokens_file.is_none());
@@ -204,10 +208,12 @@ fn cache_knobs_parsed_from_env() {
 fn cache_enabled_accepts_bool_spellings() {
     with_clean_env(|| {
         for truthy in ["1", "on", "YES", "True"] {
+            unsafe { env::set_var("OLLAMA_ROUTER_CONFIG", CONFIG_PATH) };
             unsafe { env::set_var("OLLAMA_ROUTER_CACHE_ENABLED", truthy) };
             assert!(Config::from_env().unwrap().cache_enabled, "{truthy}");
         }
         for falsy in ["0", "off", "NO", "False"] {
+            unsafe { env::set_var("OLLAMA_ROUTER_CONFIG", CONFIG_PATH) };
             unsafe { env::set_var("OLLAMA_ROUTER_CACHE_ENABLED", falsy) };
             assert!(!Config::from_env().unwrap().cache_enabled, "{falsy}");
         }
@@ -288,38 +294,6 @@ fn cache_entry_cap_above_total_fails() {
 }
 
 #[test]
-fn custom_backends_parsed() {
-    let config = parse_with_vars(&[("OLLAMA_ROUTER_BACKENDS", "a=http://a:1234,b=http://b:5678")]);
-    assert_eq!(config.backends.len(), 2);
-    assert_eq!(config.backends[0].name, "a");
-    assert_eq!(config.backends[0].url, "http://a:1234");
-    assert_eq!(config.backends[1].name, "b");
-    assert_eq!(config.backends[1].url, "http://b:5678");
-}
-
-#[test]
-fn trailing_slash_stripped() {
-    let config = parse_with_vars(&[("OLLAMA_ROUTER_BACKENDS", "x=http://host:1234/")]);
-    assert_eq!(config.backends[0].url, "http://host:1234");
-}
-
-#[test]
-fn empty_backends_fails() {
-    with_clean_env(|| {
-        unsafe { env::set_var("OLLAMA_ROUTER_BACKENDS", "") };
-        assert!(Config::from_env().is_err());
-    });
-}
-
-#[test]
-fn malformed_backend_entry_fails() {
-    assert_env_parse_error(
-        &[("OLLAMA_ROUTER_BACKENDS", "no-equals-sign")],
-        "expected name=url",
-    );
-}
-
-#[test]
 fn custom_discovery_interval() {
     let config = parse_with_vars(&[("OLLAMA_ROUTER_DISCOVERY_INTERVAL", "30")]);
     assert_eq!(config.discovery_interval_secs, 30);
@@ -350,63 +324,25 @@ fn tokens_file_set_from_env() {
     assert_eq!(config.tokens_file.as_deref(), Some("/config/tokens"));
 }
 
-// ── alias / external-backend env wiring ─────────────────────────────────────
+// ── the policy-file path ────────────────────────────────────────────────────
 
-/// Write `content` to a temp aliases file and return (dir, path). The dir
-/// keeps the file alive for the test scope.
-fn aliases_file_with(content: &str) -> (tempfile::TempDir, String) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("aliases");
-    std::fs::write(&path, content).unwrap();
-    let path = path.to_str().unwrap().to_string();
-    (dir, path)
+#[test]
+fn config_path_is_required() {
+    // No default: the backend roster and the spend boundary both live in
+    // the policy file, so a router without one has nothing to route to.
+    with_clean_env(|| {
+        let err = Config::from_env().unwrap_err();
+        assert!(
+            err.to_string().contains("OLLAMA_ROUTER_CONFIG must be set"),
+            "{err}"
+        );
+    });
 }
 
 #[test]
-fn aliases_file_validated_at_startup() {
-    let (_dir, path) = aliases_file_with(
-        "fast = swap/qwen3.6:latest | nous/Hermes-4-405B\nlocal secret = swap/qwen3.6:latest\n",
-    );
-    let config = parse_with_vars(&[
-        ("OLLAMA_ROUTER_BACKENDS", "swap=http://s:1,nous=http://n:2"),
-        ("OLLAMA_ROUTER_EXTERNAL_BACKENDS", "nous"),
-        ("OLLAMA_ROUTER_ALIASES_FILE", &path),
-    ]);
-    assert_eq!(config.aliases_file.as_deref(), Some(path.as_str()));
-    assert!(config.external_backends.contains("nous"));
-    assert!(!config.external_backends.contains("swap"));
-}
-
-#[test]
-fn local_alias_with_external_backend_fails_at_startup() {
-    let (_dir, path) = aliases_file_with("local secret = nous/Hermes-4-405B\n");
-    assert_env_parse_error(
-        &[
-            ("OLLAMA_ROUTER_BACKENDS", "swap=http://s:1,nous=http://n:2"),
-            ("OLLAMA_ROUTER_EXTERNAL_BACKENDS", "nous"),
-            ("OLLAMA_ROUTER_ALIASES_FILE", &path),
-        ],
-        "marked local",
-    );
-}
-
-#[test]
-fn external_backends_naming_unknown_backend_fails() {
-    // Privacy-critical typo check: a misspelled external backend would
-    // silently stop guarding `local` aliases against the real one.
-    assert_env_parse_error(
-        &[
-            ("OLLAMA_ROUTER_BACKENDS", "swap=http://s:1,nous=http://n:2"),
-            ("OLLAMA_ROUTER_EXTERNAL_BACKENDS", "nuos"),
-        ],
-        "not in OLLAMA_ROUTER_BACKENDS",
-    );
-}
-
-#[test]
-fn unreadable_aliases_file_fails_at_startup() {
-    assert_env_parse_error(
-        &[("OLLAMA_ROUTER_ALIASES_FILE", "/nonexistent/aliases")],
-        "could not read",
-    );
+fn empty_config_path_is_rejected_like_an_absent_one() {
+    with_clean_env(|| {
+        unsafe { env::set_var("OLLAMA_ROUTER_CONFIG", "   ") };
+        assert!(Config::from_env().is_err());
+    });
 }

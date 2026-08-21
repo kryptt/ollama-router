@@ -61,8 +61,15 @@ pub struct Metrics {
     pub backends_reachable: Gauge,
     /// Backends currently healthy (strictly up). Refreshed on scrape.
     pub backends_healthy: Gauge,
-    /// Per-backend up/down (1/0). Refreshed on scrape.
+    /// Per-backend up/down (1/0). Refreshed on scrape. Series for backends
+    /// removed by a config reload are dropped via `Family::remove` — a
+    /// gauge left behind freezes at its last value and keeps claiming a
+    /// deleted backend is up.
     pub backend_up: Family<BackendLabels, Gauge>,
+    /// Policy-file (`router.toml`) reload outcomes: `applied` | `rejected`.
+    /// A rejected reload keeps the previous config and is otherwise silent,
+    /// so this counter is the only signal that an edit never landed.
+    pub config_reloads: Family<ConfigReloadLabels, Counter>,
 
     /// Transport-level upstream failures by kind (connect / timeout /
     /// transport) — i.e. cases where no response was obtained at all. Upstream
@@ -193,6 +200,13 @@ impl Metrics {
             backend_up.clone(),
         );
 
+        let config_reloads = Family::default();
+        registry.register(
+            "ollama_router_config_reloads",
+            "router.toml reload outcomes (applied / rejected)",
+            config_reloads.clone(),
+        );
+
         let upstream_errors = Family::default();
         registry.register(
             "ollama_router_upstream_errors",
@@ -223,6 +237,7 @@ impl Metrics {
             backends_reachable,
             backends_healthy,
             backend_up,
+            config_reloads,
             upstream_errors,
             heartbeat_engaged,
             registry,
@@ -286,6 +301,11 @@ pub struct ChainLabels {
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct BackendLabels {
     pub backend: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ConfigReloadLabels {
+    pub result: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]

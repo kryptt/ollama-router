@@ -1,30 +1,6 @@
-use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt;
 use std::net::SocketAddr;
-
-/// A named backend with its base URL.
-/// Invariant: `name` is non-empty, `url` has no trailing slash.
-#[derive(Debug, Clone)]
-pub struct Backend {
-    pub name: String,
-    pub url: String,
-    /// Optional discovery allowlist. `None` = publish every model the backend
-    /// advertises (the behaviour for every local backend). `Some(set)` = keep
-    /// only these model names.
-    ///
-    /// This exists for hosted aggregators: Nous Portal advertises ~350 models,
-    /// and publishing all of them would bury the local models in every
-    /// consumer's picker *and* let anything that reaches the router spend
-    /// portal credits on a frontier model. An allowlist is the only thing
-    /// bounding that blast radius — see `OLLAMA_ROUTER_MODEL_ALLOW`.
-    pub allow_models: Option<HashSet<String>>,
-    /// Drop the client's `authorization` header before forwarding to this
-    /// backend. For backends whose credential is injected by an egress proxy:
-    /// our inbound token is not a backend credential, and sending it to a
-    /// third party is both useless and a leak. See `OLLAMA_ROUTER_STRIP_AUTH`.
-    pub strip_auth: bool,
-}
 
 /// A "if a request for `from_model` looks bigger than this model's
 /// per-slot context, transparently rewrite it to `to_model`" rule.
@@ -60,284 +36,8 @@ impl EscalationRule {
     }
 }
 
-impl Backend {
-    /// Parse a `name=url` pair. Rejects empty names or URLs.
-    fn parse(entry: &str) -> Result<Self, ConfigError> {
-        let (name, url) = entry
-            .split_once('=')
-            .ok_or_else(|| ConfigError::InvalidBackend(entry.to_string()))?;
-
-        if name.is_empty() || url.is_empty() {
-            return Err(ConfigError::InvalidBackend(entry.to_string()));
-        }
-
-        Ok(Backend {
-            name: name.to_string(),
-            url: url.trim_end_matches('/').to_string(),
-            allow_models: None,
-            strip_auth: false,
-        })
-    }
-
-    /// Construct a backend directly (bypassing env parsing). For tests.
-    pub fn for_test(name: &str, url: &str) -> Self {
-        Backend {
-            name: name.to_string(),
-            url: url.to_string(),
-            allow_models: None,
-            strip_auth: false,
-        }
-    }
-}
-
-/// Strip `#`-to-end-of-line comments and rejoin lines with commas, so file
-/// contents (one entry per line, comments allowed) parse with the same
-/// grammar as the comma-separated env values.
-fn strip_comments(raw: &str) -> String {
-    raw.lines()
-        .map(|l| l.split('#').next().unwrap_or(""))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// Parse `OLLAMA_ROUTER_MODEL_ALLOW` into a per-backend allowlist.
-///
-/// Format: `backend=model1|model2,other=model3`. Newlines work like commas
-/// and `#` starts a comment, so the same grammar serves both the env value
-/// and `OLLAMA_ROUTER_MODEL_ALLOW_FILE` contents. Backends absent from the
-/// variable are left unfiltered, so this is purely additive — an empty or
-/// unset variable reproduces the previous behaviour exactly.
-///
-/// An entry with a name but no models (`nous=`) is rejected rather than
-/// treated as "allow nothing": silently publishing zero models from a
-/// backend is indistinguishable from the backend being down.
-fn parse_model_allow(raw: &str) -> Result<HashMap<String, HashSet<String>>, ConfigError> {
-    let raw = strip_comments(raw);
-    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
-
-    for entry in raw.split(',').filter(|e| !e.trim().is_empty()) {
-        let entry = entry.trim();
-        let (name, models) = entry
-            .split_once('=')
-            .ok_or_else(|| ConfigError::InvalidModelAllow(entry.to_string()))?;
-
-        let name = name.trim();
-        let models: HashSet<String> = models
-            .split('|')
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-            .map(str::to_string)
-            .collect();
-
-        if name.is_empty() || models.is_empty() {
-            return Err(ConfigError::InvalidModelAllow(entry.to_string()));
-        }
-
-        out.entry(name.to_string()).or_default().extend(models);
-    }
-
-    Ok(out)
-}
-
-/// Load and parse an allowlist file (`OLLAMA_ROUTER_MODEL_ALLOW_FILE`).
-/// Same grammar as the env value, plus newlines-as-commas and `#` comments.
-pub fn load_model_allow_file(path: &str) -> Result<HashMap<String, HashSet<String>>, ConfigError> {
-    let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::Invalid {
-        key: "OLLAMA_ROUTER_MODEL_ALLOW_FILE",
-        reason: format!("could not read '{path}': {e}"),
-    })?;
-    parse_model_allow(&raw)
-}
-
-/// Apply a parsed allowlist to the backend list. Every backend named in
-/// `allow` must exist; an unknown name is always a typo, and a silent one:
-/// the operator believes a backend is being filtered when it is publishing
-/// its full catalogue. Nothing is applied on error, so a bad reload keeps
-/// the previous cycle's filters intact.
-pub fn apply_model_allow(
-    backends: &mut [Backend],
-    mut allow: HashMap<String, HashSet<String>>,
-) -> Result<(), String> {
-    if let Some(unknown) = allow
-        .keys()
-        .find(|name| !backends.iter().any(|b| b.name == **name))
-    {
-        return Err(unknown.clone());
-    }
-    for backend in backends {
-        backend.allow_models = allow.remove(&backend.name);
-    }
-    Ok(())
-}
-
-/// Parse a fallback map (`OLLAMA_ROUTER_FALLBACK_FILE` contents): one
-/// `local-model=stand-in-model` pair per line, `#` comments allowed.
-///
-/// The map is consulted only when no reachable backend serves the requested
-/// model; the stand-in must itself be published (allowlisted) or the hop is
-/// skipped. Duplicate keys are rejected — last-wins would hide the typo.
-pub fn parse_fallbacks(raw: &str) -> Result<HashMap<String, String>, ConfigError> {
-    let mut out = HashMap::new();
-    for line in raw.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        let err = || ConfigError::InvalidFallback(line.to_string());
-        let (from, to) = line.split_once('=').ok_or_else(err)?;
-        let (from, to) = (from.trim(), to.trim());
-        if from.is_empty() || to.is_empty() || from == to {
-            return Err(err());
-        }
-        if out.insert(from.to_string(), to.to_string()).is_some() {
-            return Err(ConfigError::Invalid {
-                key: "OLLAMA_ROUTER_FALLBACK_FILE",
-                reason: format!("duplicate fallback entry for '{from}'"),
-            });
-        }
-    }
-    Ok(out)
-}
-
-/// Load and parse a fallback file. See [`parse_fallbacks`].
-pub fn load_fallbacks_file(path: &str) -> Result<HashMap<String, String>, ConfigError> {
-    let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::Invalid {
-        key: "OLLAMA_ROUTER_FALLBACK_FILE",
-        reason: format!("could not read '{path}': {e}"),
-    })?;
-    parse_fallbacks(&raw)
-}
-
-/// One `backend/model` candidate in an alias chain.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AliasCandidate {
-    pub backend: String,
-    pub model: String,
-}
-
-/// A named priority chain of concrete `backend/model` candidates
-/// (`OLLAMA_ROUTER_ALIASES_FILE`). Requests for the alias name walk the
-/// chain in order and commit to the first candidate that answers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Alias {
-    /// Privacy pin: a `local` alias is rejected at parse time if any
-    /// candidate's backend is named in `OLLAMA_ROUTER_EXTERNAL_BACKENDS`,
-    /// so by construction its traffic can never leave the local backends.
-    pub local_only: bool,
-    /// Invariant: non-empty, every candidate's backend is a configured
-    /// backend name.
-    pub candidates: Vec<AliasCandidate>,
-}
-
-const ALIASES_KEY: &str = "OLLAMA_ROUTER_ALIASES_FILE";
-
-/// Parse an alias file (`OLLAMA_ROUTER_ALIASES_FILE` contents). One alias
-/// per line, `#` comments allowed:
-///
-/// ```text
-/// [local] <alias> = <backend>/<model> | <backend>/<model> | ...
-/// ```
-///
-/// The candidate splits on the FIRST `/` only — model ids routinely contain
-/// `/` and `:` themselves (`freellmapi/groq/llama-3.3-70b` is backend
-/// `freellmapi`, model `groq/llama-3.3-70b`).
-///
-/// Rejected outright (a typo here silently misroutes or, worse for `local`
-/// aliases, un-pins privacy): unknown backend names, duplicate aliases,
-/// empty chains, an alias named `local`, and a `local` alias whose chain
-/// contains an external backend.
-pub fn parse_aliases(
-    raw: &str,
-    backends: &[Backend],
-    external: &HashSet<String>,
-) -> Result<HashMap<String, Alias>, ConfigError> {
-    let invalid = |reason: String| ConfigError::Invalid {
-        key: ALIASES_KEY,
-        reason,
-    };
-    let mut out = HashMap::new();
-    for line in raw.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        let err = || ConfigError::InvalidAlias(line.to_string());
-        let (lhs, rhs) = line.split_once('=').ok_or_else(err)?;
-
-        // The `local` keyword is whitespace-separated from the alias name;
-        // anything other than `[local] name` on the left side is a typo.
-        let mut tokens = lhs.split_whitespace();
-        let (local_only, name) = match (tokens.next(), tokens.next(), tokens.next()) {
-            (Some("local"), Some(name), None) => (true, name),
-            (Some(name), None, None) => (false, name),
-            _ => return Err(err()),
-        };
-        if name == "local" {
-            return Err(invalid(format!(
-                "alias may not be named 'local' (reserved keyword): '{line}'"
-            )));
-        }
-
-        let candidates = rhs
-            .split('|')
-            .map(|entry| {
-                let entry = entry.trim();
-                let (backend, model) = entry.split_once('/').ok_or_else(err)?;
-                let (backend, model) = (backend.trim(), model.trim());
-                if backend.is_empty() || model.is_empty() {
-                    return Err(err());
-                }
-                if !backends.iter().any(|b| b.name == backend) {
-                    return Err(invalid(format!(
-                        "alias '{name}' names backend '{backend}', which is not in OLLAMA_ROUTER_BACKENDS"
-                    )));
-                }
-                Ok(AliasCandidate {
-                    backend: backend.to_string(),
-                    model: model.to_string(),
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if candidates.is_empty() {
-            return Err(err());
-        }
-        if local_only && let Some(c) = candidates.iter().find(|c| external.contains(&c.backend)) {
-            return Err(invalid(format!(
-                "alias '{name}' is marked local but candidate backend '{}' is in OLLAMA_ROUTER_EXTERNAL_BACKENDS",
-                c.backend
-            )));
-        }
-        if out
-            .insert(
-                name.to_string(),
-                Alias {
-                    local_only,
-                    candidates,
-                },
-            )
-            .is_some()
-        {
-            return Err(invalid(format!("duplicate alias entry for '{name}'")));
-        }
-    }
-    Ok(out)
-}
-
-/// Load and parse an alias file. See [`parse_aliases`].
-pub fn load_aliases_file(
-    path: &str,
-    backends: &[Backend],
-    external: &HashSet<String>,
-) -> Result<HashMap<String, Alias>, ConfigError> {
-    let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::Invalid {
-        key: ALIASES_KEY,
-        reason: format!("could not read '{path}': {e}"),
-    })?;
-    parse_aliases(&raw, backends, external)
-}
-
 // Default values, shared between `from_env` (as the parse fallbacks) and the
-// `Default` impl (used by `from_backends`) so the two construction paths can
+// `Default` impl (which tests build on) so the two construction paths can
 // never silently drift apart.
 const DEFAULT_DISCOVERY_INTERVAL_SECS: u64 = 60;
 const DEFAULT_GRACE_MULTIPLIER: u64 = 3;
@@ -364,7 +64,13 @@ const DEFAULT_CACHE_TTL_SECS: u64 = 3600;
 /// All parsing happens in `from_env`; once constructed, every field is valid.
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub backends: Vec<Backend>,
+    /// Path to the `router.toml` policy file (`OLLAMA_ROUTER_CONFIG`).
+    /// Required, no default: the backend roster and the spend boundary both
+    /// live in it, so a router with no policy file has nothing to route to
+    /// and nothing bounding what it would spend.
+    ///
+    /// The path itself is restart-scoped; everything *in* the file is live.
+    pub config_path: String,
     pub discovery_interval_secs: u64,
     pub grace_multiplier: u64,
     pub tokens_file: Option<String>,
@@ -386,20 +92,12 @@ pub struct Config {
     /// before giving up and emitting an in-band error.
     pub loading_max_wait_secs: u64,
     /// Per-model escalation rules. Empty = no escalation (default).
+    ///
+    /// Restart-scoped like every other env knob. Making these live would
+    /// mean moving them into `Registry` and taking a lock on the hot path —
+    /// a bigger diff than the whole policy-file migration, for a feature
+    /// that is unset in production.
     pub escalation_rules: Vec<EscalationRule>,
-    /// Path to an allowlist file, re-read every discovery cycle so a mounted
-    /// ConfigMap edit lands without a restart. Mutually exclusive with
-    /// `OLLAMA_ROUTER_MODEL_ALLOW`.
-    pub model_allow_file: Option<String>,
-    /// Path to a `local-model=stand-in` fallback map, re-read every discovery
-    /// cycle. Consulted when no reachable backend serves a requested model.
-    pub fallback_file: Option<String>,
-    /// Path to an alias/priority-chain file, re-read every discovery cycle.
-    /// Each alias names an ordered chain of `backend/model` candidates.
-    pub aliases_file: Option<String>,
-    /// Backend names considered "external" (hosted, off-LAN). A `local`
-    /// alias whose chain names one of these is rejected at parse time.
-    pub external_backends: HashSet<String>,
 
     // --- Resilience: bounded retry-with-backoff (Unit 3) ---
     /// Maximum retry attempts after the first try for a transient failure.
@@ -438,11 +136,12 @@ pub struct Config {
 }
 
 impl Default for Config {
-    /// Defaults with no backends and loopback addresses. `from_env` overrides
-    /// every field from the environment; `from_backends` overrides `backends`.
+    /// Defaults with loopback addresses and no policy-file path. `from_env`
+    /// overrides every field from the environment; tests that only need the
+    /// restart-scoped knobs use this directly.
     fn default() -> Self {
         Config {
-            backends: Vec::new(),
+            config_path: String::new(),
             discovery_interval_secs: DEFAULT_DISCOVERY_INTERVAL_SECS,
             grace_multiplier: DEFAULT_GRACE_MULTIPLIER,
             tokens_file: None,
@@ -455,10 +154,6 @@ impl Default for Config {
             preflight_timeout_secs: DEFAULT_PREFLIGHT_TIMEOUT_SECS,
             loading_max_wait_secs: DEFAULT_LOADING_MAX_WAIT_SECS,
             escalation_rules: Vec::new(),
-            model_allow_file: None,
-            fallback_file: None,
-            aliases_file: None,
-            external_backends: HashSet::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_backoff_base_ms: DEFAULT_RETRY_BACKOFF_BASE_MS,
             retry_jitter_pct: DEFAULT_RETRY_JITTER_PCT,
@@ -476,96 +171,14 @@ impl Default for Config {
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let backends_str = env::var("OLLAMA_ROUTER_BACKENDS")
-            .unwrap_or_else(|_| "ollama=http://localhost:11434".to_string());
-
-        let mut backends: Vec<Backend> = backends_str
-            .split(',')
-            .map(|e| Backend::parse(e.trim()))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        if backends.is_empty() {
-            return Err(ConfigError::NoBackends);
-        }
-
-        let model_allow_file = env::var("OLLAMA_ROUTER_MODEL_ALLOW_FILE")
+        // The policy file is the router's entire routing surface — backends,
+        // spend boundary, aliases, fallbacks — so there is deliberately no
+        // default path to fall back to. Starting without one would mean
+        // starting with no backends.
+        let config_path = env::var("OLLAMA_ROUTER_CONFIG")
             .ok()
-            .filter(|s| !s.trim().is_empty());
-        let model_allow_env = env::var("OLLAMA_ROUTER_MODEL_ALLOW")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
-        // Two sources for the same filter would make "which one is live?"
-        // a runtime question. Refuse the ambiguity at startup.
-        if model_allow_file.is_some() && model_allow_env.is_some() {
-            return Err(ConfigError::Invalid {
-                key: "OLLAMA_ROUTER_MODEL_ALLOW_FILE",
-                reason: "mutually exclusive with OLLAMA_ROUTER_MODEL_ALLOW; set only one"
-                    .to_string(),
-            });
-        }
-        let model_allow = match (&model_allow_file, &model_allow_env) {
-            // Fail fast on an unreadable/unparseable file even though the
-            // discovery loop re-reads it — a typo'd path would otherwise run
-            // unfiltered until someone reads the logs.
-            (Some(path), _) => load_model_allow_file(path)?,
-            (_, Some(s)) => parse_model_allow(s)?,
-            _ => HashMap::new(),
-        };
-        let strip_auth: HashSet<String> = env::var("OLLAMA_ROUTER_STRIP_AUTH")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
-            .map(str::to_string)
-            .collect();
-
-        for backend in &mut backends {
-            backend.strip_auth = strip_auth.contains(&backend.name);
-        }
-        apply_model_allow(&mut backends, model_allow).map_err(|unknown| ConfigError::Invalid {
-            key: "OLLAMA_ROUTER_MODEL_ALLOW",
-            reason: format!("names backend '{unknown}', which is not in OLLAMA_ROUTER_BACKENDS"),
-        })?;
-
-        let fallback_file = env::var("OLLAMA_ROUTER_FALLBACK_FILE")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
-        if let Some(path) = &fallback_file {
-            // Validate now, discard the value: the discovery loop loads it
-            // fresh on its first cycle (immediately at startup).
-            load_fallbacks_file(path)?;
-        }
-
-        let external_backends: HashSet<String> = env::var("OLLAMA_ROUTER_EXTERNAL_BACKENDS")
-            .unwrap_or_default()
-            .split(',')
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
-            .map(str::to_string)
-            .collect();
-        // An unknown name here is always a typo — and a dangerous one: a
-        // misspelled external backend would silently stop guarding `local`
-        // aliases against the real one.
-        if let Some(unknown) = external_backends
-            .iter()
-            .find(|n| !backends.iter().any(|b| b.name == **n))
-        {
-            return Err(ConfigError::Invalid {
-                key: "OLLAMA_ROUTER_EXTERNAL_BACKENDS",
-                reason: format!(
-                    "names backend '{unknown}', which is not in OLLAMA_ROUTER_BACKENDS"
-                ),
-            });
-        }
-
-        let aliases_file = env::var("OLLAMA_ROUTER_ALIASES_FILE")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
-        if let Some(path) = &aliases_file {
-            // Same startup fail-fast as the fallback file: validate now,
-            // discard; the discovery loop loads it fresh each cycle.
-            load_aliases_file(path, &backends, &external_backends)?;
-        }
+            .filter(|s| !s.trim().is_empty())
+            .ok_or(ConfigError::MissingConfigPath)?;
 
         let discovery_interval_secs = parse_env_u64(
             "OLLAMA_ROUTER_DISCOVERY_INTERVAL",
@@ -665,7 +278,7 @@ impl Config {
         }
 
         Ok(Config {
-            backends,
+            config_path,
             discovery_interval_secs,
             grace_multiplier,
             tokens_file,
@@ -678,10 +291,6 @@ impl Config {
             preflight_timeout_secs,
             loading_max_wait_secs,
             escalation_rules,
-            model_allow_file,
-            fallback_file,
-            aliases_file,
-            external_backends,
             max_retries,
             retry_backoff_base_ms,
             retry_jitter_pct,
@@ -732,20 +341,12 @@ impl Config {
         }
         Ok(builder)
     }
-
-    /// Construct a config from explicit backends with sensible defaults. For tests.
-    pub fn from_backends(backends: Vec<Backend>) -> Self {
-        Config {
-            backends,
-            ..Config::default()
-        }
-    }
 }
 
 #[derive(Debug)]
 pub enum ConfigError {
-    InvalidBackend(String),
-    NoBackends,
+    /// `OLLAMA_ROUTER_CONFIG` unset or empty.
+    MissingConfigPath,
     /// A value that should be a positive integer failed to parse as one.
     InvalidValue {
         key: &'static str,
@@ -762,21 +363,15 @@ pub enum ConfigError {
         reason: String,
     },
     InvalidEscalation(String),
-    InvalidModelAllow(String),
-    InvalidFallback(String),
-    InvalidAlias(String),
 }
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidBackend(entry) => {
-                write!(f, "invalid backend entry: '{entry}' (expected name=url)")
-            }
-            Self::NoBackends => {
+            Self::MissingConfigPath => {
                 write!(
                     f,
-                    "OLLAMA_ROUTER_BACKENDS must contain at least one backend"
+                    "OLLAMA_ROUTER_CONFIG must be set to the path of the router.toml policy file"
                 )
             }
             Self::InvalidValue { key, value } => {
@@ -795,24 +390,6 @@ impl fmt::Display for ConfigError {
                 write!(
                     f,
                     "invalid escalation rule: '{entry}' (expected from_model:max_input_tokens:to_model with positive integer threshold)"
-                )
-            }
-            Self::InvalidModelAllow(entry) => {
-                write!(
-                    f,
-                    "invalid model allowlist entry: '{entry}' (expected backend=model1|model2)"
-                )
-            }
-            Self::InvalidFallback(entry) => {
-                write!(
-                    f,
-                    "invalid fallback entry: '{entry}' (expected local-model=stand-in-model)"
-                )
-            }
-            Self::InvalidAlias(entry) => {
-                write!(
-                    f,
-                    "invalid alias entry: '{entry}' (expected [local] alias = backend/model | backend/model | ...)"
                 )
             }
         }
@@ -857,214 +434,4 @@ fn parse_env_bool(key: &'static str, default: bool) -> Result<bool, ConfigError>
             value: s.to_string(),
         }),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn allow(raw: &str) -> HashMap<String, HashSet<String>> {
-        parse_model_allow(raw).expect("expected a valid allowlist")
-    }
-
-    #[test]
-    fn allowlist_accepts_newlines_and_comments() {
-        let got = allow("# spend boundary\nnous=a/one|a/two\n\nnous=a/three # inline note\n");
-        assert_eq!(
-            got["nous"],
-            HashSet::from([
-                "a/one".to_string(),
-                "a/two".to_string(),
-                "a/three".to_string()
-            ])
-        );
-    }
-
-    #[test]
-    fn apply_model_allow_rejects_unknown_backend_without_applying() {
-        let mut backends = vec![Backend::for_test("nous", "http://n")];
-        backends[0].allow_models = Some(HashSet::from(["keep".to_string()]));
-        let bad = HashMap::from([("typo".to_string(), HashSet::from(["m".to_string()]))]);
-        assert_eq!(
-            apply_model_allow(&mut backends, bad),
-            Err("typo".to_string())
-        );
-        // Nothing applied: previous filter survives a bad reload.
-        assert_eq!(
-            backends[0].allow_models,
-            Some(HashSet::from(["keep".to_string()]))
-        );
-    }
-
-    #[test]
-    fn parses_fallback_map() {
-        let got = parse_fallbacks(
-            "# stand-ins\nqwen3.6-medium=qwen/qwen3.8-27b\ngemma4:26b = google/gemma-4-26b-a4b-it\n",
-        )
-        .expect("valid fallback map");
-        assert_eq!(got["qwen3.6-medium"], "qwen/qwen3.8-27b");
-        assert_eq!(got["gemma4:26b"], "google/gemma-4-26b-a4b-it");
-    }
-
-    #[test]
-    fn fallback_map_rejects_bad_entries() {
-        assert!(parse_fallbacks("no-equals-sign").is_err());
-        assert!(parse_fallbacks("a=").is_err());
-        assert!(parse_fallbacks("=b").is_err());
-        assert!(parse_fallbacks("a=a").is_err(), "self-mapping is a typo");
-        assert!(
-            parse_fallbacks("a=b\na=c").is_err(),
-            "duplicate keys are a typo; last-wins would hide it"
-        );
-        assert!(parse_fallbacks("").expect("empty ok").is_empty());
-    }
-
-    // ── alias grammar ────────────────────────────────────────────────────
-
-    /// Backend roster used by every alias test: two local, two external.
-    fn alias_backends() -> Vec<Backend> {
-        vec![
-            Backend::for_test("llama-swap", "http://l"),
-            Backend::for_test("rivoli", "http://r"),
-            Backend::for_test("nous", "http://n"),
-            Backend::for_test("freellmapi", "http://f"),
-        ]
-    }
-
-    fn externals() -> HashSet<String> {
-        HashSet::from(["nous".to_string(), "freellmapi".to_string()])
-    }
-
-    fn aliases(raw: &str) -> HashMap<String, Alias> {
-        parse_aliases(raw, &alias_backends(), &externals()).expect("expected a valid alias file")
-    }
-
-    #[track_caller]
-    fn assert_alias_error(raw: &str, expected_substring: &str) {
-        let err = parse_aliases(raw, &alias_backends(), &externals())
-            .expect_err("expected an alias parse error");
-        assert!(
-            err.to_string().contains(expected_substring),
-            "expected error containing {expected_substring:?}, got: {err}"
-        );
-    }
-
-    #[test]
-    fn parses_alias_chains_with_slashes_and_colons_in_model_ids() {
-        let got = aliases(
-            "# chains\n\
-             fast = llama-swap/qwen3.6:latest | freellmapi/groq/llama-3.3-70b | nous/Hermes-4-405B\n\
-             \n\
-             local secret = llama-swap/qwen3.6:latest | rivoli/glm-5.2 # stays on-LAN\n",
-        );
-        assert_eq!(got.len(), 2);
-
-        let fast = &got["fast"];
-        assert!(!fast.local_only);
-        assert_eq!(fast.candidates.len(), 3);
-        assert_eq!(fast.candidates[0].backend, "llama-swap");
-        assert_eq!(fast.candidates[0].model, "qwen3.6:latest");
-        // Split on the FIRST '/' only: the model id keeps its own slashes.
-        assert_eq!(fast.candidates[1].backend, "freellmapi");
-        assert_eq!(fast.candidates[1].model, "groq/llama-3.3-70b");
-        assert_eq!(fast.candidates[2].backend, "nous");
-        assert_eq!(fast.candidates[2].model, "Hermes-4-405B");
-
-        let secret = &got["secret"];
-        assert!(secret.local_only);
-        assert_eq!(secret.candidates.len(), 2);
-    }
-
-    #[test]
-    fn alias_rejects_local_alias_with_external_backend() {
-        assert_alias_error(
-            "local secret = llama-swap/qwen3.6:latest | nous/Hermes-4-405B",
-            "marked local but candidate backend 'nous'",
-        );
-    }
-
-    #[test]
-    fn alias_rejects_unknown_backend() {
-        assert_alias_error("fast = typo/qwen3.6:latest", "backend 'typo'");
-    }
-
-    #[test]
-    fn alias_rejects_duplicates() {
-        assert_alias_error(
-            "fast = llama-swap/a\nfast = rivoli/b",
-            "duplicate alias entry for 'fast'",
-        );
-    }
-
-    #[test]
-    fn alias_rejects_empty_chain() {
-        assert_alias_error("fast =", "invalid alias entry");
-        assert_alias_error("fast = |", "invalid alias entry");
-        assert_alias_error("fast = llama-swap/", "invalid alias entry");
-        assert_alias_error("fast = /model", "invalid alias entry");
-    }
-
-    #[test]
-    fn alias_rejects_name_local() {
-        // Both spellings that would produce an alias literally named
-        // `local`: the bare name, and the keyword doubled.
-        assert_alias_error("local = llama-swap/a", "may not be named 'local'");
-        assert_alias_error("local local = llama-swap/a", "may not be named 'local'");
-    }
-
-    #[test]
-    fn alias_rejects_malformed_left_side() {
-        assert_alias_error("no-equals-sign", "invalid alias entry");
-        assert_alias_error("a b = llama-swap/m", "invalid alias entry");
-        assert_alias_error("= llama-swap/m", "invalid alias entry");
-    }
-
-    #[test]
-    fn alias_tolerates_comments_and_whitespace() {
-        let got =
-            aliases("\n# header comment\n\n  fast   =   llama-swap/a:1  |  rivoli/b  # tail\n\n");
-        assert_eq!(got["fast"].candidates.len(), 2);
-        assert_eq!(got["fast"].candidates[0].model, "a:1");
-        assert_eq!(got["fast"].candidates[1].backend, "rivoli");
-        assert!(aliases("# only comments\n\n").is_empty());
-    }
-
-    #[test]
-    fn parses_backends_and_models() {
-        let got = allow("nous=a/one|a/two,local=b/three");
-        assert_eq!(got.len(), 2);
-        assert_eq!(
-            got["nous"],
-            HashSet::from(["a/one".to_string(), "a/two".to_string()])
-        );
-        assert_eq!(got["local"], HashSet::from(["b/three".to_string()]));
-    }
-
-    #[test]
-    fn tolerates_whitespace_and_empty_entries() {
-        let got = allow("  nous = a/one | a/two ,, ");
-        assert_eq!(
-            got["nous"],
-            HashSet::from(["a/one".to_string(), "a/two".to_string()])
-        );
-    }
-
-    #[test]
-    fn merges_repeated_backend_entries() {
-        let got = allow("nous=a/one,nous=a/two");
-        assert_eq!(
-            got["nous"],
-            HashSet::from(["a/one".to_string(), "a/two".to_string()])
-        );
-    }
-
-    #[test]
-    fn rejects_entries_that_would_silently_publish_nothing() {
-        // A backend with no models is indistinguishable at runtime from a
-        // backend that is down, so it must fail at startup instead.
-        assert!(parse_model_allow("nous=").is_err());
-        assert!(parse_model_allow("nous=|").is_err());
-        assert!(parse_model_allow("=a/one").is_err());
-        assert!(parse_model_allow("nous").is_err());
-    }
 }

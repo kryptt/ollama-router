@@ -1,13 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::config::{Alias, Config};
+use crate::config::Config;
+use crate::metrics::{BackendLabels, ConfigReloadLabels, Metrics};
+use crate::policy::{Alias, BackendSpec, FileConfig, Validated};
 
 /// Opaque index into the backends array. Not constructable outside this module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -24,7 +26,11 @@ pub enum BackendProtocol {
     OpenAi,
 }
 
-/// Per-backend mutable state, updated by the discovery loop.
+/// Per-backend state. Split in two by lifecycle: `name`/`url`/`strip_auth`/
+/// `allow_models` come from the policy file and are replaced wholesale on
+/// every reload, while `healthy`/`protocol`/`models`/`last_seen`/
+/// `grace_deadline` are *learned* by discovery and carried across a reload
+/// whenever the backend is recognisably the same server.
 #[derive(Debug)]
 struct BackendState {
     name: String,
@@ -35,9 +41,56 @@ struct BackendState {
     last_seen: Option<Instant>,
     grace_deadline: Option<Instant>,
     strip_auth: bool,
+    /// Discovery allowlist, owned by the backend itself rather than looked
+    /// up positionally in a parallel `Vec`. `None` = publish everything.
+    ///
+    /// This is where the two-Vec hazard died: pairing a filter with the
+    /// wrong backend is now unrepresentable, and for a metered backend that
+    /// pairing IS the spend boundary.
+    allow_models: Option<HashSet<String>>,
 }
 
 impl BackendState {
+    /// A backend with no learned state yet: unhealthy, protocol assumed
+    /// Ollama until a probe proves otherwise, no models.
+    fn fresh(spec: BackendSpec) -> Self {
+        BackendState {
+            name: spec.name,
+            url: spec.url,
+            healthy: false,
+            protocol: BackendProtocol::Ollama,
+            models: Vec::new(),
+            last_seen: None,
+            grace_deadline: None,
+            strip_auth: spec.strip_auth,
+            allow_models: spec.allow_models,
+        }
+    }
+
+    /// Drop every model this backend's `allow` list does not publish.
+    /// A filtered-out model is not merely hidden: it never enters the model
+    /// map, so requests for it 404 like any unknown model.
+    fn retain_allowed(&mut self) {
+        let Self {
+            allow_models: Some(allow),
+            models,
+            name,
+            ..
+        } = self
+        else {
+            return;
+        };
+        let before = models.len();
+        models.retain(|m| allow.contains(&m.name));
+        if models.is_empty() && before > 0 {
+            warn!(
+                backend = %name,
+                advertised = before,
+                "allowlist matched none of the backend's models; check the `allow` spelling in router.toml"
+            );
+        }
+    }
+
     fn is_reachable(&self) -> bool {
         self.healthy || self.grace_deadline.is_some()
     }
@@ -115,40 +168,179 @@ pub struct Registry {
     backends: Vec<BackendState>,
     model_map: HashMap<String, BackendId>,
     /// `local-model → stand-in-model` rewrites for when no reachable backend
-    /// serves the requested model. Refreshed from `OLLAMA_ROUTER_FALLBACK_FILE`
-    /// each discovery cycle; empty when the file isn't configured.
+    /// serves the requested model. Refreshed from `router.toml` each
+    /// discovery cycle.
     fallbacks: HashMap<String, String>,
     /// Alias → priority chain of `backend/model` candidates. Refreshed from
-    /// `OLLAMA_ROUTER_ALIASES_FILE` each discovery cycle; empty when the
-    /// file isn't configured. A distinct namespace from `model_map`: an
-    /// alias is resolved before (and shadows) any concrete model lookup.
+    /// `router.toml` each discovery cycle. A distinct namespace from
+    /// `model_map`: an alias is resolved before (and shadows) any concrete
+    /// model lookup.
     aliases: HashMap<String, Alias>,
     discovery_done: bool,
 }
 
 impl Registry {
-    fn new(config: &Config) -> Self {
-        let backends = config
-            .backends
-            .iter()
-            .map(|b| BackendState {
-                name: b.name.clone(),
-                url: b.url.clone(),
-                healthy: false,
-                protocol: BackendProtocol::Ollama,
-                models: Vec::new(),
-                last_seen: None,
-                grace_deadline: None,
-                strip_auth: b.strip_auth,
-            })
-            .collect();
-
-        Registry {
-            backends,
+    fn new(validated: Validated) -> Self {
+        let mut registry = Registry {
+            backends: Vec::new(),
             model_map: HashMap::new(),
             fallbacks: HashMap::new(),
             aliases: HashMap::new(),
             discovery_done: false,
+        };
+        // Nothing to remove from an empty roster, so the returned names are
+        // necessarily empty here.
+        drop(registry.apply_file_config(validated));
+        registry
+    }
+
+    /// Swap in a freshly validated policy document — roster, fallbacks and
+    /// aliases — in **one** write-lock section.
+    ///
+    /// Returns the names of backends that disappeared, so the caller can
+    /// drop their `backend_up` gauge series; a gauge for a deleted backend
+    /// otherwise freezes at its last value and keeps claiming it is up.
+    ///
+    /// Everything here is deliberately in one function: `model_map` values
+    /// are `BackendId` indices into `backends`, so mutating the roster
+    /// anywhere other than immediately before `rebuild_model_map` is a
+    /// misroute waiting to happen.
+    pub fn apply_file_config(&mut self, validated: Validated) -> Vec<String> {
+        let Validated {
+            backends,
+            fallbacks,
+            aliases,
+        } = validated;
+
+        // Keyed by name, because position is exactly what must be free to
+        // change: document order IS routing priority, so a reorder is a
+        // legitimate edit and must not be mistaken for a rename.
+        let mut previous: HashMap<String, BackendState> = self
+            .backends
+            .drain(..)
+            .map(|b| (b.name.clone(), b))
+            .collect();
+
+        self.backends = backends
+            .into_iter()
+            .map(|spec| match previous.remove(&spec.name) {
+                Some(prev) if prev.url == spec.url => {
+                    // Same name and same URL: the same server. Carry the
+                    // learned state. Rebuilding it instead would revert
+                    // `protocol` to Ollama (which hangs `/api/chat` against
+                    // an OpenAI-only backend), empty `models` (a 404 storm
+                    // until the next fetch lands) and clear the grace
+                    // deadline (losing an in-progress outage's grace).
+                    let mut next = BackendState {
+                        healthy: prev.healthy,
+                        protocol: prev.protocol,
+                        models: prev.models,
+                        last_seen: prev.last_seen,
+                        grace_deadline: prev.grace_deadline,
+                        ..BackendState::fresh(spec)
+                    };
+                    // Apply the (possibly tightened) allowlist to the models
+                    // being carried over rather than waiting for the next
+                    // fetch: the spend boundary must never lag its own edit.
+                    next.retain_allowed();
+                    next
+                }
+                Some(prev) => {
+                    // Same name, different URL: a different server wearing a
+                    // familiar name. Say so loudly — silently inheriting the
+                    // old one's model list would publish models the new
+                    // address may not serve.
+                    info!(
+                        backend = %spec.name,
+                        from = %prev.url,
+                        to = %spec.url,
+                        "backend url changed; resetting learned state",
+                    );
+                    BackendState::fresh(spec)
+                }
+                None => {
+                    info!(backend = %spec.name, url = %spec.url, "backend added by config reload");
+                    BackendState::fresh(spec)
+                }
+            })
+            .collect();
+
+        // Whatever the new roster did not claim is a removal.
+        let mut removed: Vec<String> = previous.into_keys().collect();
+        removed.sort();
+        for name in &removed {
+            info!(backend = %name, "backend removed by config reload");
+        }
+
+        // Fallbacks and aliases were validated against *this* roster, in the
+        // same pass, so they land in the same section: a reader can never
+        // observe new aliases against the old backend list.
+        self.fallbacks = fallbacks;
+        self.aliases = aliases;
+        self.rebuild_model_map();
+        removed
+    }
+
+    /// Fold a discovery cycle's results into the roster, **keyed by name**.
+    fn apply_fetch_results(
+        &mut self,
+        results: Vec<(String, FetchResult)>,
+        now: Instant,
+        grace_duration: Duration,
+    ) {
+        let mut by_name: HashMap<String, FetchResult> = results.into_iter().collect();
+
+        for backend in &mut self.backends {
+            let Some(result) = by_name.remove(&backend.name) else {
+                // Added by the reload that ran after the targets were
+                // snapshotted, or otherwise unprobed this cycle. Leave it
+                // untouched: marking it down is a claim we have no evidence
+                // for, and would cost it its grace period.
+                continue;
+            };
+            match result {
+                FetchResult::Ok { protocol, models } => {
+                    if !backend.healthy {
+                        info!(backend = %backend.name, models = models.len(), protocol = ?protocol, "backend recovered");
+                    }
+                    if backend.protocol != protocol {
+                        info!(backend = %backend.name, from = ?backend.protocol, to = ?protocol, "backend protocol updated");
+                    }
+                    backend.healthy = true;
+                    backend.protocol = protocol;
+                    backend.models = models;
+                    // Filtering here, against the backend's own allowlist,
+                    // is what makes positional mis-pairing unrepresentable.
+                    backend.retain_allowed();
+                    backend.last_seen = Some(now);
+                    backend.grace_deadline = None;
+                }
+                FetchResult::Err => mark_down(backend, now, grace_duration),
+            }
+        }
+
+        for name in by_name.into_keys() {
+            // Removed by a reload while its probe was in flight. Discarding
+            // is the point: there is no longer a slot this result describes.
+            debug!(backend = %name, "discarding discovery result for a removed backend");
+        }
+
+        // Expire grace periods.
+        for backend in &mut self.backends {
+            if let Some(deadline) = backend.grace_deadline
+                && now >= deadline
+            {
+                info!(backend = %backend.name, "grace period expired, removing models");
+                backend.models.clear();
+                backend.grace_deadline = None;
+            }
+        }
+
+        self.rebuild_model_map();
+
+        if !self.discovery_done {
+            info!("first discovery cycle complete");
+            self.discovery_done = true;
         }
     }
 
@@ -181,9 +373,9 @@ impl Registry {
         self.aliases.keys().map(String::as_str)
     }
 
-    /// Look up a backend by its configured name. Backend membership is fixed
-    /// at startup, so for names validated against the config (alias
-    /// candidates) this always resolves.
+    /// Look up a backend by its configured name. Aliases are validated
+    /// against the same roster in the same pass, so a candidate's backend
+    /// always resolves for as long as the guard is held.
     pub fn backend_id_by_name(&self, name: &str) -> Option<BackendId> {
         self.backends
             .iter()
@@ -292,12 +484,21 @@ impl Registry {
 
 pub type SharedRegistry = Arc<RwLock<Registry>>;
 
-pub fn new_shared(config: &Config) -> SharedRegistry {
-    Arc::new(RwLock::new(Registry::new(config)))
+pub fn new_shared(validated: Validated) -> SharedRegistry {
+    Arc::new(RwLock::new(Registry::new(validated)))
 }
 
-/// Long-running discovery loop. Runs first cycle immediately, then every `interval`.
-pub async fn discovery_loop(registry: SharedRegistry, config: Config) {
+/// Long-running discovery loop. Runs the first cycle immediately, then
+/// every `interval`.
+///
+/// Each iteration is reload-then-probe: `router.toml` is re-read and
+/// swapped in *before* discovery snapshots its targets, so a backend added
+/// by a config edit is probed in that same cycle (~1s) rather than the next
+/// one. That ordering is why no file watcher is needed — and inotify could
+/// not help anyway: the file lives on NFS and is edited on the server, and
+/// an NFS client receives no events for changes made elsewhere. A watcher
+/// would sit silent forever while looking like it worked.
+pub async fn discovery_loop(registry: SharedRegistry, config: Config, metrics: Arc<Metrics>) {
     let builder = match config.apply_extra_ca(Client::builder().timeout(Duration::from_secs(10))) {
         Ok(builder) => builder,
         Err(e) => {
@@ -318,60 +519,48 @@ pub async fn discovery_loop(registry: SharedRegistry, config: Config) {
 
     let interval = Duration::from_secs(config.discovery_interval_secs);
     let grace_duration = Duration::from_secs(config.grace_period_secs());
-    let mut config = config;
-
-    reload_file_config(&mut config, &registry).await;
-    run_discovery(&client, &registry, &config, grace_duration).await;
 
     loop {
+        reload_policy(&config.config_path, &registry, &metrics).await;
+        run_discovery(&client, &registry, grace_duration).await;
         tokio::time::sleep(interval).await;
-        reload_file_config(&mut config, &registry).await;
-        run_discovery(&client, &registry, &config, grace_duration).await;
     }
 }
 
-/// Re-read the allowlist and fallback files (when configured) so mounted
-/// ConfigMap edits land within one discovery cycle, no restart needed.
-/// Any read/parse error keeps the previous cycle's values: wiping the
-/// allowlist on a bad edit would blow the spend boundary open, and wiping
-/// fallbacks would silently drop failover.
-async fn reload_file_config(config: &mut crate::config::Config, registry: &SharedRegistry) {
-    if let Some(path) = config.model_allow_file.clone() {
-        match crate::config::load_model_allow_file(&path) {
-            Ok(allow) => {
-                if let Err(unknown) = crate::config::apply_model_allow(&mut config.backends, allow)
-                {
-                    warn!(
-                        backend = %unknown,
-                        file = %path,
-                        "allowlist file names an unknown backend; keeping previous allowlist"
-                    );
-                }
+/// Re-read `router.toml` and swap it in wholesale.
+///
+/// A rejected reload keeps the previous config **entirely** — never a
+/// partial apply, never a widened spend boundary — and is otherwise
+/// completely silent. That silence is the defining failure mode of putting
+/// routing policy in a hand-edited NFS file, which is why every outcome is
+/// also counted: `config_reloads_total{result="rejected"}` is what the
+/// alert fires on.
+async fn reload_policy(path: &str, registry: &SharedRegistry, metrics: &Metrics) {
+    let result = match FileConfig::load(path) {
+        Ok(validated) => {
+            let removed = registry.write().await.apply_file_config(validated);
+            for backend in removed {
+                // `backend_up` is the only backend-labelled gauge, and the
+                // one that actively lies once a backend is deleted: it
+                // freezes at its last value forever.
+                metrics.backend_up.remove(&BackendLabels { backend });
             }
-            Err(e) => {
-                warn!(error = %e, file = %path, "failed to reload allowlist file; keeping previous allowlist");
-            }
+            "applied"
         }
-    }
-    if let Some(path) = config.fallback_file.clone() {
-        match crate::config::load_fallbacks_file(&path) {
-            Ok(fallbacks) => registry.write().await.fallbacks = fallbacks,
-            Err(e) => {
-                warn!(error = %e, file = %path, "failed to reload fallback file; keeping previous fallbacks");
-            }
+        Err(e) => {
+            warn!(error = %e, file = %path, "config reload rejected; keeping previous config");
+            "rejected"
         }
-    }
-    if let Some(path) = config.aliases_file.clone() {
-        match crate::config::load_aliases_file(&path, &config.backends, &config.external_backends) {
-            Ok(aliases) => registry.write().await.aliases = aliases,
-            Err(e) => {
-                warn!(error = %e, file = %path, "failed to reload aliases file; keeping previous aliases");
-            }
-        }
-    }
+    };
+    metrics
+        .config_reloads
+        .get_or_create(&ConfigReloadLabels {
+            result: result.to_string(),
+        })
+        .inc();
 }
 
-/// Fetch results from backends, keyed by index.
+/// The outcome of probing one backend, paired with its name by the caller.
 enum FetchResult {
     Ok {
         protocol: BackendProtocol,
@@ -476,86 +665,33 @@ fn sanitize_model_entry(m: &mut ModelInfo) {
     }
 }
 
-async fn run_discovery(
-    client: &Client,
-    registry: &SharedRegistry,
-    config: &Config,
-    grace_duration: Duration,
-) {
-    // Phase 1: Fetch from all backends concurrently, WITHOUT holding any
-    // lock. Backend URLs come from Config (immutable), so no lock needed.
-    // join_all preserves order, so results still zip with `reg.backends`.
+async fn run_discovery(client: &Client, registry: &SharedRegistry, grace_duration: Duration) {
+    // Snapshot the targets from the REGISTRY (the sole roster), after the
+    // reload earlier in this same iteration. There is no second `Vec` of
+    // backends to drift out of sync with this one.
+    let targets: Vec<(String, String)> = {
+        let reg = registry.read().await;
+        reg.backends
+            .iter()
+            .map(|b| (b.name.clone(), b.url.clone()))
+            .collect()
+    };
+
+    // Phase 1: fetch from all backends concurrently, holding no lock.
     // Concurrency matters: a slow/dead backend's per-probe timeout would
     // otherwise serialise, making a cycle take N × timeout.
-    let mut fetch_results = futures_util::future::join_all(
-        config
-            .backends
-            .iter()
-            .map(|backend| fetch_models(client, &backend.name, &backend.url)),
-    )
-    .await;
+    let results =
+        futures_util::future::join_all(targets.into_iter().map(|(name, url)| async move {
+            let result = fetch_models(client, &name, &url).await;
+            (name, result)
+        }))
+        .await;
 
-    // Phase 1b: Apply per-backend discovery allowlists. Done here rather than
-    // in `fetch_models` so the filter is visible next to the fetch it trims,
-    // and so an allowlisted backend that returns nothing recognisable still
-    // reports as reachable-but-empty rather than as an error.
-    for (backend, result) in config.backends.iter().zip(fetch_results.iter_mut()) {
-        let (Some(allow), FetchResult::Ok { models, .. }) = (&backend.allow_models, result) else {
-            continue;
-        };
-        let before = models.len();
-        models.retain(|m| allow.contains(&m.name));
-        if models.is_empty() && before > 0 {
-            warn!(
-                backend = %backend.name,
-                advertised = before,
-                "allowlist matched none of the backend's models; check OLLAMA_ROUTER_MODEL_ALLOW spelling"
-            );
-        }
-    }
-
-    // Phase 2: Apply results under write lock (no I/O, microseconds).
+    // Phase 2: apply results under the write lock (no I/O, microseconds).
+    // Results carry their backend's name, so a reload that landed between
+    // the snapshot and here cannot mis-pair them.
     let mut reg = registry.write().await;
-    let now = Instant::now();
-
-    for (backend, result) in reg.backends.iter_mut().zip(fetch_results) {
-        match result {
-            FetchResult::Ok { protocol, models } => {
-                if !backend.healthy {
-                    info!(backend = %backend.name, models = models.len(), protocol = ?protocol, "backend recovered");
-                }
-                if backend.protocol != protocol {
-                    info!(backend = %backend.name, from = ?backend.protocol, to = ?protocol, "backend protocol updated");
-                }
-                backend.healthy = true;
-                backend.protocol = protocol;
-                backend.models = models;
-                backend.last_seen = Some(now);
-                backend.grace_deadline = None;
-            }
-            FetchResult::Err => {
-                mark_down(backend, now, grace_duration);
-            }
-        }
-    }
-
-    // Expire grace periods.
-    for backend in &mut reg.backends {
-        if let Some(deadline) = backend.grace_deadline
-            && now >= deadline
-        {
-            info!(backend = %backend.name, "grace period expired, removing models");
-            backend.models.clear();
-            backend.grace_deadline = None;
-        }
-    }
-
-    reg.rebuild_model_map();
-
-    if !reg.discovery_done {
-        info!("first discovery cycle complete");
-        reg.discovery_done = true;
-    }
+    reg.apply_fetch_results(results, Instant::now(), grace_duration);
 }
 
 fn mark_down(backend: &mut BackendState, now: Instant, grace_duration: Duration) {
@@ -569,13 +705,27 @@ fn mark_down(backend: &mut BackendState, now: Instant, grace_duration: Duration)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Backend, Config};
 
-    fn test_config() -> Config {
-        Config::from_backends(vec![
-            Backend::for_test("cuda", "http://cuda:11434"),
-            Backend::for_test("rocm", "http://rocm:11435"),
-        ])
+    /// Parse a policy document, or fail the test with the validator's own
+    /// error — every registry test goes through the real validator, so a
+    /// test roster can never be one the router would refuse to run.
+    fn policy(raw: &str) -> Validated {
+        FileConfig::parse(raw).expect("valid test policy")
+    }
+
+    /// A backend table with the given name, url and allow list.
+    fn backend_toml(name: &str, url: &str, allow: &str) -> String {
+        format!("[[backends]]\nname = \"{name}\"\nurl = \"{url}\"\nallow = {allow}\n")
+    }
+
+    /// The two-backend roster shared by most tests: `cuda` first (so it wins
+    /// colliding model names), `rocm` second.
+    fn test_policy() -> Validated {
+        policy(&format!(
+            "{}{}[fallbacks]\n[aliases]\n",
+            backend_toml("cuda", "http://cuda:11434", "[\"*\"]"),
+            backend_toml("rocm", "http://rocm:11435", "[\"*\"]"),
+        ))
     }
 
     fn make_model(name: &str) -> ModelInfo {
@@ -598,7 +748,7 @@ mod tests {
 
     #[test]
     fn fallback_map_covers_models_of_unreachable_backends() {
-        let mut reg = Registry::new(&test_config());
+        let mut reg = Registry::new(test_policy());
         // cuda is up serving the stand-in; rocm (which served the local
         // model) is down, so the local name has vanished from the map.
         setup_backend(
@@ -619,12 +769,12 @@ mod tests {
 
     #[test]
     fn alias_for_and_backend_id_by_name() {
-        let mut reg = Registry::new(&test_config());
+        let mut reg = Registry::new(test_policy());
         reg.aliases = HashMap::from([(
             "fast".to_string(),
             Alias {
                 local_only: false,
-                candidates: vec![crate::config::AliasCandidate {
+                candidates: vec![crate::policy::AliasCandidate {
                     backend: "cuda".to_string(),
                     model: "qwen3.6:latest".to_string(),
                 }],
@@ -652,37 +802,6 @@ mod tests {
             .expect("configured backend should resolve");
         assert_eq!(reg.backend(id).expect("live id").name, "rocm");
         assert!(reg.backend_id_by_name("typo").is_none());
-    }
-
-    #[tokio::test]
-    async fn alias_reload_keeps_previous_on_error() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("aliases");
-        std::fs::write(&path, "fast = cuda/qwen3.6:latest | rocm/glm-5.2\n").expect("write");
-
-        let mut config = test_config();
-        config.aliases_file = Some(path.to_string_lossy().into_owned());
-        let registry = new_shared(&config);
-
-        reload_file_config(&mut config, &registry).await;
-        assert_eq!(
-            registry
-                .read()
-                .await
-                .alias_for("fast")
-                .expect("alias loaded")
-                .1
-                .candidates
-                .len(),
-            2
-        );
-
-        // A bad edit (unknown backend) must keep the previous chain intact.
-        std::fs::write(&path, "fast = typo/qwen3.6:latest\n").expect("write");
-        reload_file_config(&mut config, &registry).await;
-        let reg = registry.read().await;
-        let (_, alias) = reg.alias_for("fast").expect("previous alias survives");
-        assert_eq!(alias.candidates[0].backend, "cuda");
     }
 
     /// Assert that `model` resolves to a backend named `expected_name`.
@@ -719,7 +838,7 @@ mod tests {
 
     /// Create a fresh registry with one healthy backend serving `models`.
     fn reg_with_healthy(idx: usize, models: &[&str]) -> Registry {
-        let mut reg = Registry::new(&test_config());
+        let mut reg = Registry::new(test_policy());
         setup_backend(
             &mut reg,
             idx,
@@ -733,7 +852,7 @@ mod tests {
     /// Set up both backends serving the same model, with backend 0 in a
     /// given health/grace state and backend 1 healthy.
     fn reg_dual_serving(model: &str, b0_healthy: bool, b0_grace: Option<Duration>) -> Registry {
-        let mut reg = Registry::new(&test_config());
+        let mut reg = Registry::new(test_policy());
         setup_backend(&mut reg, 0, b0_healthy, b0_grace, vec![make_model(model)]);
         setup_backend(&mut reg, 1, true, None, vec![make_model(model)]);
         reg
@@ -741,7 +860,7 @@ mod tests {
 
     /// Set up both backends with no models, only health flags.
     fn reg_health_only(b0_healthy: bool, b1_healthy: bool) -> Registry {
-        let mut reg = Registry::new(&test_config());
+        let mut reg = Registry::new(test_policy());
         setup_backend(&mut reg, 0, b0_healthy, None, vec![]);
         setup_backend(&mut reg, 1, b1_healthy, None, vec![]);
         reg
@@ -749,7 +868,7 @@ mod tests {
 
     #[test]
     fn new_registry_starts_empty() {
-        let reg = Registry::new(&test_config());
+        let reg = Registry::new(test_policy());
         assert!(!reg.is_discovery_done());
         assert!(reg.model_map.is_empty());
     }
@@ -823,7 +942,7 @@ mod tests {
 
     #[test]
     fn available_models_returns_only_qualified_names() {
-        let mut reg = Registry::new(&test_config());
+        let mut reg = Registry::new(test_policy());
         setup_backend(&mut reg, 0, true, None, vec![make_model("a:v1")]);
         setup_backend(&mut reg, 1, true, None, vec![make_model("b:latest")]);
 
@@ -834,7 +953,7 @@ mod tests {
 
     #[test]
     fn unhealthy_without_grace_excluded() {
-        let mut reg = Registry::new(&test_config());
+        let mut reg = Registry::new(test_policy());
         setup_backend(&mut reg, 0, false, None, vec![make_model("orphan:v1")]);
 
         assert!(reg.lookup("orphan:v1").is_none());
@@ -842,7 +961,7 @@ mod tests {
 
     #[test]
     fn unhealthy_within_grace_included() {
-        let mut reg = Registry::new(&test_config());
+        let mut reg = Registry::new(test_policy());
         setup_backend(
             &mut reg,
             0,
@@ -866,7 +985,7 @@ mod tests {
 
     #[test]
     fn models_from_both_backends() {
-        let mut reg = Registry::new(&test_config());
+        let mut reg = Registry::new(test_policy());
         setup_backend(&mut reg, 0, true, None, vec![make_model("small:v1")]);
         setup_backend(&mut reg, 1, true, None, vec![make_model("large:v1")]);
 
@@ -899,7 +1018,7 @@ mod tests {
 
     #[test]
     fn any_healthy_none_when_all_down() {
-        let reg = Registry::new(&test_config());
+        let reg = Registry::new(test_policy());
         assert!(reg.any_healthy().is_none());
     }
 
@@ -973,5 +1092,297 @@ mod tests {
         let not_an_object = serde_json::Value::String("not-an-object".to_string());
         let m = sanitized("x", not_an_object.clone());
         assert_eq!(m.extra, not_an_object);
+    }
+
+    // ── policy reload: the single-roster contract ────────────────────────
+
+    /// The roster after a reload, as `(name, url)` pairs in routing order.
+    fn roster(reg: &Registry) -> Vec<(&str, &str)> {
+        reg.backends
+            .iter()
+            .map(|b| (b.name.as_str(), b.url.as_str()))
+            .collect()
+    }
+
+    /// A registry whose two backends are both healthy and serving one model
+    /// each, with `cuda` also carrying a non-default protocol and a grace
+    /// deadline — i.e. every field a reload must be careful with.
+    fn reg_with_learned_state() -> Registry {
+        let mut reg = Registry::new(test_policy());
+        setup_backend(&mut reg, 0, true, None, vec![make_model("cuda-only:v1")]);
+        setup_backend(&mut reg, 1, true, None, vec![make_model("rocm-only:v1")]);
+        reg.backends[0].protocol = BackendProtocol::OpenAi;
+        reg.backends[0].last_seen = Some(Instant::now());
+        reg
+    }
+
+    #[test]
+    fn reload_preserves_learned_state_for_an_unchanged_backend() {
+        // Hazard 5: rebuilding a BackendState reverts `protocol` to Ollama
+        // (which hangs /api/chat against an OpenAI-only backend) and empties
+        // `models` (a 404 storm until the next fetch lands).
+        let mut reg = reg_with_learned_state();
+        let removed = reg.apply_file_config(test_policy());
+
+        assert!(removed.is_empty());
+        assert!(reg.backends[0].healthy);
+        assert_eq!(reg.backends[0].protocol, BackendProtocol::OpenAi);
+        assert_eq!(reg.backends[0].models.len(), 1);
+        assert!(reg.backends[0].last_seen.is_some());
+        assert_lookup_name(&reg, "cuda-only:v1", "cuda");
+    }
+
+    #[test]
+    fn reload_reorder_repoints_lookup_and_keeps_state() {
+        // Order IS priority: swapping the two tables must move a colliding
+        // model name to the newly-first backend, with both keeping their
+        // learned state.
+        let mut reg = Registry::new(test_policy());
+        setup_backend(&mut reg, 0, true, None, vec![make_model("shared:v1")]);
+        setup_backend(&mut reg, 1, true, None, vec![make_model("shared:v1")]);
+        assert_lookup_name(&reg, "shared:v1", "cuda");
+
+        let reversed = policy(&format!(
+            "{}{}[fallbacks]\n[aliases]\n",
+            backend_toml("rocm", "http://rocm:11435", "[\"*\"]"),
+            backend_toml("cuda", "http://cuda:11434", "[\"*\"]"),
+        ));
+        assert!(reg.apply_file_config(reversed).is_empty());
+
+        assert_eq!(
+            roster(&reg),
+            vec![("rocm", "http://rocm:11435"), ("cuda", "http://cuda:11434")]
+        );
+        assert_lookup_name(&reg, "shared:v1", "rocm");
+        assert!(
+            reg.backends
+                .iter()
+                .all(|b| b.healthy && !b.models.is_empty())
+        );
+    }
+
+    #[test]
+    fn reload_add_leaves_existing_backends_untouched() {
+        let mut reg = reg_with_learned_state();
+        let grown = policy(&format!(
+            "{}{}{}[fallbacks]\n[aliases]\n",
+            backend_toml("cuda", "http://cuda:11434", "[\"*\"]"),
+            backend_toml("rocm", "http://rocm:11435", "[\"*\"]"),
+            backend_toml("new", "http://new:1", "[\"*\"]"),
+        ));
+        assert!(reg.apply_file_config(grown).is_empty());
+
+        assert_eq!(reg.backends.len(), 3);
+        assert_eq!(reg.backends[0].protocol, BackendProtocol::OpenAi);
+        assert_lookup_name(&reg, "rocm-only:v1", "rocm");
+        // The new backend starts unhealthy and empty — it has not been
+        // probed yet. It is deliberately NOT allowed to un-ready /health:
+        // with replicas 1 and maxUnavailable 0 that would pull the pod's
+        // only endpoint, so adding a backend would cause a total outage.
+        assert!(!reg.backends[2].healthy);
+        assert!(reg.backends[2].models.is_empty());
+    }
+
+    #[test]
+    fn reload_remove_reports_the_name_and_leaves_no_dangling_route() {
+        let mut reg = reg_with_learned_state();
+        let shrunk = policy(&format!(
+            "{}[fallbacks]\n[aliases]\n",
+            backend_toml("cuda", "http://cuda:11434", "[\"*\"]"),
+        ));
+        let removed = reg.apply_file_config(shrunk);
+
+        assert_eq!(removed, vec!["rocm".to_string()]);
+        assert_eq!(roster(&reg), vec![("cuda", "http://cuda:11434")]);
+        // The removed backend's models are gone from the map, and every
+        // surviving value still indexes a live slot.
+        assert!(reg.lookup("rocm-only:v1").is_none());
+        for id in reg.model_map.values() {
+            assert!(reg.backend(*id).is_some(), "dangling model_map value");
+        }
+        assert_lookup_name(&reg, "cuda-only:v1", "cuda");
+    }
+
+    #[test]
+    fn reload_url_change_resets_learned_state() {
+        // Same name, different URL is a different server. Inheriting the old
+        // one's model list would publish models the new address may not
+        // serve.
+        let mut reg = reg_with_learned_state();
+        let moved = policy(&format!(
+            "{}{}[fallbacks]\n[aliases]\n",
+            backend_toml("cuda", "http://cuda:19999", "[\"*\"]"),
+            backend_toml("rocm", "http://rocm:11435", "[\"*\"]"),
+        ));
+        assert!(reg.apply_file_config(moved).is_empty());
+
+        assert_eq!(reg.backends[0].url, "http://cuda:19999");
+        assert!(!reg.backends[0].healthy);
+        assert_eq!(reg.backends[0].protocol, BackendProtocol::Ollama);
+        assert!(reg.backends[0].models.is_empty());
+        assert!(reg.lookup("cuda-only:v1").is_none());
+        // The untouched sibling keeps everything.
+        assert_lookup_name(&reg, "rocm-only:v1", "rocm");
+    }
+
+    #[test]
+    fn stale_backend_id_returns_none_rather_than_panicking() {
+        let mut reg = reg_with_learned_state();
+        let stale = reg.backend_id_by_name("rocm").expect("rocm is configured");
+        reg.apply_file_config(policy(&format!(
+            "{}[fallbacks]\n[aliases]\n",
+            backend_toml("cuda", "http://cuda:11434", "[\"*\"]"),
+        )));
+        assert!(reg.backend(stale).is_none());
+    }
+
+    #[test]
+    fn reload_tightening_allow_drops_carried_over_models_immediately() {
+        // The spend boundary must not lag its own edit by a discovery cycle.
+        let mut reg = Registry::new(test_policy());
+        setup_backend(
+            &mut reg,
+            0,
+            true,
+            None,
+            vec![make_model("cheap:v1"), make_model("frontier:v1")],
+        );
+        assert!(reg.lookup("frontier:v1").is_some());
+
+        reg.apply_file_config(policy(&format!(
+            "{}{}[fallbacks]\n[aliases]\n",
+            backend_toml("cuda", "http://cuda:11434", "[\"cheap:v1\"]"),
+            backend_toml("rocm", "http://rocm:11435", "[\"*\"]"),
+        )));
+
+        assert!(reg.lookup("cheap:v1").is_some());
+        assert!(
+            reg.lookup("frontier:v1").is_none(),
+            "a tightened allowlist must take effect at reload, not at the next fetch"
+        );
+    }
+
+    #[test]
+    fn reload_swaps_fallbacks_and_aliases_together() {
+        let mut reg = Registry::new(test_policy());
+        let doc = format!(
+            "{}{}[fallbacks]\n\"ghost\" = \"cuda-only:v1\"\n\
+             [aliases.fast]\nchain = [\"cuda/cuda-only:v1\"]\n",
+            backend_toml("cuda", "http://cuda:11434", "[\"*\"]"),
+            backend_toml("rocm", "http://rocm:11435", "[\"*\"]"),
+        );
+        reg.apply_file_config(policy(&doc));
+        assert_eq!(reg.fallback_for("ghost"), Some("cuda-only:v1"));
+        assert!(reg.alias_for("fast").is_some());
+
+        // A later document with neither: both must clear in the same swap,
+        // so a reader can never see the new one against the old other.
+        reg.apply_file_config(test_policy());
+        assert_eq!(reg.fallback_for("ghost"), None);
+        assert!(reg.alias_for("fast").is_none());
+    }
+
+    // ── discovery results are keyed by NAME, never by position ───────────
+
+    fn ok_result(models: &[&str]) -> FetchResult {
+        FetchResult::Ok {
+            protocol: BackendProtocol::OpenAi,
+            models: models.iter().map(|n| make_model(n)).collect(),
+        }
+    }
+
+    fn apply(reg: &mut Registry, results: Vec<(&str, FetchResult)>) {
+        let results = results
+            .into_iter()
+            .map(|(n, r)| (n.to_string(), r))
+            .collect();
+        reg.apply_fetch_results(results, Instant::now(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn fetch_results_land_on_the_named_backend_not_the_indexed_one() {
+        // THE security-relevant case: results arrive in an order that does
+        // not match the roster (a reload reordered it mid-cycle). A
+        // positional zip would put backend A's models — and therefore its
+        // spend boundary — on B.
+        let mut reg = Registry::new(test_policy());
+        apply(
+            &mut reg,
+            vec![
+                ("rocm", ok_result(&["rocm-model:v1"])),
+                ("cuda", ok_result(&["cuda-model:v1"])),
+            ],
+        );
+
+        assert_lookup_name(&reg, "cuda-model:v1", "cuda");
+        assert_lookup_name(&reg, "rocm-model:v1", "rocm");
+    }
+
+    #[test]
+    fn fetch_result_for_a_vanished_backend_is_discarded() {
+        let mut reg = Registry::new(test_policy());
+        apply(
+            &mut reg,
+            vec![
+                ("cuda", ok_result(&["cuda-model:v1"])),
+                ("ghost", ok_result(&["ghost-model:v1"])),
+            ],
+        );
+
+        assert_lookup_name(&reg, "cuda-model:v1", "cuda");
+        assert!(reg.lookup("ghost-model:v1").is_none());
+        assert_eq!(reg.backends.len(), 2);
+    }
+
+    #[test]
+    fn backend_with_no_fetch_result_is_left_untouched() {
+        // A backend added by the reload after targets were snapshotted has
+        // no result this cycle. Marking it down would be a claim we have no
+        // evidence for — and would cost a healthy backend its grace period.
+        let mut reg = reg_with_learned_state();
+        apply(&mut reg, vec![("cuda", ok_result(&["cuda-model:v1"]))]);
+
+        assert!(reg.backends[1].healthy, "rocm must not be marked down");
+        assert_lookup_name(&reg, "rocm-only:v1", "rocm");
+    }
+
+    #[test]
+    fn allowlist_pairs_with_its_own_backend_regardless_of_order() {
+        // cuda is metered (allowlisted), rocm publishes everything. The
+        // filter must follow the *name*, not the slot.
+        let mut reg = Registry::new(policy(&format!(
+            "{}{}[fallbacks]\n[aliases]\n",
+            backend_toml("cuda", "http://cuda:11434", "[\"kept:v1\"]"),
+            backend_toml("rocm", "http://rocm:11435", "[\"*\"]"),
+        )));
+        apply(
+            &mut reg,
+            vec![
+                ("rocm", ok_result(&["kept:v1", "dropped:v1"])),
+                ("cuda", ok_result(&["kept:v1", "dropped:v1"])),
+            ],
+        );
+
+        assert_eq!(reg.backends[0].models.len(), 1, "cuda is filtered");
+        assert_eq!(reg.backends[1].models.len(), 2, "rocm is not");
+        // First-writer-wins still puts the shared name on cuda.
+        assert_lookup_name(&reg, "kept:v1", "cuda");
+        assert_lookup_name(&reg, "dropped:v1", "rocm");
+    }
+
+    #[test]
+    fn fetch_error_marks_only_that_backend_down() {
+        let mut reg = reg_with_learned_state();
+        apply(
+            &mut reg,
+            vec![
+                ("cuda", FetchResult::Err),
+                ("rocm", ok_result(&["rocm-only:v1"])),
+            ],
+        );
+
+        assert!(!reg.backends[0].healthy);
+        assert!(reg.backends[0].grace_deadline.is_some(), "grace starts");
+        assert!(reg.backends[1].healthy);
     }
 }

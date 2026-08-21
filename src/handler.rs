@@ -1234,10 +1234,13 @@ mod tests {
     /// server, no real backends. Proves the I4 seam: handlers are callable
     /// directly now that they live in the library.
     fn test_state() -> AppState {
-        use crate::config::{Backend, Config};
-        let config = Config::from_backends(vec![Backend::for_test("b", "http://127.0.0.1:1")]);
+        let policy = crate::policy::FileConfig::parse(
+            "[[backends]]\nname = \"b\"\nurl = \"http://127.0.0.1:1\"\nallow = [\"*\"]\n\
+             [fallbacks]\n[aliases]\n",
+        )
+        .expect("valid test policy");
         AppState {
-            registry: crate::registry::new_shared(&config),
+            registry: crate::registry::new_shared(policy),
             metrics: Arc::new(Metrics::new()),
             client: Arc::new(reqwest::Client::new()),
             token_store: Arc::new(TokenStore::new(None)),

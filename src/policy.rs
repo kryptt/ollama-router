@@ -287,21 +287,40 @@ impl FileConfig {
     }
 }
 
-/// Check the scheme and strip any trailing slash, so `url` concatenates
-/// cleanly with the `/api/tags`-style suffixes discovery appends.
+/// Check the scheme *and the host*, then strip any trailing slash so `url`
+/// concatenates cleanly with the `/api/tags`-style suffixes discovery
+/// appends.
+///
+/// The host check is not pedantry. `http:///llama-swap.ai:8080` (a
+/// triple-slash typo) and `http://:8080` are both scheme-correct and
+/// host-less: they would be *accepted*, counted as an applied reload, and
+/// then fail every probe — so the backend's models would quietly drop out
+/// after the grace period instead of the file being rejected outright, with
+/// no alert anywhere. Hand-rolled rather than pulling in the `url` crate:
+/// this is a scheme plus a non-empty authority, and the dependency would
+/// cost more binary than the check is worth.
 fn validate_url(name: &str, raw: &str) -> Result<String, PolicyError> {
-    let url = raw.trim();
-    let host = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"));
-    match host {
-        Some(host) if !host.trim_matches('/').is_empty() => {
-            Ok(url.trim_end_matches('/').to_string())
-        }
-        _ => invalid(format!(
+    let reject = || {
+        invalid(format!(
             "backend '{name}': `url` must be http(s)://host[:port], got '{raw}'"
-        )),
+        ))
+    };
+    let url = raw.trim();
+    let Some(rest) = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+    else {
+        return reject();
+    };
+    // Authority is everything before the first '/', hostname everything
+    // before the first ':' in that. Both must be non-empty: an empty
+    // authority is the triple-slash typo, an empty hostname is ":8080".
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let hostname = authority.split(':').next().unwrap_or(authority);
+    if hostname.is_empty() {
+        return reject();
     }
+    Ok(url.trim_end_matches('/').to_string())
 }
 
 /// Lower an `allow` list to the registry's filter representation.
@@ -712,6 +731,40 @@ mod tests {
         assert_rejects(&doc("a", "ftp://a:1"), "http(s)://");
         assert_rejects(&doc("a", "a:1"), "http(s)://");
         assert_rejects(&doc("a", "http://"), "http(s)://");
+    }
+
+    #[test]
+    fn hostless_url_is_rejected() {
+        // A triple-slash typo is scheme-correct but host-less. Accepted, it
+        // would count as an applied reload and then fail every probe, so the
+        // backend's models drop out after the grace period with no alert —
+        // the exact opposite of the wholesale rejection promised above.
+        let doc = |url: &str| {
+            format!(
+                "[[backends]]\nname = \"a\"\nurl = \"{url}\"\nallow = [\"*\"]\n\
+                 [fallbacks]\n[aliases]\n"
+            )
+        };
+        for url in [
+            "http:///llama-swap.ai:8080",
+            "https:///a",
+            "http://:8080",
+            "http:///",
+        ] {
+            assert_rejects(&doc(url), "http(s)://");
+        }
+        // ...while real hosts, with and without port or path, still pass.
+        for url in [
+            "http://a",
+            "http://a:1",
+            "https://inference-api.nousresearch.com",
+            "http://a:1/v1",
+        ] {
+            assert!(
+                FileConfig::parse(&doc(url)).is_ok(),
+                "{url} should be accepted"
+            );
+        }
     }
 
     #[test]

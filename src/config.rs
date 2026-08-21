@@ -208,6 +208,134 @@ pub fn load_fallbacks_file(path: &str) -> Result<HashMap<String, String>, Config
     parse_fallbacks(&raw)
 }
 
+/// One `backend/model` candidate in an alias chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasCandidate {
+    pub backend: String,
+    pub model: String,
+}
+
+/// A named priority chain of concrete `backend/model` candidates
+/// (`OLLAMA_ROUTER_ALIASES_FILE`). Requests for the alias name walk the
+/// chain in order and commit to the first candidate that answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Alias {
+    /// Privacy pin: a `local` alias is rejected at parse time if any
+    /// candidate's backend is named in `OLLAMA_ROUTER_EXTERNAL_BACKENDS`,
+    /// so by construction its traffic can never leave the local backends.
+    pub local_only: bool,
+    /// Invariant: non-empty, every candidate's backend is a configured
+    /// backend name.
+    pub candidates: Vec<AliasCandidate>,
+}
+
+const ALIASES_KEY: &str = "OLLAMA_ROUTER_ALIASES_FILE";
+
+/// Parse an alias file (`OLLAMA_ROUTER_ALIASES_FILE` contents). One alias
+/// per line, `#` comments allowed:
+///
+/// ```text
+/// [local] <alias> = <backend>/<model> | <backend>/<model> | ...
+/// ```
+///
+/// The candidate splits on the FIRST `/` only — model ids routinely contain
+/// `/` and `:` themselves (`freellmapi/groq/llama-3.3-70b` is backend
+/// `freellmapi`, model `groq/llama-3.3-70b`).
+///
+/// Rejected outright (a typo here silently misroutes or, worse for `local`
+/// aliases, un-pins privacy): unknown backend names, duplicate aliases,
+/// empty chains, an alias named `local`, and a `local` alias whose chain
+/// contains an external backend.
+pub fn parse_aliases(
+    raw: &str,
+    backends: &[Backend],
+    external: &HashSet<String>,
+) -> Result<HashMap<String, Alias>, ConfigError> {
+    let invalid = |reason: String| ConfigError::Invalid {
+        key: ALIASES_KEY,
+        reason,
+    };
+    let mut out = HashMap::new();
+    for line in raw.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let err = || ConfigError::InvalidAlias(line.to_string());
+        let (lhs, rhs) = line.split_once('=').ok_or_else(err)?;
+
+        // The `local` keyword is whitespace-separated from the alias name;
+        // anything other than `[local] name` on the left side is a typo.
+        let mut tokens = lhs.split_whitespace();
+        let (local_only, name) = match (tokens.next(), tokens.next(), tokens.next()) {
+            (Some("local"), Some(name), None) => (true, name),
+            (Some(name), None, None) => (false, name),
+            _ => return Err(err()),
+        };
+        if name == "local" {
+            return Err(invalid(format!(
+                "alias may not be named 'local' (reserved keyword): '{line}'"
+            )));
+        }
+
+        let candidates = rhs
+            .split('|')
+            .map(|entry| {
+                let entry = entry.trim();
+                let (backend, model) = entry.split_once('/').ok_or_else(err)?;
+                let (backend, model) = (backend.trim(), model.trim());
+                if backend.is_empty() || model.is_empty() {
+                    return Err(err());
+                }
+                if !backends.iter().any(|b| b.name == backend) {
+                    return Err(invalid(format!(
+                        "alias '{name}' names backend '{backend}', which is not in OLLAMA_ROUTER_BACKENDS"
+                    )));
+                }
+                Ok(AliasCandidate {
+                    backend: backend.to_string(),
+                    model: model.to_string(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if candidates.is_empty() {
+            return Err(err());
+        }
+        if local_only && let Some(c) = candidates.iter().find(|c| external.contains(&c.backend)) {
+            return Err(invalid(format!(
+                "alias '{name}' is marked local but candidate backend '{}' is in OLLAMA_ROUTER_EXTERNAL_BACKENDS",
+                c.backend
+            )));
+        }
+        if out
+            .insert(
+                name.to_string(),
+                Alias {
+                    local_only,
+                    candidates,
+                },
+            )
+            .is_some()
+        {
+            return Err(invalid(format!("duplicate alias entry for '{name}'")));
+        }
+    }
+    Ok(out)
+}
+
+/// Load and parse an alias file. See [`parse_aliases`].
+pub fn load_aliases_file(
+    path: &str,
+    backends: &[Backend],
+    external: &HashSet<String>,
+) -> Result<HashMap<String, Alias>, ConfigError> {
+    let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::Invalid {
+        key: ALIASES_KEY,
+        reason: format!("could not read '{path}': {e}"),
+    })?;
+    parse_aliases(&raw, backends, external)
+}
+
 // Default values, shared between `from_env` (as the parse fallbacks) and the
 // `Default` impl (used by `from_backends`) so the two construction paths can
 // never silently drift apart.
@@ -266,6 +394,12 @@ pub struct Config {
     /// Path to a `local-model=stand-in` fallback map, re-read every discovery
     /// cycle. Consulted when no reachable backend serves a requested model.
     pub fallback_file: Option<String>,
+    /// Path to an alias/priority-chain file, re-read every discovery cycle.
+    /// Each alias names an ordered chain of `backend/model` candidates.
+    pub aliases_file: Option<String>,
+    /// Backend names considered "external" (hosted, off-LAN). A `local`
+    /// alias whose chain names one of these is rejected at parse time.
+    pub external_backends: HashSet<String>,
 
     // --- Resilience: bounded retry-with-backoff (Unit 3) ---
     /// Maximum retry attempts after the first try for a transient failure.
@@ -323,6 +457,8 @@ impl Default for Config {
             escalation_rules: Vec::new(),
             model_allow_file: None,
             fallback_file: None,
+            aliases_file: None,
+            external_backends: HashSet::new(),
             max_retries: DEFAULT_MAX_RETRIES,
             retry_backoff_base_ms: DEFAULT_RETRY_BACKOFF_BASE_MS,
             retry_jitter_pct: DEFAULT_RETRY_JITTER_PCT,
@@ -398,6 +534,37 @@ impl Config {
             // Validate now, discard the value: the discovery loop loads it
             // fresh on its first cycle (immediately at startup).
             load_fallbacks_file(path)?;
+        }
+
+        let external_backends: HashSet<String> = env::var("OLLAMA_ROUTER_EXTERNAL_BACKENDS")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .collect();
+        // An unknown name here is always a typo — and a dangerous one: a
+        // misspelled external backend would silently stop guarding `local`
+        // aliases against the real one.
+        if let Some(unknown) = external_backends
+            .iter()
+            .find(|n| !backends.iter().any(|b| b.name == **n))
+        {
+            return Err(ConfigError::Invalid {
+                key: "OLLAMA_ROUTER_EXTERNAL_BACKENDS",
+                reason: format!(
+                    "names backend '{unknown}', which is not in OLLAMA_ROUTER_BACKENDS"
+                ),
+            });
+        }
+
+        let aliases_file = env::var("OLLAMA_ROUTER_ALIASES_FILE")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        if let Some(path) = &aliases_file {
+            // Same startup fail-fast as the fallback file: validate now,
+            // discard; the discovery loop loads it fresh each cycle.
+            load_aliases_file(path, &backends, &external_backends)?;
         }
 
         let discovery_interval_secs = parse_env_u64(
@@ -513,6 +680,8 @@ impl Config {
             escalation_rules,
             model_allow_file,
             fallback_file,
+            aliases_file,
+            external_backends,
             max_retries,
             retry_backoff_base_ms,
             retry_jitter_pct,
@@ -595,6 +764,7 @@ pub enum ConfigError {
     InvalidEscalation(String),
     InvalidModelAllow(String),
     InvalidFallback(String),
+    InvalidAlias(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -637,6 +807,12 @@ impl fmt::Display for ConfigError {
                 write!(
                     f,
                     "invalid fallback entry: '{entry}' (expected local-model=stand-in-model)"
+                )
+            }
+            Self::InvalidAlias(entry) => {
+                write!(
+                    f,
+                    "invalid alias entry: '{entry}' (expected [local] alias = backend/model | backend/model | ...)"
                 )
             }
         }
@@ -741,6 +917,116 @@ mod tests {
             "duplicate keys are a typo; last-wins would hide it"
         );
         assert!(parse_fallbacks("").expect("empty ok").is_empty());
+    }
+
+    // ── alias grammar ────────────────────────────────────────────────────
+
+    /// Backend roster used by every alias test: two local, two external.
+    fn alias_backends() -> Vec<Backend> {
+        vec![
+            Backend::for_test("llama-swap", "http://l"),
+            Backend::for_test("rivoli", "http://r"),
+            Backend::for_test("nous", "http://n"),
+            Backend::for_test("freellmapi", "http://f"),
+        ]
+    }
+
+    fn externals() -> HashSet<String> {
+        HashSet::from(["nous".to_string(), "freellmapi".to_string()])
+    }
+
+    fn aliases(raw: &str) -> HashMap<String, Alias> {
+        parse_aliases(raw, &alias_backends(), &externals()).expect("expected a valid alias file")
+    }
+
+    #[track_caller]
+    fn assert_alias_error(raw: &str, expected_substring: &str) {
+        let err = parse_aliases(raw, &alias_backends(), &externals())
+            .expect_err("expected an alias parse error");
+        assert!(
+            err.to_string().contains(expected_substring),
+            "expected error containing {expected_substring:?}, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parses_alias_chains_with_slashes_and_colons_in_model_ids() {
+        let got = aliases(
+            "# chains\n\
+             fast = llama-swap/qwen3.6:latest | freellmapi/groq/llama-3.3-70b | nous/Hermes-4-405B\n\
+             \n\
+             local secret = llama-swap/qwen3.6:latest | rivoli/glm-5.2 # stays on-LAN\n",
+        );
+        assert_eq!(got.len(), 2);
+
+        let fast = &got["fast"];
+        assert!(!fast.local_only);
+        assert_eq!(fast.candidates.len(), 3);
+        assert_eq!(fast.candidates[0].backend, "llama-swap");
+        assert_eq!(fast.candidates[0].model, "qwen3.6:latest");
+        // Split on the FIRST '/' only: the model id keeps its own slashes.
+        assert_eq!(fast.candidates[1].backend, "freellmapi");
+        assert_eq!(fast.candidates[1].model, "groq/llama-3.3-70b");
+        assert_eq!(fast.candidates[2].backend, "nous");
+        assert_eq!(fast.candidates[2].model, "Hermes-4-405B");
+
+        let secret = &got["secret"];
+        assert!(secret.local_only);
+        assert_eq!(secret.candidates.len(), 2);
+    }
+
+    #[test]
+    fn alias_rejects_local_alias_with_external_backend() {
+        assert_alias_error(
+            "local secret = llama-swap/qwen3.6:latest | nous/Hermes-4-405B",
+            "marked local but candidate backend 'nous'",
+        );
+    }
+
+    #[test]
+    fn alias_rejects_unknown_backend() {
+        assert_alias_error("fast = typo/qwen3.6:latest", "backend 'typo'");
+    }
+
+    #[test]
+    fn alias_rejects_duplicates() {
+        assert_alias_error(
+            "fast = llama-swap/a\nfast = rivoli/b",
+            "duplicate alias entry for 'fast'",
+        );
+    }
+
+    #[test]
+    fn alias_rejects_empty_chain() {
+        assert_alias_error("fast =", "invalid alias entry");
+        assert_alias_error("fast = |", "invalid alias entry");
+        assert_alias_error("fast = llama-swap/", "invalid alias entry");
+        assert_alias_error("fast = /model", "invalid alias entry");
+    }
+
+    #[test]
+    fn alias_rejects_name_local() {
+        // Both spellings that would produce an alias literally named
+        // `local`: the bare name, and the keyword doubled.
+        assert_alias_error("local = llama-swap/a", "may not be named 'local'");
+        assert_alias_error("local local = llama-swap/a", "may not be named 'local'");
+    }
+
+    #[test]
+    fn alias_rejects_malformed_left_side() {
+        assert_alias_error("no-equals-sign", "invalid alias entry");
+        assert_alias_error("a b = llama-swap/m", "invalid alias entry");
+        assert_alias_error("= llama-swap/m", "invalid alias entry");
+    }
+
+    #[test]
+    fn alias_tolerates_comments_and_whitespace() {
+        let got =
+            aliases("\n# header comment\n\n  fast   =   llama-swap/a:1  |  rivoli/b  # tail\n\n");
+        assert_eq!(got["fast"].candidates.len(), 2);
+        assert_eq!(got["fast"].candidates[0].model, "a:1");
+        assert_eq!(got["fast"].candidates[1].backend, "rivoli");
+        assert!(aliases("# only comments\n\n").is_empty());
     }
 
     #[test]

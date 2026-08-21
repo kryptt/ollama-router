@@ -32,6 +32,8 @@ unsafe fn clear_env() {
         "OLLAMA_ROUTER_CACHE_MAX_BYTES",
         "OLLAMA_ROUTER_CACHE_MAX_ENTRY_BYTES",
         "OLLAMA_ROUTER_CACHE_TTL",
+        "OLLAMA_ROUTER_ALIASES_FILE",
+        "OLLAMA_ROUTER_EXTERNAL_BACKENDS",
     ] {
         unsafe { env::remove_var(key) };
     }
@@ -346,4 +348,65 @@ fn custom_timeouts() {
 fn tokens_file_set_from_env() {
     let config = parse_with_vars(&[("OLLAMA_ROUTER_TOKENS_FILE", "/config/tokens")]);
     assert_eq!(config.tokens_file.as_deref(), Some("/config/tokens"));
+}
+
+// ── alias / external-backend env wiring ─────────────────────────────────────
+
+/// Write `content` to a temp aliases file and return (dir, path). The dir
+/// keeps the file alive for the test scope.
+fn aliases_file_with(content: &str) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aliases");
+    std::fs::write(&path, content).unwrap();
+    let path = path.to_str().unwrap().to_string();
+    (dir, path)
+}
+
+#[test]
+fn aliases_file_validated_at_startup() {
+    let (_dir, path) = aliases_file_with(
+        "fast = swap/qwen3.6:latest | nous/Hermes-4-405B\nlocal secret = swap/qwen3.6:latest\n",
+    );
+    let config = parse_with_vars(&[
+        ("OLLAMA_ROUTER_BACKENDS", "swap=http://s:1,nous=http://n:2"),
+        ("OLLAMA_ROUTER_EXTERNAL_BACKENDS", "nous"),
+        ("OLLAMA_ROUTER_ALIASES_FILE", &path),
+    ]);
+    assert_eq!(config.aliases_file.as_deref(), Some(path.as_str()));
+    assert!(config.external_backends.contains("nous"));
+    assert!(!config.external_backends.contains("swap"));
+}
+
+#[test]
+fn local_alias_with_external_backend_fails_at_startup() {
+    let (_dir, path) = aliases_file_with("local secret = nous/Hermes-4-405B\n");
+    assert_env_parse_error(
+        &[
+            ("OLLAMA_ROUTER_BACKENDS", "swap=http://s:1,nous=http://n:2"),
+            ("OLLAMA_ROUTER_EXTERNAL_BACKENDS", "nous"),
+            ("OLLAMA_ROUTER_ALIASES_FILE", &path),
+        ],
+        "marked local",
+    );
+}
+
+#[test]
+fn external_backends_naming_unknown_backend_fails() {
+    // Privacy-critical typo check: a misspelled external backend would
+    // silently stop guarding `local` aliases against the real one.
+    assert_env_parse_error(
+        &[
+            ("OLLAMA_ROUTER_BACKENDS", "swap=http://s:1,nous=http://n:2"),
+            ("OLLAMA_ROUTER_EXTERNAL_BACKENDS", "nuos"),
+        ],
+        "not in OLLAMA_ROUTER_BACKENDS",
+    );
+}
+
+#[test]
+fn unreadable_aliases_file_fails_at_startup() {
+    assert_env_parse_error(
+        &[("OLLAMA_ROUTER_ALIASES_FILE", "/nonexistent/aliases")],
+        "could not read",
+    );
 }

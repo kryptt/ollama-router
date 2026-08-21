@@ -469,19 +469,32 @@ impl Registry {
         self.discovery_done
     }
 
-    /// True when this router can actually serve something.
+    /// True when this router is configured and has finished starting up.
     ///
-    /// The `!backends.is_empty()` half is not redundant with "some backend is
-    /// reachable": a cycle over an *empty* roster completes successfully with
-    /// nothing to probe and flips `discovery_done`, so without this the
-    /// no-policy-file state would report Ready, take Service endpoints, and
-    /// 404 every request as an unknown model — which looks healthy and is
-    /// strictly worse than crash-looping. A router with no configured
-    /// backends is never Ready.
+    /// Gated on the roster being non-empty because a cycle over an *empty*
+    /// roster completes successfully — there is nothing to probe — and flips
+    /// `discovery_done`. Without that check the no-policy-file state would
+    /// report Ready, take Service endpoints, and 404 every request as an
+    /// unknown model, which looks healthy and is strictly worse than being
+    /// visibly down. An empty roster is a *configuration* fact: it cannot
+    /// resolve without an edit, so gating on it is right.
+    ///
+    /// Deliberately NOT gated on any backend being reachable. That is an
+    /// *operational* fact which resolves on its own, and absorbing it is the
+    /// router's whole job — grace periods, fallbacks and alias chains all
+    /// exist to keep serving through it. With `replicas: 1`, tying readiness
+    /// to backend health would turn a transient all-down blip into zero
+    /// Service endpoints: every client gets connection-refused instead of an
+    /// honest 502, a total outage that is also harder to diagnose because
+    /// the pod has vanished from the Service exactly when `/status`,
+    /// `/metrics` and the logs are what you need. It would also couple this
+    /// pod's readiness to remote hosts we do not control, reintroducing the
+    /// readiness flapping that previously cycled this deployment and
+    /// cascaded into its dependents. Zero reachable backends belongs in
+    /// metrics and alerts (`backend_up`, `OllamaRouterBackendDown`,
+    /// `OllamaRouterChainExhausted`), not in the readiness probe.
     pub fn is_ready(&self) -> bool {
-        self.discovery_done
-            && !self.backends.is_empty()
-            && self.backends.iter().any(BackendState::is_reachable)
+        self.discovery_done && !self.backends.is_empty()
     }
 
     /// True when the roster is empty — no policy file has ever applied.
@@ -1562,5 +1575,45 @@ mod tests {
         reg.apply_file_config(test_policy());
         apply(&mut reg, vec![("cuda", ok_result(&["m:v1"]))]);
         assert!(reg.is_ready());
+    }
+
+    #[test]
+    fn all_backends_down_stays_ready() {
+        // Reachability is an *operational* fact that resolves on its own,
+        // and absorbing it is the router's whole job. With `replicas: 1`,
+        // going un-Ready here would empty the Service and turn honest 502s
+        // into connection-refused for every client — a total outage, and one
+        // that also hides /status and /metrics behind a missing endpoint
+        // exactly when they are needed. It would additionally couple this
+        // pod's readiness to remote hosts (Nous, the GPU node), which is the
+        // readiness flapping that previously cycled this deployment.
+        let mut reg = Registry::new(test_policy());
+        apply(
+            &mut reg,
+            vec![
+                ("cuda", ok_result(&["m:v1"])),
+                ("rocm", ok_result(&["n:v1"])),
+            ],
+        );
+        assert!(reg.is_ready());
+
+        // Every backend fails its probe, and every grace period expires.
+        apply(
+            &mut reg,
+            vec![("cuda", FetchResult::Err), ("rocm", FetchResult::Err)],
+        );
+        for backend in &mut reg.backends {
+            backend.grace_deadline = Some(Instant::now() - Duration::from_secs(1));
+        }
+        reg.apply_fetch_results(Vec::new(), Instant::now(), Duration::from_secs(60));
+
+        assert!(
+            reg.all_backends().all(|b| !b.healthy && !b.in_grace_period),
+            "precondition: every backend is hard-down",
+        );
+        assert!(
+            reg.is_ready(),
+            "a configured router must stay Ready through a transient all-down blip",
+        );
     }
 }

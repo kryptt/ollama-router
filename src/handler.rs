@@ -911,14 +911,12 @@ pub async fn health_route(State(state): State<AppState>) -> Response {
         );
     }
 
-    if snapshot.is_ready() {
-        json_status(StatusCode::OK, json!({"status": "ok"}))
-    } else {
-        json_status(
-            StatusCode::SERVICE_UNAVAILABLE,
-            json!({"status": "unhealthy", "reason": "all backends unreachable"}),
-        )
-    }
+    // Note what is NOT checked here: whether any backend is currently
+    // reachable. Serving through an all-backends-down blip is the router's
+    // job (grace periods, fallbacks, alias chains), and with `replicas: 1`
+    // going un-Ready would empty the Service — turning honest 502s into
+    // connection-refused for every client. See `Registry::is_ready`.
+    json_status(StatusCode::OK, json!({"status": "ok"}))
 }
 
 /// Liveness: 200 for as long as the process is running and serving.

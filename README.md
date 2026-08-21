@@ -365,7 +365,7 @@ Internal router (`OLLAMA_ROUTER_INTERNAL_PORT`):
 
 | Path | Purpose |
 |---|---|
-| `GET /health` | **Readiness.** 200 once the first discovery cycle has completed, at least one backend is *configured*, and at least one is reachable. A router whose policy file has never loaded reports `503 {"reason": "no backends configured"}` — it can serve nothing, so it must never take Service endpoints. |
+| `GET /health` | **Readiness.** 200 once the first discovery cycle has completed and at least one backend is *configured*. A router whose policy file has never loaded reports `503 {"reason": "no backends configured"}` — it can serve nothing, so it must never take Service endpoints. Deliberately **not** gated on backends being *reachable*: serving through an all-down blip is the router's job (grace periods, fallbacks, alias chains), and with `replicas: 1` going un-Ready would empty the Service and turn honest 502s into connection-refused. Use `ollama_router_backend_up` / `backends_reachable` to alert on backend health. |
 | `GET /live` | **Liveness.** 200 for as long as the process is serving. Separate from `/health` on purpose: readiness is 503 while the policy file is unreadable, and pointing a liveness probe at that would kill the pod that is waiting to self-heal. |
 | `GET /status` | JSON dump of every backend's current health, models, and grace state. |
 | `GET /metrics` | Prometheus text-format exposition. |

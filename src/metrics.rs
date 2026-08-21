@@ -54,8 +54,12 @@ pub struct Metrics {
     /// resets on a short interval is the fingerprint of pod churn — the exact
     /// signal that would have surfaced the macvlan-watchdog kill loop.
     pub start_time_seconds: Gauge,
-    /// 1 when the router is ready to serve (first discovery done AND at least
-    /// one backend reachable), else 0. Refreshed on each `/metrics` scrape.
+    /// 1 when the router is ready to serve (first discovery cycle done AND a
+    /// non-empty backend roster), else 0. Refreshed on each `/metrics` scrape.
+    /// Mirrors `/health` exactly — and like it, is deliberately independent
+    /// of whether any backend is currently *reachable*: that is
+    /// `backends_reachable` / `backend_up`'s job, and conflating the two
+    /// would make readiness flap on remote hosts we do not control.
     pub ready: Gauge,
     /// Backends currently reachable (healthy or within grace). Refreshed on scrape.
     pub backends_reachable: Gauge,

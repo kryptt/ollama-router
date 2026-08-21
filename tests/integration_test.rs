@@ -1294,6 +1294,27 @@ async fn unreadable_policy_at_startup_serves_unready_then_self_heals() {
 }
 
 #[tokio::test]
+async fn all_backends_down_still_reports_ready() {
+    // End-to-end counterpart to the unit test: a configured router whose
+    // only backend is unreachable must keep its Service endpoint. Going
+    // un-Ready with `replicas: 1` would replace honest 502s with
+    // connection-refused for every client.
+    let (_dir, config, reg) = policy_setup(&[("dead", "http://127.0.0.1:1")], "");
+    let metrics = Arc::new(Metrics::new());
+    let state = app_state_with(&reg, &metrics);
+    spawn_discovery(&reg, &config, &metrics);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    assert!(
+        reg.read().await.all_backends().all(|b| !b.healthy),
+        "precondition: the backend is unreachable",
+    );
+    let (status, body) = probe(&state, "health").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(reg.read().await.is_ready());
+}
+
+#[tokio::test]
 async fn empty_roster_is_never_ready_even_with_discovery_done() {
     // The invariant on its own, without the timing: a router with nothing
     // configured can never serve anything, so it must never be Ready.

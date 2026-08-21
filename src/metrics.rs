@@ -42,8 +42,9 @@ pub struct Metrics {
     /// the walk arrived from — the alias name itself before the first
     /// candidate, else the previously tried candidate's backend name.
     /// `reason` is one of: unreachable | connect | timeout | transport |
-    /// rate_limited | model_missing | upstream_5xx. Cardinality is bounded
-    /// by the operator's alias file (aliases × chain length × 7 reasons).
+    /// auth | rate_limited | model_missing | upstream_5xx. Cardinality is
+    /// bounded by the operator's alias file (aliases × chain length × 8
+    /// reasons).
     pub chain_advance: Family<ChainAdvanceLabels, Counter>,
     /// Alias chains that ran out of candidates without committing a
     /// response — every candidate was unreachable or failed.

@@ -43,12 +43,8 @@ impl BackendState {
     }
 
     /// True when this backend carries `model` by exact name or by `:`-prefix.
-    /// Mirrors the key generation in `rebuild_model_map`, so it agrees with
-    /// what `lookup` would resolve.
     fn serves(&self, model: &str) -> bool {
-        self.models
-            .iter()
-            .any(|m| m.name == model || m.name.split_once(':').map(|(p, _)| p) == Some(model))
+        self.view().serves(model)
     }
 
     fn view(&self) -> BackendView<'_> {
@@ -98,6 +94,17 @@ pub struct BackendView<'a> {
     pub models: &'a [ModelInfo],
     pub in_grace_period: bool,
     pub strip_auth: bool,
+}
+
+impl BackendView<'_> {
+    /// True when this backend carries `model` by exact name or by `:`-prefix.
+    /// Mirrors the key generation in `rebuild_model_map`, so it agrees with
+    /// what `lookup` would resolve.
+    pub fn serves(&self, model: &str) -> bool {
+        self.models
+            .iter()
+            .any(|m| m.name == model || m.name.split_once(':').map(|(p, _)| p) == Some(model))
+    }
 }
 
 /// The central routing table. All access goes through `SharedRegistry`.
@@ -151,9 +158,22 @@ impl Registry {
         self.fallbacks.get(model).map(String::as_str)
     }
 
-    /// The alias chain registered under `name`, if any.
-    pub fn alias_for(&self, name: &str) -> Option<&Alias> {
-        self.aliases.get(name)
+    /// The alias chain registered under `name`, if any, together with its
+    /// canonical (as-configured) alias name — callers label metrics/spans
+    /// with the canonical name so `fast` and `fast:latest` don't split.
+    ///
+    /// Ollama clients normalise bare model names to `name:latest`, so an
+    /// exact miss falls back to the name with a trailing `:latest`
+    /// stripped. Exact matches win: an alias literally named `foo:latest`
+    /// resolves before (and is never shadowed by) an alias named `foo`.
+    pub fn alias_for(&self, name: &str) -> Option<(&str, &Alias)> {
+        if let Some((k, v)) = self.aliases.get_key_value(name) {
+            return Some((k.as_str(), v));
+        }
+        let stripped = name.strip_suffix(":latest")?;
+        self.aliases
+            .get_key_value(stripped)
+            .map(|(k, v)| (k.as_str(), v))
     }
 
     /// All configured alias names, in arbitrary order.
@@ -606,10 +626,21 @@ mod tests {
             },
         )]);
 
-        let alias = reg.alias_for("fast").expect("alias should resolve");
+        let (canonical, alias) = reg.alias_for("fast").expect("alias should resolve");
+        assert_eq!(canonical, "fast");
         assert_eq!(alias.candidates[0].backend, "cuda");
         assert!(reg.alias_for("qwen3.6:latest").is_none());
         assert_eq!(reg.alias_names().collect::<Vec<_>>(), vec!["fast"]);
+
+        // Ollama clients normalise bare names to `name:latest`; the alias
+        // must resolve under both spellings, with the canonical name kept
+        // for metric labels.
+        let (canonical, _) = reg
+            .alias_for("fast:latest")
+            .expect("`:latest` form should resolve");
+        assert_eq!(canonical, "fast");
+        // Only `:latest` is stripped — other tags stay misses.
+        assert!(reg.alias_for("fast:v2").is_none());
 
         let id = reg
             .backend_id_by_name("rocm")
@@ -635,6 +666,7 @@ mod tests {
                 .await
                 .alias_for("fast")
                 .expect("alias loaded")
+                .1
                 .candidates
                 .len(),
             2
@@ -644,7 +676,7 @@ mod tests {
         std::fs::write(&path, "fast = typo/qwen3.6:latest\n").expect("write");
         reload_file_config(&mut config, &registry).await;
         let reg = registry.read().await;
-        let alias = reg.alias_for("fast").expect("previous alias survives");
+        let (_, alias) = reg.alias_for("fast").expect("previous alias survives");
         assert_eq!(alias.candidates[0].backend, "cuda");
     }
 

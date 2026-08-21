@@ -58,20 +58,30 @@ fn alias_tag_entry(name: &str) -> Value {
 /// they're distinguishable from discovered concrete models.
 pub fn v1_models_response(reg: &Registry) -> Response {
     let mut models = v1_model_objects(reg);
-    models.extend(sorted_alias_names(reg).into_iter().map(|name| {
-        json!({
-            "id": name,
-            "object": "model",
-            "created": 0,
-            "owned_by": "router-alias",
-        })
-    }));
+    models.extend(sorted_alias_names(reg).into_iter().map(v1_alias_object));
     json_ok(json!({ "object": "list", "data": models }))
+}
+
+/// The `/v1/models` object for an alias entry. Shared by the list and the
+/// single-model retrieval so the two shapes cannot drift.
+fn v1_alias_object(name: &str) -> Value {
+    json!({
+        "id": name,
+        "object": "model",
+        "created": 0,
+        "owned_by": "router-alias",
+    })
 }
 
 /// `GET /v1/models/:model_id` — OpenAI-compatible single-model retrieval.
 /// Matches by exact name or prefix (before `:`), same as routing lookup.
 pub fn v1_model_response(reg: &Registry, model_id: &str) -> Response {
+    // Aliases shadow concrete models in routing, so retrieval resolves them
+    // first too — anything /v1/models lists must be retrievable by id.
+    if let Some((canonical, _)) = reg.alias_for(model_id) {
+        return json_ok(v1_alias_object(canonical));
+    }
+
     // Try exact match against reachable models first, then prefix.
     let found = reg.reachable_models().into_iter().find(|m| {
         m.name == model_id

@@ -84,7 +84,7 @@ backend wiring:
 | `OLLAMA_ROUTER_TOKENS_FILE` | (unset, no auth) | Path to a newline-separated file of valid bearer tokens. Reloaded every 60 s without restart. |
 | `OLLAMA_ROUTER_MODEL_ALLOW` | (unset, publish everything) | Per-backend discovery allowlist: `backend=model1\|model2,other=model3`. A backend not named here publishes its full catalogue, so this is purely additive. Naming a backend that isn't in `OLLAMA_ROUTER_BACKENDS`, or an entry with no models, fails at startup. |
 | `OLLAMA_ROUTER_MODEL_ALLOW_FILE` | (unset) | Path to a file with the same grammar as `OLLAMA_ROUTER_MODEL_ALLOW`, plus newlines-as-commas and `#` comments. Re-read every discovery cycle, so an edited mounted ConfigMap lands without a restart; a bad edit keeps the previous cycle's filters. Mutually exclusive with `OLLAMA_ROUTER_MODEL_ALLOW`; an unreadable file fails at startup. |
-| `OLLAMA_ROUTER_FALLBACK_FILE` | (unset, no fallback) | Path to a file of `local-model=stand-in-model` lines (`#` comments allowed). When no reachable backend serves a requested model, the request is transparently rewritten (routing *and* body `model` field) to the stand-in — one hop, applied only if the stand-in is itself published. Re-read every discovery cycle. Metrics: `ollama_router_fallbacks{from,to}`. |
+| `OLLAMA_ROUTER_FALLBACK_FILE` | (unset, no fallback) | Path to a file of `local-model=stand-in-model` lines (`#` comments allowed). When no reachable backend serves a requested model, the request is transparently rewritten (routing *and* body `model` field) to the stand-in — one hop, applied only if the stand-in is itself published (or is an alias, in which case the request enters the alias chain). Re-read every discovery cycle. Metrics: `ollama_router_fallbacks{from,to}`. |
 | `OLLAMA_ROUTER_ALIASES_FILE` | (unset, no aliases) | Path to an alias/priority-chain file: `[local] alias = backend/model \| backend/model \| ...` per line (`#` comments allowed). Requests for the alias walk the chain in order and commit to the first candidate that answers; see [Aliases](#aliases-priority-chains). Re-read every discovery cycle; a bad edit keeps the previous cycle's table. Fatal at startup on parse/validation errors. |
 | `OLLAMA_ROUTER_EXTERNAL_BACKENDS` | (unset) | Comma-separated backend names considered "external" (hosted, off-LAN), e.g. `nous,freellmapi`. A `local`-prefixed alias whose chain names one of these is rejected at parse time — the privacy pin. Every name must be in `OLLAMA_ROUTER_BACKENDS` (a typo here would silently un-pin privacy). |
 | `OLLAMA_ROUTER_EXTRA_CA_FILE` | (unset, built-in roots only) | Path to a PEM bundle of additional root certificates to trust on outbound requests. Needed when a backend is reached through a TLS-intercepting egress proxy whose CA is private. Applied to both the proxy and discovery clients. |
@@ -117,9 +117,18 @@ fast  = llama-swap/qwen3.6:latest | freellmapi/groq/llama-3.3-70b | nous/Hermes-
 local secret = llama-swap/qwen3.6:latest | rivoli/glm-5.2
 ```
 
+Advance reasons per candidate: unreachable in the registry, connect/timeout/
+transport errors, and 429 (rate-limit), 401/403 (auth — an expired hosted
+API key fails over instead of relaying the auth error), 404 (model missing),
+or 5xx response heads.
+
 - The candidate splits on the **first** `/` only, so model ids keep their own
   slashes and colons (`freellmapi/groq/llama-3.3-70b` = backend `freellmapi`,
   model `groq/llama-3.3-70b`).
+- Ollama clients normalise bare model names to `name:latest`; an alias
+  resolves under both spellings (`fast` and `fast:latest`), with metrics
+  labelled by the canonical configured name. Only a trailing `:latest` is
+  normalised; an alias literally named `foo:latest` always wins exactly.
 - The `local` keyword privacy-pins an alias: if any candidate's backend is
   named in `OLLAMA_ROUTER_EXTERNAL_BACKENDS`, the file is rejected. By
   construction, traffic for a `local` alias can never leave the local
@@ -128,6 +137,18 @@ local secret = llama-swap/qwen3.6:latest | rivoli/glm-5.2
 - Aliases are a **distinct namespace**, resolved before — and shadowing —
   concrete model lookup. Escalation and the single-hop fallback map are
   skipped entirely for alias requests: the chain is the failover mechanism.
+  (A fallback-map *stand-in* may itself name an alias, though — that request
+  enters the chain path.)
+- **Streaming**: the cold-load heartbeat (which commits `200 OK` before the
+  upstream status is known, forfeiting the rest of the chain) engages for a
+  candidate only when its backend's discovered model list advertises the
+  candidate model — positive evidence it exists and is merely cold. A
+  reachable llama-swap that does *not* advertise the model is passed over
+  immediately (`reason="model_missing"`) without an upstream attempt.
+- When **no** candidate is reachable (startup race before the first
+  discovery cycle, or a registry-blind outage), the walk attempts every
+  candidate in order anyway — connect/timeout advances weed out the truly
+  dead ones instead of returning a blind 502.
 - Aliases appear in `/v1/models` (`owned_by: "router-alias"`) and `/api/tags`
   (synthesised, pydantic-safe entries); concrete models keep listing.
 - Unknown backend names, duplicate aliases, empty chains, and an alias named
@@ -136,9 +157,11 @@ local secret = llama-swap/qwen3.6:latest | rivoli/glm-5.2
 - There are deliberately no per-candidate retries or backoff — the chain
   advance *is* the retry.
 - Metrics: `ollama_router_chain_advance{alias,from,to,reason}` (reasons:
-  `unreachable|connect|timeout|transport|rate_limited|model_missing|upstream_5xx`;
+  `unreachable|connect|timeout|transport|auth|rate_limited|model_missing|upstream_5xx`;
   `from` is the previous hop — the alias name for the first candidate) and
-  `ollama_router_chain_exhausted{alias}`.
+  `ollama_router_chain_exhausted{alias}`. An exhausted chain still records
+  `requests_total` — alias as the model, and the backend whose failure was
+  relayed (`"none"` when no candidate produced a response).
 
 Cold-load heartbeat (kicks in when an upstream model isn't loaded):
 

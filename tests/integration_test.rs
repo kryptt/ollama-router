@@ -388,6 +388,7 @@ async fn spawn_router(state: AppState) -> String {
     let router = router
         .route("/api/tags", get(handler::tags_route))
         .route("/v1/models", get(handler::v1_models_route))
+        .route("/v1/models/{model_id}", get(handler::v1_model_route))
         .with_state(state);
     spawn_test_server(router).await
 }
@@ -525,6 +526,13 @@ async fn alias_chain_exhausted_relays_last_failure() {
         "expected a chain_exhausted sample:\n{text}"
     );
     assert!(text.contains(r#"reason="upstream_5xx""#), "{text}");
+    // Even an exhausted chain answered the client, so the request shows up
+    // in requests_total: alias as the model, the backend whose failure was
+    // relayed, and the relayed status.
+    assert!(
+        text.contains(r#"ollama_router_requests_total{model="ali",backend="p2",status_code="500""#),
+        "exhausted chain must still record request metrics:\n{text}"
+    );
 }
 
 #[tokio::test]
@@ -644,6 +652,25 @@ async fn aliases_listed_in_v1_models_and_api_tags() {
     assert!(alias_tag["size"].is_u64());
     assert!(models.iter().any(|m| m["name"] == "m:latest"), "{models:?}");
 
+    // Anything /v1/models lists must be retrievable by id — the alias too.
+    let one: serde_json::Value = client
+        .get(format!("{base}/v1/models/ali"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(one["id"], "ali");
+    assert_eq!(one["owned_by"], "router-alias");
+    // Concrete retrieval still works alongside.
+    let concrete = client
+        .get(format!("{base}/v1/models/m"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(concrete.status(), StatusCode::OK);
+
     // The unknown-model 404 hint includes the alias.
     let resp = post_chat(&client, &base, "nope", false).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -693,4 +720,175 @@ async fn concrete_models_and_fallbacks_route_unchanged_alongside_aliases() {
         text.contains(r#"ollama_router_fallbacks_total{from="ghost",to="m:latest"}"#),
         "{text}"
     );
+}
+
+#[tokio::test]
+async fn alias_chain_advances_on_auth_error() {
+    // Expired/missing external API key is the steady-state failure of the
+    // hosted backends this feature targets: it must fail over, not relay.
+    let b1 = start_counting_backend(vec!["m:latest"], StatusCode::UNAUTHORIZED).await;
+    let b2 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+
+    let mut config = Config::from_backends(vec![
+        Backend::for_test("p1", &b1.url),
+        Backend::for_test("p2", &b2.url),
+    ]);
+    let (_dir, path) = write_aliases_file("ali = p1/m:latest | p2/m:latest\n");
+    config.aliases_file = Some(path);
+
+    let reg = registry::new_shared(&config);
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+
+    let client = Client::new();
+    let resp = post_chat(&client, &base, "ali", false).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(b1.chat_hits(), 1);
+    assert_eq!(b2.chat_hits(), 1);
+
+    let text = state.metrics.encode().unwrap();
+    assert!(
+        text.contains(r#"reason="auth""#),
+        "expected an auth chain_advance sample:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn alias_chain_skips_llama_swap_missing_model_without_send() {
+    // A reachable llama-swap that does NOT advertise the candidate model
+    // must be passed over without an upstream attempt (its list is fresh —
+    // absence is positive evidence), even for a streaming request. Before
+    // the heartbeat gate, streaming would have committed 200 on the dead-end
+    // candidate and never reached the healthy one.
+    let swap = start_counting_backend(vec!["other:latest"], StatusCode::OK).await;
+    let b2 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+
+    let mut config = Config::from_backends(vec![
+        Backend::for_test("llama-swap", &swap.url),
+        Backend::for_test("p2", &b2.url),
+    ]);
+    let (_dir, path) = write_aliases_file("ali = llama-swap/m:latest | p2/m:latest\n");
+    config.aliases_file = Some(path);
+
+    let reg = registry::new_shared(&config);
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+
+    let client = Client::new();
+    let resp = post_chat(&client, &base, "ali", true).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.text().await.unwrap().starts_with("echoed:"));
+
+    // llama-swap received ZERO chat requests; the second candidate served.
+    assert_eq!(swap.chat_hits(), 0);
+    assert_eq!(b2.chat_hits(), 1);
+    let text = state.metrics.encode().unwrap();
+    assert!(
+        text.contains(r#"to="llama-swap""#) && text.contains(r#"reason="model_missing""#),
+        "expected a model_missing advance for llama-swap:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn alias_resolves_latest_normalized_name() {
+    // Ollama clients normalise a bare model name to `name:latest`; the
+    // alias must resolve under that spelling and keep the canonical name
+    // in metric labels.
+    let b1 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+
+    let mut config = Config::from_backends(vec![Backend::for_test("p1", &b1.url)]);
+    let (_dir, path) = write_aliases_file("ali = p1/m:latest\n");
+    config.aliases_file = Some(path);
+
+    let reg = registry::new_shared(&config);
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+
+    let client = Client::new();
+    let resp = post_chat(&client, &base, "ali:latest", false).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.text().await.unwrap().starts_with("echoed:"));
+    assert_eq!(b1.chat_hits(), 1);
+}
+
+#[tokio::test]
+async fn fallback_to_alias_stand_in_enters_chain() {
+    // A fallback stand-in naming an alias is the natural operator move once
+    // chains exist: the request enters the chain path instead of being
+    // dropped as "target not in registry".
+    let b1 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+
+    let mut config = Config::from_backends(vec![Backend::for_test("p1", &b1.url)]);
+    let (_adir, apath) = write_aliases_file("ali = p1/m:latest\n");
+    config.aliases_file = Some(apath);
+    let fdir = tempfile::tempdir().unwrap();
+    let fpath = fdir.path().join("fallbacks");
+    std::fs::write(&fpath, "ghost=ali\n").unwrap();
+    config.fallback_file = Some(fpath.to_str().unwrap().to_string());
+
+    let reg = registry::new_shared(&config);
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+
+    let client = Client::new();
+    let resp = post_chat(&client, &base, "ghost", false).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.text().await.unwrap().starts_with("echoed:"));
+    assert_eq!(b1.chat_hits(), 1);
+
+    let text = state.metrics.encode().unwrap();
+    assert!(
+        text.contains(r#"ollama_router_fallbacks_total{from="ghost",to="ali"}"#),
+        "{text}"
+    );
+    // The committed candidate is recorded under its concrete labels.
+    assert!(text.contains(r#"backend="p1""#), "{text}");
+}
+
+#[tokio::test]
+async fn alias_attempts_all_candidates_when_none_reachable() {
+    // Startup race / registry-blind window: discovery marks the backend
+    // down (its listing endpoints fail) but the backend actually answers
+    // /api/chat. With no reachable candidate the walk must attempt them
+    // all in order rather than 502 blindly.
+    let chat_hits = Arc::new(AtomicUsize::new(0));
+    let hits = chat_hits.clone();
+    let app = Router::new()
+        .route(
+            "/api/chat",
+            post(move |payload: Bytes| async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::OK, format!("echoed: {}", payload.len()))
+            }),
+        )
+        // /api/tags, /v1/models, /api/ps all fail: discovery never marks
+        // this backend healthy.
+        .fallback(any(|| async {
+            (StatusCode::INTERNAL_SERVER_ERROR, "boom")
+        }));
+    let url = spawn_test_server(app).await;
+
+    let mut config = Config::from_backends(vec![Backend::for_test("p1", &url)]);
+    let (_dir, path) = write_aliases_file("ali = p1/m:latest\n");
+    config.aliases_file = Some(path);
+
+    let reg = registry::new_shared(&config);
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+    assert!(reg.read().await.any_healthy().is_none());
+
+    let client = Client::new();
+    let resp = post_chat(&client, &base, "ali", false).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.text().await.unwrap().starts_with("echoed:"));
+    assert_eq!(chat_hits.load(Ordering::SeqCst), 1);
+
+    let text = state.metrics.encode().unwrap();
+    // The candidate was attempted, not skipped: no "unreachable" advance.
+    assert!(!text.contains(r#"reason="unreachable""#), "{text}");
 }

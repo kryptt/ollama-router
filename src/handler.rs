@@ -21,7 +21,7 @@ use crate::heartbeat::{self, HeartbeatConfig, StreamProtocol};
 use crate::metrics::{self, Metrics};
 use crate::models;
 use crate::proxy;
-use crate::registry::{BackendProtocol, SharedRegistry};
+use crate::registry::{BackendProtocol, Registry, SharedRegistry};
 use crate::response::json_status;
 use crate::routes;
 use crate::spill;
@@ -74,44 +74,11 @@ pub async fn model_route(
     // single-hop fallback — the chain itself is the failover mechanism.
     // Candidates are snapshotted out of the registry here so no lock is
     // held across any upstream I/O during the walk.
-    let alias_chain: Option<Vec<ChainCandidate>> = {
+    let alias_chain = {
         let reg = state.registry.read().await;
-        reg.alias_for(&spilled.model).map(|alias| {
-            alias
-                .candidates
-                .iter()
-                .map(|c| match reg.backend_id_by_name(&c.backend) {
-                    Some(id) => {
-                        let view = reg.backend(id);
-                        ChainCandidate {
-                            model: c.model.clone(),
-                            reachable: view.healthy || view.in_grace_period,
-                            target: AttemptTarget {
-                                url: view.url.to_string(),
-                                name: view.name.to_string(),
-                                protocol: view.protocol,
-                                strip_auth: view.strip_auth,
-                            },
-                        }
-                    }
-                    // Parse-time validation pins candidate backends to the
-                    // configured set, so this arm is defensive only: treat
-                    // an unknown backend as unreachable rather than panic.
-                    None => ChainCandidate {
-                        model: c.model.clone(),
-                        reachable: false,
-                        target: AttemptTarget {
-                            url: String::new(),
-                            name: c.backend.clone(),
-                            protocol: BackendProtocol::Ollama,
-                            strip_auth: false,
-                        },
-                    },
-                })
-                .collect()
-        })
+        snapshot_alias_chain(&reg, &spilled.model)
     };
-    if let Some(candidates) = alias_chain {
+    if let Some((alias, candidates)) = alias_chain {
         let ctx = AttemptContext {
             state: &state,
             method: &method,
@@ -119,7 +86,7 @@ pub async fn model_route(
             headers: &headers,
             stream: spilled.stream,
         };
-        return route_alias_chain(&ctx, spilled.model, spilled.body, candidates).await;
+        return route_alias_chain(&ctx, alias, spilled.body, candidates).await;
     }
 
     // Escalate to a higher-context sibling when input is too big for the
@@ -185,20 +152,23 @@ pub async fn model_route(
     if reg.lookup(&spilled.model).is_none()
         && let Some(target) = reg.fallback_for(&spilled.model).map(str::to_string)
     {
-        if reg.lookup(&target).is_some() {
-            state
-                .metrics
-                .fallbacks
-                .get_or_create(&metrics::EscalationLabels {
-                    from: spilled.model.clone(),
-                    to: target.clone(),
-                })
-                .inc();
-            tracing::info!(
-                from = %spilled.model,
-                to = %target,
-                "no reachable backend serves model; applying fallback",
-            );
+        // The stand-in may itself be an alias — the natural operator move
+        // once chains exist ("when the local model is gone, use the chain").
+        // An alias stand-in routes through the chain path; a concrete
+        // published stand-in keeps the original one-hop rewrite.
+        if let Some((alias, candidates)) = snapshot_alias_chain(&reg, &target) {
+            record_fallback(&state.metrics, &spilled.model, &target);
+            drop(reg);
+            let ctx = AttemptContext {
+                state: &state,
+                method: &method,
+                uri: &uri,
+                headers: &headers,
+                stream: spilled.stream,
+            };
+            return route_alias_chain(&ctx, alias, spilled.body, candidates).await;
+        } else if reg.lookup(&target).is_some() {
+            record_fallback(&state.metrics, &spilled.model, &target);
             spilled.model = target;
         } else {
             tracing::warn!(
@@ -279,7 +249,7 @@ pub async fn model_route(
         strip_auth: backend_strip_auth,
     };
 
-    let outcome = match execute_attempt(&ctx, &spilled.model, spilled.body, &target).await {
+    let outcome = match execute_attempt(&ctx, &spilled.model, spilled.body, &target, true).await {
         Ok(o) => o,
         Err(resp) => return resp,
     };
@@ -300,26 +270,7 @@ pub async fn model_route(
         AttemptOutcome::Failed(e) => e.into_response(),
     };
 
-    let duration = start.elapsed().as_secs_f64();
-    let status_code = response.status().as_u16();
-    span.record("http.response.status_code", status_code);
-
-    // The `stream` label means "this request will actually stream the
-    // response back" — i.e. spilled.stream AND the path's protocol
-    // supports streaming. For /api/embed and /api/show this is always
-    // false even when the body's stream flag (defaulted) reads true,
-    // because those endpoints return a single JSON regardless.
-    let actually_streams = spilled.stream && StreamProtocol::from_path(uri.path()).is_some();
-
-    record_request_metrics(
-        &state.metrics,
-        spilled.model,
-        target.name,
-        status_code,
-        method.as_str(),
-        actually_streams,
-        duration,
-    );
+    record_commit(&ctx, &response, spilled.model, target.name, start);
 
     response
 }
@@ -370,6 +321,14 @@ enum AttemptOutcome {
 /// send. Extracted so the legacy single-backend path and the alias-chain
 /// walk share one implementation and cannot drift.
 ///
+/// `allow_heartbeat` gates the heartbeat path on top of the usual
+/// streaming + preflight decision. The single-backend path always allows
+/// it (unchanged behaviour); the chain path allows it only on positive
+/// registry evidence that the candidate model exists on this backend —
+/// a heartbeat engagement commits `200 OK` before the upstream status is
+/// known, which forfeits the rest of the chain, so it must not fire for
+/// a model the backend cannot actually serve.
+///
 /// `Err(response)` is a request-side failure (unreadable or non-JSON body)
 /// that goes straight back to the client — trying another backend cannot
 /// fix the client's own body.
@@ -378,6 +337,7 @@ async fn execute_attempt(
     model: &str,
     body: Body,
     target: &AttemptTarget,
+    allow_heartbeat: bool,
 ) -> Result<AttemptOutcome, Response> {
     // Protocol translation: client speaks Ollama-native /api/chat but the
     // chosen backend only speaks OpenAI /v1/*. We rewrite the upstream URL
@@ -432,7 +392,8 @@ async fn execute_attempt(
     // the heartbeat branch both consume this single value, so the protocol is
     // never re-derived (and never needs an "infallible" unwrap downstream).
     let protocol = StreamProtocol::from_path(ctx.uri.path());
-    let use_heartbeat = ctx.stream
+    let use_heartbeat = allow_heartbeat
+        && ctx.stream
         && protocol.is_some()
         && !preflight_model_loaded(ctx.state, &target.url, &target.name, model).await;
 
@@ -518,9 +479,57 @@ async fn finish_upstream_response(
 struct ChainCandidate {
     model: String,
     /// healthy || in grace period, at snapshot time. Unreachable candidates
-    /// are skipped without an upstream attempt.
+    /// are skipped without an upstream attempt — unless NO candidate is
+    /// reachable, in which case the walk attempts everyone (startup race).
     reachable: bool,
+    /// Whether the backend's discovered model list advertises this
+    /// candidate's model (exact or `:`-prefix). Positive evidence gates the
+    /// heartbeat path; positive absence on a reachable llama-swap skips the
+    /// candidate outright.
+    serves: bool,
     target: AttemptTarget,
+}
+
+/// Snapshot an alias's candidate chain out of the registry: the canonical
+/// alias name (used for metric/span labels so `fast` and `fast:latest`
+/// don't split into two series) plus per-candidate backend views.
+fn snapshot_alias_chain(reg: &Registry, model: &str) -> Option<(String, Vec<ChainCandidate>)> {
+    let (canonical, alias) = reg.alias_for(model)?;
+    let candidates = alias
+        .candidates
+        .iter()
+        .map(|c| match reg.backend_id_by_name(&c.backend) {
+            Some(id) => {
+                let view = reg.backend(id);
+                ChainCandidate {
+                    model: c.model.clone(),
+                    reachable: view.healthy || view.in_grace_period,
+                    serves: view.serves(&c.model),
+                    target: AttemptTarget {
+                        url: view.url.to_string(),
+                        name: view.name.to_string(),
+                        protocol: view.protocol,
+                        strip_auth: view.strip_auth,
+                    },
+                }
+            }
+            // Parse-time validation pins candidate backends to the
+            // configured set, so this arm is defensive only: treat an
+            // unknown backend as unreachable rather than panic.
+            None => ChainCandidate {
+                model: c.model.clone(),
+                reachable: false,
+                serves: false,
+                target: AttemptTarget {
+                    url: String::new(),
+                    name: c.backend.clone(),
+                    protocol: BackendProtocol::Ollama,
+                    strip_auth: false,
+                },
+            },
+        })
+        .collect();
+    Some((canonical.to_string(), candidates))
 }
 
 /// Walk an alias's candidate chain in priority order and commit to the
@@ -561,19 +570,47 @@ async fn route_alias_chain(
         }
     };
 
-    let mut last_failure: Option<Response> = None;
+    // Startup-race guard: before the first discovery cycle completes (or
+    // during a registry-visible total outage) every candidate reads
+    // unreachable, and skipping them all would 502 without trying anyone.
+    // When NO candidate is reachable, attempt all of them in order instead —
+    // the connect/timeout advance path weeds out the truly-dead ones, and a
+    // live-but-not-yet-discovered backend serves the request.
+    let attempt_all = !candidates.iter().any(|c| c.reachable);
+
+    let mut last_failure: Option<(Response, String)> = None;
     // `from` label for chain_advance: the hop the walk arrived from — the
     // alias name itself before the first candidate, then the backend name
     // of the last candidate tried. `to` is the failing candidate's backend.
     let mut from_hop = alias.clone();
     for cand in candidates {
-        if !cand.reachable {
+        if !attempt_all && !cand.reachable {
             record_chain_advance(
                 &ctx.state.metrics,
                 &alias,
                 &from_hop,
                 &cand.target.name,
                 "unreachable",
+            );
+            from_hop = cand.target.name;
+            continue;
+        }
+
+        // llama-swap serves only the models in its own config: a model
+        // absent from its advertised list cannot load, and sending the
+        // request anyway wedges on the child-spawn path instead of failing
+        // fast. Positive absence — the backend is reachable, so its list is
+        // fresh — is decided here without an upstream attempt. When the
+        // backend is unreachable (attempt_all pass) the list is empty or
+        // stale, so absence proves nothing and the attempt proceeds.
+        let kind = models::classify(&cand.target.name);
+        if cand.reachable && kind == models::BackendKind::LlamaSwap && !cand.serves {
+            record_chain_advance(
+                &ctx.state.metrics,
+                &alias,
+                &from_hop,
+                &cand.target.name,
+                "model_missing",
             );
             from_hop = cand.target.name;
             continue;
@@ -587,16 +624,27 @@ async fn route_alias_chain(
             }
         };
 
-        let outcome =
-            match execute_attempt(ctx, &cand.model, Body::from(rewritten), &cand.target).await {
-                Ok(o) => o,
-                // Request-side failure — no other candidate can fix the
-                // client's own body.
-                Err(resp) => return resp,
-            };
+        // Heartbeat is allowed only on positive registry evidence that the
+        // candidate model exists on this backend (merely cold): a heartbeat
+        // engagement commits 200 before the upstream status is known, which
+        // forfeits the rest of the chain.
+        let outcome = match execute_attempt(
+            ctx,
+            &cand.model,
+            Body::from(rewritten),
+            &cand.target,
+            cand.serves,
+        )
+        .await
+        {
+            Ok(o) => o,
+            // Request-side failure — no other candidate can fix the
+            // client's own body.
+            Err(resp) => return resp,
+        };
         match outcome {
             AttemptOutcome::Committed(response) => {
-                record_chain_commit(ctx, &response, cand.model, cand.target.name, start);
+                record_commit(ctx, &response, cand.model, cand.target.name, start);
                 return response;
             }
             AttemptOutcome::Upstream {
@@ -607,6 +655,10 @@ async fn route_alias_chain(
                 let reason = match status {
                     StatusCode::TOO_MANY_REQUESTS => Some("rate_limited"),
                     StatusCode::NOT_FOUND => Some("model_missing"),
+                    // Expired or missing credentials on a hosted backend is
+                    // the steady-state failure this feature exists to
+                    // absorb — fail over rather than relay the auth error.
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Some("auth"),
                     s if s.is_server_error() => Some("upstream_5xx"),
                     _ => None,
                 };
@@ -619,9 +671,10 @@ async fn route_alias_chain(
                             &cand.target.name,
                             reason,
                         );
-                        // Keep the failure so an exhausted chain can relay
-                        // the most recent honest upstream signal.
-                        last_failure = Some(response);
+                        // Keep the failure (and whose it was) so an
+                        // exhausted chain can relay the most recent honest
+                        // upstream signal under honest labels.
+                        last_failure = Some((response, cand.target.name.clone()));
                         from_hop = cand.target.name;
                         continue;
                     }
@@ -633,7 +686,7 @@ async fn route_alias_chain(
                             cand.model.clone(),
                         )
                         .await;
-                        record_chain_commit(ctx, &response, cand.model, cand.target.name, start);
+                        record_commit(ctx, &response, cand.model, cand.target.name, start);
                         return response;
                     }
                 }
@@ -660,12 +713,38 @@ async fn route_alias_chain(
         })
         .inc();
     tracing::warn!(alias = %alias, "alias chain exhausted; no candidate served the request");
-    match last_failure {
-        // Relay the last upstream failure verbatim — the most honest signal
-        // available (e.g. a 429 the client can back off from).
-        Some(resp) => resp,
-        None => proxy::bad_gateway("alias chain exhausted: no reachable candidate"),
-    }
+    // Relay the last upstream failure verbatim — the most honest signal
+    // available (e.g. a 429 the client can back off from) — or a 502 when
+    // no candidate produced a response at all. Either way the client got an
+    // answer, so it must appear in request metrics and the span like any
+    // other request: the alias as the model label, and the backend whose
+    // failure is being relayed — "none" when there wasn't one.
+    let (response, backend) = match last_failure {
+        Some((resp, backend)) => (resp, backend),
+        None => (
+            proxy::bad_gateway("alias chain exhausted: no reachable candidate"),
+            "none".to_string(),
+        ),
+    };
+    record_commit(ctx, &response, alias, backend, start);
+    response
+}
+
+/// Increment the fallback counter and emit the matching info log. Shared by
+/// the concrete-stand-in rewrite and the stand-in-is-an-alias chain entry.
+fn record_fallback(metrics: &Metrics, from: &str, to: &str) {
+    metrics
+        .fallbacks
+        .get_or_create(&metrics::EscalationLabels {
+            from: from.to_string(),
+            to: to.to_string(),
+        })
+        .inc();
+    tracing::info!(
+        from,
+        to,
+        "no reachable backend serves model; applying fallback"
+    );
 }
 
 /// Increment `chain_advance` and emit the matching structured log line.
@@ -682,10 +761,17 @@ fn record_chain_advance(metrics: &Metrics, alias: &str, from: &str, to: &str, re
     tracing::info!(alias, from, to, reason, "alias chain advancing");
 }
 
-/// Record span fields and request metrics for the committed chain candidate,
-/// under its concrete model + backend labels. Committed-via-heartbeat goes
-/// through here too.
-fn record_chain_commit(
+/// Record span fields and request metrics for one answered request: the
+/// single-backend epilogue, a committed chain candidate (concrete model +
+/// backend labels; committed-via-heartbeat included), and the exhausted
+/// chain answer all go through here so metric/span emission cannot drift.
+///
+/// The `stream` label means "this request will actually stream the response
+/// back" — i.e. the body's stream flag AND the path's protocol supports
+/// streaming. For /api/embed and /api/show this is always false even when
+/// the (defaulted) body flag reads true, because those endpoints return a
+/// single JSON regardless.
+fn record_commit(
     ctx: &AttemptContext<'_>,
     response: &Response,
     model: String,

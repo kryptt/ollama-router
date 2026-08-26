@@ -545,7 +545,7 @@ mod tests {
         // Every fallback target is an alias, so a client that still sends a
         // raw model name gets the whole free -> local -> paid walk instead
         // of one hop onto a metered backend.
-        assert_eq!(v.fallbacks.len(), 17);
+        assert_eq!(v.fallbacks.len(), 23);
         for (from, to) in &v.fallbacks {
             assert!(
                 v.aliases.contains_key(to),

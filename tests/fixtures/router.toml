@@ -141,6 +141,19 @@ allow = [
 # silent swap would poison grepai's index. When hr-main is down, jina 404s.
 # That is the correct failure.
 [fallbacks]
+# TRANSITIONAL — the pre-2026-08-26 alias names. Every client that still
+# sends `memory`/`coder`/`vision`/etc. keeps working while it is migrated,
+# because a fallback whose target is an alias enters that alias's chain.
+# These are the ONLY entries here that are meant to be deleted: drop them
+# once `ollama_router_unknown_model_requests_total` stops moving and every
+# client in docs has been repointed.
+"memory" = "auto:memory"
+"financial" = "auto:financial"
+"chat" = "auto"
+"chat-smart" = "auto:smart"
+"coder" = "auto:coding"
+"vision" = "auto:vision"
+
 # llama-swap (rh-anine, vulkan) — the qwen3.6 effort tiers
 "qwen3.6-low" = "auto:fast"
 "qwen3.6-medium" = "auto"

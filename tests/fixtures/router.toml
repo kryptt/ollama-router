@@ -15,6 +15,14 @@
 #
 # Which keys are live and which need a restart: see README.md
 # "## Configuration".
+#
+# ── THE CONTRACT WITH CLIENTS ──────────────────────────────────────────────
+# Clients name a PURPOSE (`auto:*`) or a SPECIFIC EMBEDDING MODEL (`embed:*`).
+# They do not name chat models, and they do not encode effort in a model name
+# — router 0.16.0 translates `reasoning_effort: none|minimal|low|medium|high`
+# into llama.cpp's own spelling for the local backends, so depth is a request
+# parameter now. Concrete model names still resolve (operators need them) and
+# [fallbacks] below rescues the ones clients used to send.
 
 # ── backends: DOCUMENT ORDER IS ROUTING PRIORITY ───────────────────────────
 # The model map is first-writer-wins, so the backend declared first wins a
@@ -22,13 +30,15 @@
 # the metered/hosted ones last — reordering these tables moves the spend
 # boundary.
 
-# hr-main (CUDA): arctic-embed2, GLM-4.6V, gemma4 e2b/e4b.
+# hr-main (CUDA): gemma4 e2b/e4b, GLM-4.6V, jina-code + qwen3 embeddings,
+# whisper/qwen3-asr/chatterbox.
 [[backends]]
 name = "llama-swap-cuda"
 url = "http://llama-swap-cuda.ai:8080"
 allow = ["*"]                            # on-LAN, unmetered: publish everything
 
-# rh-anine (Vulkan): qwen3.6, gpt-oss, gemma4:26b.
+# rh-anine (Vulkan): qwen3.6 effort tiers, gpt-oss, gemma4:26b,
+# nemotron3-super, glm-5.2-rivoli, qwen3 embeddings.
 [[backends]]
 name = "llama-swap"
 url = "http://llama-swap.ai:8080"
@@ -57,8 +67,14 @@ allow = [
   "moonshotai/kimi-k3",                  # 2.40 / 12.00 — deliberate outlier
   "qwen/qwen3.8-27b",                    # 0.36 / 2.56
   "qwen/qwen3.8-max",                    # 1.60 / 4.80
-  # Fallback stand-ins (see [fallbacks] below) — cheap hosted twins of the
-  # local models, published so the fallback hop can resolve them.
+  # Hermes' `general` and `high` gateway profiles. They used to call Nous
+  # DIRECTLY (no allowlist, no metrics, no failover); admitting their models
+  # here is what lets those profiles come back inside the spend boundary.
+  # PRICES UNVERIFIED — check the live catalog and fill them in.
+  "stealth/ox-alpha",                    # ? / ?
+  "deepseek/deepseek-v4-flash-0731",     # ? / ?
+  # Fallback stand-ins and chain tails — cheap hosted twins of the local
+  # models, published so the last hop of a chain can resolve.
   "openai/gpt-oss-120b",                 # 0.02 / 0.14
   "google/gemma-4-26b-a4b-it",           # 0.06 / 0.27
   "nvidia/nemotron-3-super-120b-a12b",   # 0.07 / 0.32
@@ -68,56 +84,108 @@ allow = [
 # freellmapi aggregates free-tier hosted providers (its provider keys also
 # live behind postern). Declared LAST on purpose: an earlier slot would let
 # a colliding hosted model name silently steal traffic from the local
-# backends. `allow = ["*"]` makes its unfiltered publish explicit — it is
-# free-tier, so there is no spend to bound, only rate limits.
+# backends.
+#
+# CURATED, not `["*"]`. The wildcard published 202 ids and drowned every
+# model picker in the fleet (Open WebUI, pi, gptel, hermes-dms) — 237 models
+# total, of which ~20 were ever chosen. This is the shortlist; add an id
+# when you actually want to pick it by name.
+#
+# `auto`, `auto:coding` and `auto:vision` are DELIBERATELY ABSENT. The router
+# publishes its own `auto:*` aliases, and alias names are APPENDED to
+# /v1/models with no dedup against concrete models — allowing freellmapi's
+# copies would list each id twice. Omitting them here hides the duplicates
+# while `freellmapi/auto:*` still works as a chain hop, because chain
+# candidates are never checked against a backend's allow list. freellmapi's
+# own profiles live UNDERNEATH our alias names, which is the intent.
 [[backends]]
 name = "freellmapi"
-url = "http://freellmapi.ai:3001"
+url = "https://freellmapi.hr-home.xyz"
 external = true                          # => can never appear in a `local` alias
-allow = ["*"]
+allow = [
+  # frontier, by name — for when you want a specific one
+  "claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5",
+  "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex",
+  "gemini-3.6-flash", "gemini-3.5-flash-lite",
+  "grok-4.3", "grok-4.1-fast-reasoning",
+  # glm-4.7 is what the Claude Code .envrc-local files ask for over the
+  # Anthropic passthrough — freellmapi is the only backend that translates
+  # /v1/messages, so these must stay reachable BY NAME (an alias would
+  # chain onto a llama-swap hop that speaks no Anthropic).
+  "glm-4.7", "glm-4.7-flash", "glm-5.2",
+  "qwen3-coder-next", "qwen3.5-397b",
+  "kimi-k2.7-code", "minimax-m3",
+  "deepseek-v4-pro", "deepseek-v4-flash",
+  "mistral-small-4", "llama-4-maverick", "gpt-oss-120b",
+  "nemotron-3-ultra",
+  # web-grounded search
+  "sonar", "sonar-pro",
+]
 
-# ── fallbacks: local-model -> hosted stand-in ──────────────────────────────
-# When no reachable backend serves the local model (rh-anine or hr-main down
-# past the ~3 min grace period), the router rewrites the request — routing
-# AND the body's model field — to the stand-in. One hop, applied only if the
-# stand-in is published above. Local serving resumes on recovery.
-# Embedding/ASR/TTS models (jina-code, qwen3-embedding-4b, whisper-*,
-# qwen3-asr, chatterbox) have no hosted twin on Nous — left out.
+# ── fallbacks: concrete name -> alias ──────────────────────────────────────
+# Consulted ONLY when no reachable backend serves the concrete name, and
+# never once an alias chain has started. The target may itself be an alias,
+# which is what every entry below uses: a client that still sends a raw
+# model name gets the same free -> local -> paid walk as an alias caller
+# instead of a single hop straight onto a metered backend.
+#
+# That is not theoretical. The old map sent `qwen3.6-medium` directly to
+# `qwen/qwen3.8-27b`, and it fired 230 times in 30 days — every one a
+# silent paid call standing in for a "local fallback".
 #
 # QUOTE EVERY KEY: every model name contains a `.`, and a bare
 # `qwen3.6-low = "x"` is a TOML *dotted key* meaning `qwen3 = { "6-low" = ... }`.
+#
+# NOTE the deliberate omission: `jina-code-embeddings` has NO entry. Every
+# possible stand-in has a different vector dimension (1536 vs 2560), and a
+# silent swap would poison grepai's index. When hr-main is down, jina 404s.
+# That is the correct failure.
 [fallbacks]
-# llama-swap (rh-anine, vulkan)
-"qwen3.6-low" = "qwen/qwen3.8-27b"
-"qwen3.6-medium" = "qwen/qwen3.8-27b"
-"qwen3.6-high" = "qwen/qwen3.8-max"
-"qwen3.6-ultra" = "qwen/qwen3.8-max"
-"gpt-oss:latest" = "openai/gpt-oss-120b"
-"gpt-oss" = "openai/gpt-oss-120b"
-"gemma4:26b" = "google/gemma-4-26b-a4b-it"
-"nemotron3-super" = "nvidia/nemotron-3-super-120b-a12b"
-"glm-5.2-rivoli" = "z-ai/glm-5.2"
+# llama-swap (rh-anine, vulkan) — the qwen3.6 effort tiers
+"qwen3.6-low" = "auto:fast"
+"qwen3.6-medium" = "auto"
+"qwen3.6" = "auto"
+"qwen3.6:latest" = "auto"
+"qwen3.6-high" = "auto:smart"
+"qwen3.6-ultra" = "auto:smart"
+"gpt-oss" = "auto"
+"gpt-oss:latest" = "auto"
+"gemma4:26b" = "auto"
+"nemotron3-super" = "auto:smart"
+"glm-5.2-rivoli" = "auto:smart"
 # llama-swap-cuda (hr-main)
-"gemma4:e2b" = "google/gemma-4-26b-a4b-it"
-"gemma4:e4b" = "google/gemma-4-26b-a4b-it"
-"gemma4" = "google/gemma-4-26b-a4b-it"
-"haervwe/GLM-4.6V-Flash-9B:latest" = "z-ai/glm-4.6v"
-"haervwe/GLM-4.6V-Flash-9B" = "z-ai/glm-4.6v"
+"gemma4" = "auto:fast"
+"gemma4:e2b" = "auto:fast"
+"gemma4:e4b" = "auto:fast"
+"haervwe/GLM-4.6V-Flash-9B" = "auto:vision"
+"haervwe/GLM-4.6V-Flash-9B:latest" = "auto:vision"
+"qwen3-embedding-4b" = "embed:qwen3"
 
-# ── alias chains: client-facing names walking a priority queue ─────────────
-# free (freellmapi) -> local GPU -> paid (nous). Each candidate is
-# `<backend>/<model>`, split on the FIRST `/` so model ids keep their own
-# slashes. Unreachable candidates are skipped (the freellmapi hops
-# self-activate once its provider keys land — until then chains start at the
-# local hop).
+# ── aliases: the public surface ────────────────────────────────────────────
+# Each candidate is `<backend>/<model>`, split on the FIRST `/` so model ids
+# keep their own slashes. Unreachable candidates are skipped without an
+# upstream attempt; a candidate that answers 404/429/401/403/5xx advances the
+# walk on the response head, before any body byte is forwarded.
+#
+# Ordering is per-role, not one rule:
+#   - `local = true` chains are local-first because the data must not leave.
+#   - `auto:vision` is local-first for the same reason (household camera
+#     frames), not for speed.
+#   - the heavy roles are hosted-first because they are measurably faster:
+#     7d p95 was 21s on freellmapi/auto:coding vs 91s on qwen3.6-high.
+#   - `auto` and `auto:fast` are local-first: gemma4:e4b answers in ~5s p95
+#     and rh-anine is idle most of the day.
+#
+# There is no chain-level timeout. A chain of N candidates can take up to
+# N x request_timeout, so keep chains short and put the flaky hop last.
 
 # ---- privacy-pinned: this data never leaves the cluster ----
 # `local = true` is re-proved on EVERY reload against the roster above:
 # flipping a chained backend to `external = true` rejects the whole file.
 
-# financial: receipt-ledger (bank statements, receipts). Small models,
-#            cheapest first; batch workload, cold-loads are fine.
-[aliases.financial]
+# receipt-ledger: bank statements, receipts. Small models, cheapest first;
+# batch workload, cold-loads are fine.
+[aliases."auto:financial"]
 local = true
 chain = [
   "llama-swap-cuda/gemma4:e2b",
@@ -125,41 +193,81 @@ chain = [
   "llama-swap/qwen3.6-low",
 ]
 
-# memory: hindsight + hr-home-palace (personal memory, financial
-#         classification). qwen3.6-medium first to match tuned timeouts.
-[aliases.memory]
+# hindsight + hr-home-palace: personal memory, financial classification.
+# qwen3.6-medium first to match hindsight's tuned 800s timeout.
+[aliases."auto:memory"]
 local = true
 chain = [
   "llama-swap/qwen3.6-medium",
   "llama-swap-cuda/gemma4:e4b",
 ]
 
-# ---- general chains: free -> local -> paid ----
-# TODO(A2): swap the freellmapi model ids for real advertised ids (or
-# auto:<profile> names) once provider keys exist.
-[aliases.chat]
+# ---- embeddings: ONE MODEL PER ALIAS, NEVER A MIXED CHAIN ----
+# Embedding dimension is a hard lock on whatever index consumes it —
+# hindsight's is enforced in schema (2560 needs vchord; pgvector's HNSW caps
+# at 2000) and changing it means wiping memory_units. So an `embed:*` chain
+# may only hop between backends serving the IDENTICAL model, never between
+# two different embedders. The name says which model you get, on purpose.
+
+# 2560-dim. The same GGUF on both nodes (shared /swarm/storage/ai/models),
+# so this hop is dimension-safe and it is the only embedder in the fleet
+# that survives a single-node outage.
+[aliases."embed:qwen3"]
+local = true
 chain = [
-  "freellmapi/auto:fast",
+  "llama-swap-cuda/qwen3-embedding-4b",
+  "llama-swap/qwen3-embedding-4b",
+]
+
+# 1536-dim, grepai's indexer. Single-homed on hr-main: one hop is all there
+# is, and that is honest. Give it a second hop by adding the model to
+# fleet/ai/llama-swap.yaml — NOT by pointing it at a different embedder.
+[aliases."embed:jina-code"]
+local = true
+chain = [
+  "llama-swap-cuda/jina-code-embeddings",
+]
+
+# ---- purpose chains ----
+
+# The default. Anything that just wants a competent answer.
+[aliases."auto"]
+chain = [
   "llama-swap/qwen3.6-medium",
+  "freellmapi/auto",
   "nous/nousresearch/hermes-4-70b",
 ]
 
-[aliases.chat-smart]
+# Short turns, classification, tool-shaped work. Cheapest that can answer.
+[aliases."auto:fast"]
 chain = [
-  "freellmapi/auto:smart",
+  "llama-swap-cuda/gemma4:e4b",
+  "llama-swap/qwen3.6-low",
+  "freellmapi/auto",
+  "nous/openai/gpt-oss-120b",
+]
+
+# Hard reasoning. Hosted first — the local high tier is ~4x slower.
+[aliases."auto:smart"]
+chain = [
+  "freellmapi/auto",
   "llama-swap/qwen3.6-high",
   "nous/nousresearch/hermes-4-405b",
 ]
 
-[aliases.coder]
+# Code. freellmapi's `coding` chain is a real named chain as of 0.8.7.
+[aliases."auto:coding"]
 chain = [
   "freellmapi/auto:coding",
   "llama-swap/qwen3.6-high",
   "nous/qwen/qwen3.8-max",
 ]
 
-[aliases.vision]
+# Images. LOCAL FIRST: this is what Home Assistant's LLM Vision sends, and
+# the frames are household camera captures.
+[aliases."auto:vision"]
 chain = [
   "llama-swap-cuda/haervwe/GLM-4.6V-Flash-9B:latest",
+  "freellmapi/auto:vision",
   "nous/z-ai/glm-4.6v",
 ]

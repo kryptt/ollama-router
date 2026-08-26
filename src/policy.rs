@@ -493,8 +493,8 @@ mod tests {
             vec!["llama-swap-cuda", "llama-swap", "nous", "freellmapi"]
         );
 
-        // Both llama-swaps and freellmapi publish everything...
-        for name in ["llama-swap-cuda", "llama-swap", "freellmapi"] {
+        // The on-LAN, unmetered backends publish everything...
+        for name in ["llama-swap-cuda", "llama-swap"] {
             let b = v
                 .backends
                 .iter()
@@ -511,7 +511,7 @@ mod tests {
             .find(|b| b.name == "nous")
             .expect("nous present");
         let allow = nous.allow_models.as_ref().expect("nous is allowlisted");
-        assert_eq!(allow.len(), 13);
+        assert_eq!(allow.len(), 15);
         assert!(allow.contains("nousresearch/hermes-4-405b"));
         assert!(allow.contains("z-ai/glm-4.6v"));
         assert!(
@@ -520,13 +520,50 @@ mod tests {
         );
         assert!(nous.strip_auth);
 
-        assert_eq!(v.fallbacks.len(), 14);
+        // freellmapi is curated too — not to bound spend (it is free tier)
+        // but to keep the published catalogue small enough to pick from.
+        let free = v
+            .backends
+            .iter()
+            .find(|b| b.name == "freellmapi")
+            .expect("freellmapi present");
+        let free_allow = free.allow_models.as_ref().expect("freellmapi is curated");
+        assert_eq!(free_allow.len(), 25);
+        assert!(!free.strip_auth, "freellmapi must forward auth");
+        // Its own `auto:*` profiles are deliberately NOT published: the
+        // router's aliases carry those names, and alias entries are appended
+        // to /v1/models without dedup, so publishing both would list each id
+        // twice. Chain candidates bypass the allow list, so the hops still
+        // work — see the `auto:coding` chain below.
+        for hidden in ["auto", "auto:coding", "auto:vision"] {
+            assert!(
+                !free_allow.contains(hidden),
+                "{hidden} must stay hidden behind the router's own alias"
+            );
+        }
+
+        // Every fallback target is an alias, so a client that still sends a
+        // raw model name gets the whole free -> local -> paid walk instead
+        // of one hop onto a metered backend.
+        assert_eq!(v.fallbacks.len(), 17);
+        for (from, to) in &v.fallbacks {
+            assert!(
+                v.aliases.contains_key(to),
+                "fallback {from} -> {to} must target an alias, not a bare model"
+            );
+        }
         assert_eq!(
             v.fallbacks.get("gemma4:e2b").map(String::as_str),
-            Some("google/gemma-4-26b-a4b-it")
+            Some("auto:fast")
+        );
+        // Dimension lock: jina (1536) has no stand-in of the same width, and
+        // silently swapping in a 2560-dim embedder would poison the index.
+        assert!(
+            !v.fallbacks.contains_key("jina-code-embeddings"),
+            "an embedding model must never fall back across dimensions"
         );
 
-        assert_eq!(v.aliases.len(), 6);
+        assert_eq!(v.aliases.len(), 9);
         let mut local: Vec<&str> = v
             .aliases
             .iter()
@@ -534,18 +571,44 @@ mod tests {
             .map(|(n, _)| n.as_str())
             .collect();
         local.sort();
-        assert_eq!(local, vec!["financial", "memory"]);
+        assert_eq!(
+            local,
+            vec![
+                "auto:financial",
+                "auto:memory",
+                "embed:jina-code",
+                "embed:qwen3"
+            ]
+        );
+
+        // Every `embed:*` alias pins ONE model across its whole chain. A hop
+        // between two different embedders would change the vector width
+        // under a live index.
+        for (name, alias) in v.aliases.iter().filter(|(n, _)| n.starts_with("embed:")) {
+            let first = &alias.candidates[0].model;
+            assert!(
+                alias.candidates.iter().all(|c| &c.model == first),
+                "{name} chains across models: {first} vs others"
+            );
+        }
 
         // The vision chain exercises the first-'/' split on a model id that
         // contains both '/' and ':'.
-        let vision = v.aliases.get("vision").expect("vision alias");
+        let vision = v.aliases.get("auto:vision").expect("auto:vision alias");
         assert_eq!(vision.candidates[0].backend, "llama-swap-cuda");
         assert_eq!(
             vision.candidates[0].model,
             "haervwe/GLM-4.6V-Flash-9B:latest"
         );
-        assert_eq!(vision.candidates[1].backend, "nous");
-        assert_eq!(vision.candidates[1].model, "z-ai/glm-4.6v");
+        assert_eq!(vision.candidates[2].backend, "nous");
+        assert_eq!(vision.candidates[2].model, "z-ai/glm-4.6v");
+
+        // A chain candidate may name a model its backend does not publish:
+        // freellmapi's `auto:coding` is hidden from the catalogue above but
+        // still reachable as the first hop here.
+        let coding = v.aliases.get("auto:coding").expect("auto:coding alias");
+        assert_eq!(coding.candidates[0].backend, "freellmapi");
+        assert_eq!(coding.candidates[0].model, "auto:coding");
     }
 
     // ── schema ───────────────────────────────────────────────────────────

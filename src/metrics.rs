@@ -37,6 +37,12 @@ pub struct Metrics {
     /// `/api/chat` from a client → `/v1/chat/completions` to a backend
     /// that only speaks OpenAI). Label-free on purpose — cardinality.
     pub protocol_translations: Counter,
+    /// Requests whose `reasoning_effort` was rewritten into llama.cpp's own
+    /// spelling (`chat_template_kwargs.enable_thinking` +
+    /// `thinking_budget_tokens`). Counts only bodies that actually asked for
+    /// reasoning; a body that never mentions it is forwarded untouched and
+    /// never counted. Label-free on purpose — cardinality.
+    pub reasoning_translations: Counter,
     /// Alias-chain failovers: while serving alias `alias`, the walk moved
     /// past candidate backend `to` because of `reason`. The hop it came
     /// from is implied by the chain order in the alias file, so it is not
@@ -164,6 +170,13 @@ impl Metrics {
             protocol_translations.clone(),
         );
 
+        let reasoning_translations = Counter::default();
+        registry.register(
+            "ollama_router_reasoning_translations",
+            "Requests whose reasoning_effort was rewritten for a llama.cpp backend",
+            reasoning_translations.clone(),
+        );
+
         let chain_advance = Family::default();
         registry.register(
             "ollama_router_chain_advance",
@@ -257,6 +270,7 @@ impl Metrics {
             escalations_skipped,
             fallbacks,
             protocol_translations,
+            reasoning_translations,
             chain_advance,
             chain_exhausted,
             start_time_seconds,

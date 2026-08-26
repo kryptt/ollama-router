@@ -166,6 +166,29 @@ fn mock_backend_router(
         .fallback(catch_all)
 }
 
+/// A mock backend that echoes the raw `/v1/chat/completions` body straight
+/// back, so a test can assert on exactly what the router forwarded.
+async fn start_body_echo_backend(models: Vec<&str>, status: StatusCode) -> MockBackend {
+    let chat_hits = Arc::new(AtomicUsize::new(0));
+    let hits = chat_hits.clone();
+    let router = mock_backend_router(models, StatusCode::OK, Arc::new(AtomicUsize::new(0))).route(
+        "/v1/chat/completions",
+        post(move |payload: Bytes| {
+            let hits = hits.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                (status, payload)
+            }
+        }),
+    );
+    let (url, handle) = spawn_test_server_abortable(router).await;
+    MockBackend {
+        url,
+        handle,
+        chat_hits,
+    }
+}
+
 /// Start a mock backend whose /api/chat answers with `chat_status`.
 async fn start_counting_backend(models: Vec<&str>, chat_status: StatusCode) -> MockBackend {
     let chat_hits = Arc::new(AtomicUsize::new(0));
@@ -501,6 +524,88 @@ async fn alias_chain_advances_past_rate_limited_candidate() {
         text.contains(r#"backend="p2""#) && text.contains(r#"model="m:latest""#),
         "{text}"
     );
+}
+
+/// `reasoning_effort` is the scale every client speaks and the one thing
+/// llama.cpp ignores. The router must rewrite it into llama.cpp's own
+/// spelling — and must still do so on the candidate a chain advanced ONTO,
+/// not just the first one it tried.
+#[tokio::test]
+async fn reasoning_effort_is_translated_for_the_candidate_the_chain_lands_on() {
+    let b1 = start_body_echo_backend(vec!["m:latest"], StatusCode::TOO_MANY_REQUESTS).await;
+    let b2 = start_body_echo_backend(vec!["m:latest"], StatusCode::OK).await;
+
+    let (_dir, config, reg) = policy_setup(
+        &[("llama-swap-a", &b1.url), ("llama-swap-b", &b2.url)],
+        &alias_toml("ali", &["llama-swap-a/m:latest", "llama-swap-b/m:latest"]),
+    );
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+
+    let client = Client::new();
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({
+            "model": "ali",
+            "reasoning_effort": "high",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let forwarded: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(forwarded["chat_template_kwargs"]["enable_thinking"], true);
+    assert_eq!(forwarded["thinking_budget_tokens"], 32768);
+    assert!(
+        forwarded.get("reasoning_effort").is_none(),
+        "llama.cpp ignores reasoning_effort; it must not survive: {forwarded}"
+    );
+    // The alias rewrite still happened alongside the effort rewrite.
+    assert_eq!(forwarded["model"], "m:latest");
+    assert_eq!(forwarded["messages"][0]["content"], "hi");
+
+    assert_eq!(b1.chat_hits(), 1, "first candidate should have been tried");
+    assert_eq!(b2.chat_hits(), 1);
+
+    let text = state.metrics.encode().unwrap();
+    assert!(
+        text.contains("ollama_router_reasoning_translations_total 2"),
+        "both candidates should have been translated:\n{text}"
+    );
+
+    b1.handle.abort();
+    b2.handle.abort();
+}
+
+/// A hosted backend understands `reasoning_effort` natively. Rewriting it
+/// there would be a downgrade, so the body must arrive byte-identical.
+#[tokio::test]
+async fn reasoning_effort_reaches_a_hosted_backend_untouched() {
+    let hosted = start_body_echo_backend(vec!["m:latest"], StatusCode::OK).await;
+
+    let (_dir, config, reg) = policy_setup(&[("nous", &hosted.url)], "");
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+
+    let client = Client::new();
+    let resp = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({"model": "m:latest", "reasoning_effort": "high", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let forwarded: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(forwarded["reasoning_effort"], "high");
+    assert!(forwarded.get("chat_template_kwargs").is_none());
+    assert!(forwarded.get("thinking_budget_tokens").is_none());
+
+    hosted.handle.abort();
 }
 
 #[tokio::test]

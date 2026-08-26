@@ -18,6 +18,12 @@ compatible inference endpoints behind a single OpenAI-compatible API.
   request body, streaming SSE responses, and non-streaming responses are
   reshaped in-flight in both directions, transparently to the client. (Scope
   today: `/api/chat`; other paths proxy unchanged.)
+- **Portable reasoning effort.** The OpenAI `reasoning_effort` scale — which
+  Zed, Open WebUI, pi and freellmapi all speak — is rewritten into llama.cpp's
+  own spelling for llama-swap-family backends, which otherwise ignore it.
+  Hosted backends understand the field natively and receive it untouched, so
+  clients can stop encoding effort in the model name. See
+  [Reasoning effort](#reasoning-effort).
 - **Cold-load heartbeat.** Preflights the backend (Ollama `/api/ps`,
   llama-swap `/running`, or "always-resident" backends) and, while a model is
   still loading, injects protocol-correct keepalive bytes — empty NDJSON chunks
@@ -283,6 +289,54 @@ or 5xx response heads.
   `ollama_router_chain_exhausted{alias}`. An exhausted chain still records
   `requests_total` — alias as the model, and the backend whose failure was
   relayed (`"none"` when no candidate produced a response).
+
+### Reasoning effort
+
+`reasoning_effort: none | minimal | low | medium | high` is the field OpenAI
+defined and Zed, Open WebUI, pi and freellmapi all emit. llama.cpp's
+llama-server accepts per-request thinking control too, but under different
+names, and ignores `reasoning_effort` outright — which is why effort so often
+ends up baked into a model name instead.
+
+For **llama-swap-family** backends (`llama-swap*`, `llama-edge*`) on
+`/api/chat` and `/v1/chat/completions`, the router rewrites it:
+
+| `reasoning_effort` | `chat_template_kwargs.enable_thinking` | `thinking_budget_tokens` |
+|---|---|---|
+| `none` | `false` | — |
+| `minimal` | `true` | 512 |
+| `low` | `true` | 2048 |
+| `medium` | `true` | 8192 |
+| `high` | `true` | 32768 |
+
+Details that matter in practice:
+
+- **Off-scale spellings fold onto the scale**, matching freellmapi so both
+  hops of a chain agree on what a word means: `max`/`maximum`/`highest`/
+  `ultra`/`xhigh` → `high`; `mid`/`balanced`/`normal` → `medium`;
+  `min`/`lowest`/`xlow` → `minimal`; `off`/`disabled` → `none`.
+- **Unrecognised values are dropped, never rejected.** `auto`, `adaptive` and
+  anything unknown remove the knob and let the server's own default stand —
+  a request is never 400'd over an effort spelling.
+- **The object form `reasoning: { effort }` is accepted**, and the wrapper is
+  never forwarded: backends disagree on its shape. A flat `reasoning_effort`
+  wins where both are present.
+- **An explicit llama.cpp knob beats the coarse level.** A client that spelled
+  out `chat_template_kwargs.enable_thinking` or `thinking_budget_tokens` meant
+  it; those values are left alone.
+- **The budget is clamped** to the client's own `max_completion_tokens` /
+  `max_tokens` when it set one. llama.cpp does no clamping itself.
+- **Hosted backends are untouched.** `nous`, `freellmapi` and anything else
+  not in the llama-swap family receive `reasoning_effort` verbatim, because
+  they already understand it.
+- **A body that never mentions reasoning is forwarded byte-identical**, and
+  `ollama_router_reasoning_translations_total` counts only the bodies that did.
+- The translation is applied **per alias-chain candidate**, so a chain that
+  advances from a local hop to a hosted one sends each the spelling it wants.
+
+Two upstream gates apply on the llama.cpp side: the budget takes effect only
+when the server was started with `--reasoning-budget -1` (the default) and
+only when the chat template exposes a thinking end tag.
 
 ### Environment
 

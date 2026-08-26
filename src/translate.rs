@@ -7,6 +7,10 @@
 //! translates the request body, and reshapes the response — either a single
 //! JSON object or an SSE stream — back into the Ollama-native NDJSON / JSON
 //! shape the client expects.
+//!
+//! It also carries the one translation that is not about protocol at all:
+//! `reasoning_effort` -> llama.cpp's `chat_template_kwargs.enable_thinking`
+//! and `thinking_budget_tokens`. See `reasoning_effort_to_llamacpp`.
 
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -50,7 +54,9 @@ pub fn ollama_chat_to_openai_request(bytes: &[u8]) -> Result<Vec<u8>, serde_json
                 // num_ctx is a server-side knob, not a request param. Drop.
                 "num_ctx" => continue,
                 // Anything else: pass through with original name. OpenAI
-                // tolerates unknown fields.
+                // tolerates unknown fields. Root fields win a collision (see
+                // `request_preserves_root_field_collisions_under_options`):
+                // an explicit root value is caller intent, `options` is not.
                 _ => {
                     obj.entry(key).or_insert(value);
                     continue;
@@ -74,6 +80,132 @@ pub fn rewrite_model_field(bytes: &[u8], model: &str) -> Result<Vec<u8>, serde_j
         obj.insert("model".to_string(), Value::String(model.to_string()));
     }
     serde_json::to_vec(&root)
+}
+
+// ---------------------------------------------------------------------------
+// reasoning_effort -> llama.cpp
+// ---------------------------------------------------------------------------
+
+/// How much thinking each `reasoning_effort` level buys, in tokens.
+///
+/// `reasoning_effort: none|minimal|low|medium|high` is the spelling OpenAI,
+/// Zed, Open WebUI, pi and freellmapi all speak. llama.cpp's llama-server
+/// accepts per-request thinking control too — but under different names:
+/// `chat_template_kwargs.enable_thinking` (server-common.cpp) and
+/// `thinking_budget_tokens`. It ignores `reasoning_effort` outright. This
+/// table is the bridge, and it is the reason effort no longer has to be
+/// encoded in a model name.
+///
+/// Budgets are deliberately coarse — the point is a usable gradient, not a
+/// calibrated one.
+const EFFORT_BUDGETS: [(&str, u64); 4] = [
+    ("minimal", 512),
+    ("low", 2048),
+    ("medium", 8192),
+    ("high", 32768),
+];
+
+/// Fold the spellings clients actually send onto the canonical scale.
+/// Mirrors freellmapi's `EFFORT_ALIASES` (`server/src/lib/sampling-params.ts`)
+/// so the two hops in a chain agree on what a word means.
+fn canonical_effort(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" | "off" | "disabled" => Some("none"),
+        "minimal" | "min" | "lowest" | "xlow" => Some("minimal"),
+        "low" => Some("low"),
+        "medium" | "mid" | "balanced" | "normal" => Some("medium"),
+        "high" | "max" | "maximum" | "highest" | "ultra" | "xhigh" => Some("high"),
+        // "auto"/"adaptive" and anything unrecognised: no opinion. The knob
+        // is dropped and the server's own default stands, which is what
+        // freellmapi does and the only behaviour that can't surprise anyone.
+        _ => None,
+    }
+}
+
+/// Read the client's requested effort out of the body, removing whichever
+/// spelling carried it. Accepts the flat `reasoning_effort: "high"` and the
+/// object form `reasoning: { effort: "high" }`; the object wrapper is never
+/// forwarded, because llama.cpp would ignore it and a hosted backend might
+/// not.
+///
+/// Returns `None` when the body asked for nothing, which is the signal to
+/// leave the request byte-identical.
+fn take_requested_effort(obj: &mut serde_json::Map<String, Value>) -> Option<String> {
+    let flat = obj
+        .remove("reasoning_effort")
+        .and_then(|v| v.as_str().map(str::to_string));
+
+    // Remove the wrapper regardless of whether it carried a usable effort:
+    // forwarding a half-understood `reasoning` object is worse than dropping
+    // it, since backends disagree on its shape.
+    let nested = match obj.remove("reasoning") {
+        Some(Value::Object(r)) => r.get("effort").and_then(|v| v.as_str().map(str::to_string)),
+        _ => None,
+    };
+
+    flat.or(nested)
+}
+
+/// Translate `reasoning_effort` into the fields llama.cpp actually reads.
+///
+/// Returns `Ok(None)` when the body carried no reasoning request at all — the
+/// caller then forwards the original bytes untouched, so a request that never
+/// mentions reasoning costs nothing but the parse.
+///
+/// Only ever called for llama-swap-family backends. `nous` and `freellmapi`
+/// both understand `reasoning_effort` natively, so their bodies pass through
+/// this module untouched.
+pub fn reasoning_effort_to_llamacpp(bytes: &[u8]) -> Result<Option<Vec<u8>>, serde_json::Error> {
+    let mut root: Value = serde_json::from_slice(bytes)?;
+    let Some(obj) = root.as_object_mut() else {
+        return Ok(None);
+    };
+
+    let Some(requested) = take_requested_effort(obj) else {
+        return Ok(None);
+    };
+
+    if let Some(effort) = canonical_effort(&requested) {
+        let budget = EFFORT_BUDGETS
+            .iter()
+            .find(|(name, _)| *name == effort)
+            .map(|(_, tokens)| *tokens);
+
+        // A client that spelled out llama.cpp's own fields meant it. The
+        // coarse level never overrides the precise knob.
+        let max_tokens = client_max_tokens(obj);
+        let kwargs = obj
+            .entry("chat_template_kwargs")
+            .or_insert_with(|| json!({}));
+        if let Some(kwargs) = kwargs.as_object_mut() {
+            kwargs
+                .entry("enable_thinking")
+                .or_insert(Value::Bool(budget.is_some()));
+        }
+
+        if let Some(budget) = budget {
+            // ponytail: flat clamp against the client's own output budget.
+            // llama.cpp does no clamping itself, so an unclamped budget can
+            // swallow the whole generation. If a tiny `max_tokens` plus deep
+            // thinking ever starves an answer in practice, split the budget
+            // instead of capping it.
+            let budget = max_tokens.map_or(budget, |max| budget.min(max));
+            obj.entry("thinking_budget_tokens")
+                .or_insert(Value::from(budget));
+        }
+    }
+
+    serde_json::to_vec(&root).map(Some)
+}
+
+/// The client's own output-token ceiling, under either spelling OpenAI has
+/// used. `max_completion_tokens` is the newer name and wins where both are
+/// present, matching llama.cpp's own precedence (server-task.cpp).
+fn client_max_tokens(obj: &serde_json::Map<String, Value>) -> Option<u64> {
+    obj.get("max_completion_tokens")
+        .or_else(|| obj.get("max_tokens"))
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0)
 }
 
 /// Build the common Ollama message frame shared by streaming deltas and
@@ -425,6 +557,160 @@ mod tests {
         assert_eq!(v["model"], "qwen/qwen3.8-27b");
         assert_eq!(v["stream"], true);
         assert_eq!(v["messages"][0]["content"], "hi");
+    }
+
+    // ── reasoning_effort → llama.cpp ─────────────────────────────────────
+
+    /// Translate and re-parse. `None` means the body was left byte-identical.
+    fn parse_effort(input: &[u8]) -> Option<Value> {
+        reasoning_effort_to_llamacpp(input)
+            .unwrap()
+            .map(|out| serde_json::from_slice(&out).unwrap())
+    }
+
+    fn body_with_effort(effort: &str) -> Vec<u8> {
+        format!(r#"{{"model":"qwen3.6-high","reasoning_effort":"{effort}","messages":[{{"role":"user","content":"hi"}}]}}"#)
+            .into_bytes()
+    }
+
+    #[test]
+    fn absent_reasoning_leaves_the_body_alone() {
+        let input = br#"{"model":"qwen3.6-high","messages":[{"role":"user","content":"hi"}]}"#;
+        assert!(parse_effort(input).is_none());
+    }
+
+    #[test]
+    fn each_effort_level_maps_to_its_budget() {
+        for (effort, budget) in [
+            ("minimal", 512),
+            ("low", 2048),
+            ("medium", 8192),
+            ("high", 32768),
+        ] {
+            let v = parse_effort(&body_with_effort(effort)).expect("body rewritten");
+            assert_eq!(
+                v["chat_template_kwargs"]["enable_thinking"], true,
+                "{effort} should enable thinking"
+            );
+            assert_eq!(
+                v["thinking_budget_tokens"], budget,
+                "wrong budget for {effort}"
+            );
+            assert!(
+                v.get("reasoning_effort").is_none(),
+                "{effort}: llama.cpp ignores reasoning_effort; it must not survive"
+            );
+        }
+    }
+
+    #[test]
+    fn effort_none_disables_thinking_without_a_budget() {
+        let v = parse_effort(&body_with_effort("none")).expect("body rewritten");
+        assert_eq!(v["chat_template_kwargs"]["enable_thinking"], false);
+        assert!(v.get("thinking_budget_tokens").is_none());
+    }
+
+    #[test]
+    fn off_scale_spellings_fold_onto_the_canonical_scale() {
+        for (spelling, budget) in [
+            ("MAX", 32768),
+            ("xhigh", 32768),
+            ("balanced", 8192),
+            ("  Lowest  ", 512),
+        ] {
+            let v = parse_effort(&body_with_effort(spelling)).expect("body rewritten");
+            assert_eq!(
+                v["thinking_budget_tokens"], budget,
+                "wrong budget for {spelling}"
+            );
+        }
+        let v = parse_effort(&body_with_effort("off")).expect("body rewritten");
+        assert_eq!(v["chat_template_kwargs"]["enable_thinking"], false);
+    }
+
+    #[test]
+    fn unrecognised_effort_is_dropped_not_rejected() {
+        // "auto"/"adaptive"/garbage: no opinion. The knob goes away and the
+        // server's own default stands — never a 400.
+        for spelling in ["auto", "adaptive", "banana"] {
+            let v = parse_effort(&body_with_effort(spelling)).expect("body rewritten");
+            assert!(
+                v.get("reasoning_effort").is_none(),
+                "{spelling} must not survive"
+            );
+            assert!(
+                v.get("chat_template_kwargs").is_none(),
+                "{spelling} must inject nothing"
+            );
+            assert!(
+                v.get("thinking_budget_tokens").is_none(),
+                "{spelling} must inject nothing"
+            );
+            assert_eq!(v["model"], "qwen3.6-high");
+        }
+    }
+
+    #[test]
+    fn object_form_is_accepted_and_the_wrapper_never_forwarded() {
+        let input = br#"{"model":"qwen3.6-high","reasoning":{"effort":"high","summary":"auto"}}"#;
+        let v = parse_effort(input).expect("body rewritten");
+        assert_eq!(v["thinking_budget_tokens"], 32768);
+        assert!(v.get("reasoning").is_none(), "the wrapper must be dropped");
+    }
+
+    #[test]
+    fn flat_form_wins_over_the_object_form() {
+        let input = br#"{"model":"q","reasoning_effort":"low","reasoning":{"effort":"high"}}"#;
+        let v = parse_effort(input).expect("body rewritten");
+        assert_eq!(v["thinking_budget_tokens"], 2048);
+        assert!(v.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn budget_is_clamped_to_the_clients_own_output_ceiling() {
+        let input = br#"{"model":"q","reasoning_effort":"high","max_tokens":1000,"messages":[]}"#;
+        let v = parse_effort(input).expect("body rewritten");
+        assert_eq!(v["thinking_budget_tokens"], 1000);
+
+        // max_completion_tokens is the newer spelling and wins where both are set.
+        let input =
+            br#"{"model":"q","reasoning_effort":"high","max_tokens":9000,"max_completion_tokens":700}"#;
+        let v = parse_effort(input).expect("body rewritten");
+        assert_eq!(v["thinking_budget_tokens"], 700);
+    }
+
+    #[test]
+    fn an_explicit_llamacpp_knob_beats_the_coarse_level() {
+        let input = br#"{"model":"q","reasoning_effort":"none","chat_template_kwargs":{"enable_thinking":true},"thinking_budget_tokens":99}"#;
+        let v = parse_effort(input).expect("body rewritten");
+        assert_eq!(v["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(v["thinking_budget_tokens"], 99);
+    }
+
+    #[test]
+    fn existing_chat_template_kwargs_survive() {
+        let input =
+            br#"{"model":"q","reasoning_effort":"low","chat_template_kwargs":{"custom":"keep"}}"#;
+        let v = parse_effort(input).expect("body rewritten");
+        assert_eq!(v["chat_template_kwargs"]["custom"], "keep");
+        assert_eq!(v["chat_template_kwargs"]["enable_thinking"], true);
+    }
+
+    #[test]
+    fn every_other_body_field_survives_the_rewrite() {
+        let input = br#"{"model":"qwen3.6-high","reasoning_effort":"medium","stream":true,"temperature":0.3,"tools":[{"type":"function"}],"messages":[{"role":"user","content":"hi"}]}"#;
+        let v = parse_effort(input).expect("body rewritten");
+        assert_eq!(v["model"], "qwen3.6-high");
+        assert_eq!(v["stream"], true);
+        assert_eq!(v["temperature"], 0.3);
+        assert_eq!(v["tools"][0]["type"], "function");
+        assert_eq!(v["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn a_non_object_body_is_left_alone() {
+        assert!(parse_effort(b"[1,2,3]").is_none());
+        assert!(reasoning_effort_to_llamacpp(b"not json").is_err());
     }
 
     fn parse_response(input: &[u8], model: &str) -> Value {

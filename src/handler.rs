@@ -359,32 +359,68 @@ async fn execute_attempt(
     //     hangs forever — discovery thinks it's Ollama-protocol but it
     //     can't actually handle the chat path.
     let backend_kind = models::classify(&target.name);
+    let is_local_llama = matches!(
+        backend_kind,
+        models::BackendKind::LlamaSwap | models::BackendKind::AlwaysResident
+    );
     let needs_translation = ctx.uri.path() == "/api/chat"
-        && (target.protocol == BackendProtocol::OpenAi
-            || matches!(
-                backend_kind,
-                models::BackendKind::LlamaSwap | models::BackendKind::AlwaysResident
-            ));
+        && (target.protocol == BackendProtocol::OpenAi || is_local_llama);
+
+    // Effort translation: `reasoning_effort` is the scale OpenAI, Zed, Open
+    // WebUI, pi and freellmapi all speak, and llama.cpp is the one hop that
+    // ignores it (it wants `chat_template_kwargs.enable_thinking` +
+    // `thinking_budget_tokens` instead). Rewrite it for llama-swap-family
+    // backends only — `nous` and `freellmapi` understand the field natively,
+    // so their bodies must reach them untouched.
+    //
+    // Chat paths only: `reasoning_effort` is meaningless on embeddings, and
+    // `/v1/messages` is pure passthrough to a backend that speaks Anthropic,
+    // which llama-swap never does.
+    let needs_effort_translation =
+        is_local_llama && matches!(ctx.uri.path(), "/api/chat" | "/v1/chat/completions");
 
     let mut body = body;
-    if needs_translation {
-        tracing::info!(
-            backend = %target.name,
-            requested_model = %model,
-            "translating /api/chat → /v1/chat/completions"
-        );
-        ctx.state.metrics.protocol_translations.inc();
-
-        // Buffer the request body then translate Ollama → OpenAI.
+    if needs_translation || needs_effort_translation {
+        // Buffer once, then apply whichever rewrites this hop needs. The
+        // alias-chain walk already buffers every body it forwards, so for the
+        // aliased traffic this is the same read, not a second one.
         let body_bytes = collect_body_to_bytes(body).await.map_err(|e| {
             tracing::warn!(error = %e, "failed to buffer request body for translation");
             proxy::bad_gateway("failed to buffer request body for translation")
         })?;
-        let translated = translate::ollama_chat_to_openai_request(&body_bytes).map_err(|e| {
-            tracing::warn!(error = %e, "failed to translate /api/chat body");
-            proxy::bad_request("body is not valid JSON")
-        })?;
-        body = Body::from(translated);
+
+        let mut body_bytes = if needs_translation {
+            tracing::info!(
+                backend = %target.name,
+                requested_model = %model,
+                "translating /api/chat → /v1/chat/completions"
+            );
+            ctx.state.metrics.protocol_translations.inc();
+            translate::ollama_chat_to_openai_request(&body_bytes).map_err(|e| {
+                tracing::warn!(error = %e, "failed to translate /api/chat body");
+                proxy::bad_request("body is not valid JSON")
+            })?
+        } else {
+            body_bytes.to_vec()
+        };
+
+        if needs_effort_translation {
+            // `Ok(None)` means the body never mentioned reasoning, which is
+            // the common case — leave the bytes exactly as they were.
+            match translate::reasoning_effort_to_llamacpp(&body_bytes) {
+                Ok(Some(rewritten)) => {
+                    ctx.state.metrics.reasoning_translations.inc();
+                    body_bytes = rewritten;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to translate reasoning_effort");
+                    return Err(proxy::bad_request("body is not valid JSON"));
+                }
+            }
+        }
+
+        body = Body::from(body_bytes);
     }
 
     // Decide between hot-path proxy and heartbeat-wrapped proxy.

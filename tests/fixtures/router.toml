@@ -35,14 +35,12 @@
 [[backends]]
 name = "llama-swap-cuda"
 url = "http://llama-swap-cuda.ai:8080"
-allow = ["*"]                            # on-LAN, unmetered: publish everything
 
 # rh-anine (Vulkan): qwen3.6 effort tiers, gpt-oss, gemma4:26b,
 # nemotron3-super, glm-5.2-rivoli, qwen3 embeddings.
 [[backends]]
 name = "llama-swap"
 url = "http://llama-swap.ai:8080"
-allow = ["*"]                            # on-LAN, unmetered: publish everything
 
 # Nous Portal — hosted and metered, reached through postern, which injects
 # the API key so this pod holds no credential.
@@ -53,74 +51,16 @@ external = true                          # => can never appear in a `local` alia
 # The inbound router token means nothing to Nous; forwarding it would leak
 # it to a third party and leave postern reconciling two auth headers.
 strip_auth = true
-# THE SPEND BOUNDARY. Everything not named here 404s. Exact-match ids (no
-# prefix/glob matching); a typo silently drops the model rather than
-# erroring. Prices per M tokens (in/out), verified against the live catalog
-# 2026-08-17.
-allow = [
-  "nousresearch/hermes-4-70b",           # 0.05 / 0.20
-  "nousresearch/hermes-4-405b",          # 0.09 / 0.37
-  "meta/muse-glimmer-30b",               # 0.28 / 1.20
-  "deepseek/deepseek-v4-pro-0813",       # 0.53 / 1.58 (time-of-day varying)
-  "z-ai/glm-5.2",                        # 0.25 / 0.77
-  "nvidia/nemotron-3-ultra-550b-a55b",   # 0.48 / 2.88
-  "moonshotai/kimi-k3",                  # 2.40 / 12.00 — deliberate outlier
-  "qwen/qwen3.8-27b",                    # 0.36 / 2.56
-  "qwen/qwen3.8-max",                    # 1.60 / 4.80
-  # Hermes' `general` and `high` gateway profiles. They used to call Nous
-  # DIRECTLY (no allowlist, no metrics, no failover); admitting their models
-  # here is what lets those profiles come back inside the spend boundary.
-  # PRICES UNVERIFIED — check the live catalog and fill them in.
-  "stealth/ox-alpha",                    # ? / ?
-  "deepseek/deepseek-v4-flash-0731",     # ? / ?
-  # Fallback stand-ins and chain tails — cheap hosted twins of the local
-  # models, published so the last hop of a chain can resolve.
-  "openai/gpt-oss-120b",                 # 0.02 / 0.14
-  "google/gemma-4-26b-a4b-it",           # 0.06 / 0.27
-  "nvidia/nemotron-3-super-120b-a12b",   # 0.07 / 0.32
-  "z-ai/glm-4.6v",                       # 0.24 / 0.72 (vision)
-]
 
 # freellmapi aggregates free-tier hosted providers (its provider keys also
 # live behind postern). Declared LAST on purpose: an earlier slot would let
 # a colliding hosted model name silently steal traffic from the local
-# backends.
-#
-# CURATED, not `["*"]`. The wildcard published 202 ids and drowned every
-# model picker in the fleet (Open WebUI, pi, gptel, hermes-dms) — 237 models
-# total, of which ~20 were ever chosen. This is the shortlist; add an id
-# when you actually want to pick it by name.
-#
-# `auto`, `auto:coding` and `auto:vision` are DELIBERATELY ABSENT. The router
-# publishes its own `auto:*` aliases, and alias names are APPENDED to
-# /v1/models with no dedup against concrete models — allowing freellmapi's
-# copies would list each id twice. Omitting them here hides the duplicates
-# while `freellmapi/auto:*` still works as a chain hop, because chain
-# candidates are never checked against a backend's allow list. freellmapi's
-# own profiles live UNDERNEATH our alias names, which is the intent.
+# backends. It is reached only through the router's own `auto:*` alias
+# chains, never by raw model name.
 [[backends]]
 name = "freellmapi"
 url = "https://freellmapi.hr-home.xyz"
 external = true                          # => can never appear in a `local` alias
-allow = [
-  # frontier, by name — for when you want a specific one
-  "claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5",
-  "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex",
-  "gemini-3.6-flash", "gemini-3.5-flash-lite",
-  "grok-4.3", "grok-4.1-fast-reasoning",
-  # glm-4.7 is what the Claude Code .envrc-local files ask for over the
-  # Anthropic passthrough — freellmapi is the only backend that translates
-  # /v1/messages, so these must stay reachable BY NAME (an alias would
-  # chain onto a llama-swap hop that speaks no Anthropic).
-  "glm-4.7", "glm-4.7-flash", "glm-5.2",
-  "qwen3-coder-next", "qwen3.5-397b",
-  "kimi-k2.7-code", "minimax-m3",
-  "deepseek-v4-pro", "deepseek-v4-flash",
-  "mistral-small-4", "llama-4-maverick", "gpt-oss-120b",
-  "nemotron-3-ultra",
-  # web-grounded search
-  "sonar", "sonar-pro",
-]
 
 # ── fallbacks: concrete name -> alias ──────────────────────────────────────
 # Consulted ONLY when no reachable backend serves the concrete name, and

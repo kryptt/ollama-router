@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REGISTRY="${REGISTRY:-ghcr.io}"
-OWNER=kryptt
+OWNER="${OWNER:-kryptt}"
 APP=ollama-router
 VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 

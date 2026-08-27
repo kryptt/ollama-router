@@ -22,9 +22,6 @@ use std::fmt;
 
 use serde::Deserialize;
 
-/// The wildcard `allow` entry: publish everything the backend advertises.
-const ALLOW_ALL: &str = "*";
-
 /// The raw TOML document, before validation.
 ///
 /// `deny_unknown_fields` throughout: this is a hand-edited file on NFS with
@@ -55,11 +52,6 @@ pub struct FileConfig {
 struct RawBackend {
     name: String,
     url: String,
-    /// **Required**, with `["*"]` meaning publish-all. Not optional: under
-    /// the old flat-file grammar, deleting a backend's allow line was a
-    /// *successful* parse that silently evaporated its spend boundary, so
-    /// keep-previous never fired. Absence is now a rejection.
-    allow: Vec<String>,
     /// Hosted / off-LAN. Consumed entirely by validation (it is what a
     /// `local` alias is checked against) and never needed at request time,
     /// so it does not survive into [`BackendSpec`].
@@ -105,7 +97,7 @@ pub struct Alias {
 /// routing priority.
 ///
 /// Invariants: `name` non-empty and unique, `url` is `http(s)://…` with no
-/// trailing slash, `allow_models` is either `None` or a non-empty set.
+/// trailing slash.
 ///
 /// `non_exhaustive` so that only this module can build one: fields are `pub`
 /// for readers, but a struct literal outside the crate is refused, keeping
@@ -116,13 +108,6 @@ pub struct Alias {
 pub struct BackendSpec {
     pub name: String,
     pub url: String,
-    /// Discovery allowlist. `None` = publish every model the backend
-    /// advertises (`allow = ["*"]`); `Some(set)` = keep only these exact
-    /// names.
-    ///
-    /// For a metered backend this is the spend boundary: anything that can
-    /// reach the router can request any model the router publishes.
-    pub allow_models: Option<HashSet<String>>,
     pub strip_auth: bool,
 }
 
@@ -236,14 +221,12 @@ impl FileConfig {
                 ));
             }
             let url = validate_url(&name, &raw.url)?;
-            let allow_models = validate_allow(&name, &raw.allow)?;
             if raw.external {
                 external.insert(name.clone());
             }
             specs.push(BackendSpec {
                 name,
                 url,
-                allow_models,
                 strip_auth: raw.strip_auth,
             });
         }
@@ -255,8 +238,8 @@ impl FileConfig {
         fallback_entries.sort();
         for (from, to) in fallback_entries {
             // `to` is deliberately NOT checked against the published
-            // catalogue: its backend may simply be down right now, and it
-            // is unprovable at all against an `allow = ["*"]` backend.
+            // catalogue: its backend may simply be down right now, and
+            // every backend now serves whatever it advertises.
             if from.trim().is_empty() || to.trim().is_empty() {
                 return invalid(format!("fallback '{from}' = '{to}' has an empty side"));
             }
@@ -319,38 +302,6 @@ fn validate_url(name: &str, raw: &str) -> Result<String, PolicyError> {
     Ok(url.trim_end_matches('/').to_string())
 }
 
-/// Lower an `allow` list to the registry's filter representation.
-/// `["*"]` — and only a lone `["*"]` — means "publish everything".
-fn validate_allow(name: &str, allow: &[String]) -> Result<Option<HashSet<String>>, PolicyError> {
-    if allow.is_empty() {
-        return invalid(format!(
-            "backend '{name}': `allow` is empty, which would publish nothing and be \
-             indistinguishable at runtime from the backend being down; use \
-             allow = [\"*\"] to publish everything"
-        ));
-    }
-    if allow.iter().any(|m| m.trim() == ALLOW_ALL) {
-        if allow.len() > 1 {
-            // "*" plus explicit ids reads as "these, but really everything".
-            // Whichever the operator meant, one of the two is wrong.
-            return invalid(format!(
-                "backend '{name}': `allow` mixes \"*\" with explicit model ids; \
-                 use either the wildcard alone or an explicit list"
-            ));
-        }
-        return Ok(None);
-    }
-    let mut set = HashSet::with_capacity(allow.len());
-    for model in allow {
-        let model = model.trim();
-        if model.is_empty() {
-            return invalid(format!("backend '{name}': `allow` contains an empty entry"));
-        }
-        set.insert(model.to_string());
-    }
-    Ok(Some(set))
-}
-
 fn validate_alias(
     name: &str,
     raw: &RawAlias,
@@ -395,8 +346,7 @@ fn validate_alias(
                 "alias '{name}' names backend '{backend}', which is not declared in [[backends]]"
             ));
         }
-        // NOT checked: whether `model` is in that backend's allow list. A
-        // chain skips non-serving candidates by design, and placeholder
+        // A chain skips non-serving candidates by design, and placeholder
         // candidates for a not-yet-provisioned provider are deliberate.
         candidates.push(AliasCandidate {
             backend: backend.to_string(),
@@ -431,7 +381,6 @@ mod tests {
         [[backends]]
         name = "a"
         url = "http://a:1"
-        allow = ["*"]
         [fallbacks]
         [aliases]
     "#;
@@ -457,13 +406,11 @@ mod tests {
             [[backends]]
             name = "swap"
             url = "http://s:1"
-            allow = ["*"]
 
             [[backends]]
             name = "nous"
             url = "http://n:2"
             external = true
-            allow = ["m"]
 
             [fallbacks]
 
@@ -493,54 +440,30 @@ mod tests {
             vec!["llama-swap-cuda", "llama-swap", "nous", "freellmapi"]
         );
 
-        // The on-LAN, unmetered backends publish everything...
+        // The on-LAN, unmetered backends forward auth.
         for name in ["llama-swap-cuda", "llama-swap"] {
             let b = v
                 .backends
                 .iter()
                 .find(|b| b.name == name)
                 .expect("backend present");
-            assert!(b.allow_models.is_none(), "{name} should publish everything");
             assert!(!b.strip_auth, "{name} must forward auth");
         }
 
-        // ...nous is the spend boundary.
+        // nous is metered: postern injects its key, so auth is stripped.
         let nous = v
             .backends
             .iter()
             .find(|b| b.name == "nous")
             .expect("nous present");
-        let allow = nous.allow_models.as_ref().expect("nous is allowlisted");
-        assert_eq!(allow.len(), 15);
-        assert!(allow.contains("nousresearch/hermes-4-405b"));
-        assert!(allow.contains("z-ai/glm-4.6v"));
-        assert!(
-            !allow.contains("*"),
-            "the wildcard must not survive as an id"
-        );
         assert!(nous.strip_auth);
 
-        // freellmapi is curated too — not to bound spend (it is free tier)
-        // but to keep the published catalogue small enough to pick from.
         let free = v
             .backends
             .iter()
             .find(|b| b.name == "freellmapi")
             .expect("freellmapi present");
-        let free_allow = free.allow_models.as_ref().expect("freellmapi is curated");
-        assert_eq!(free_allow.len(), 25);
         assert!(!free.strip_auth, "freellmapi must forward auth");
-        // Its own `auto:*` profiles are deliberately NOT published: the
-        // router's aliases carry those names, and alias entries are appended
-        // to /v1/models without dedup, so publishing both would list each id
-        // twice. Chain candidates bypass the allow list, so the hops still
-        // work — see the `auto:coding` chain below.
-        for hidden in ["auto", "auto:coding", "auto:vision"] {
-            assert!(
-                !free_allow.contains(hidden),
-                "{hidden} must stay hidden behind the router's own alias"
-            );
-        }
 
         // Every fallback target is an alias, so a client that still sends a
         // raw model name gets the whole free -> local -> paid walk instead
@@ -629,15 +552,12 @@ mod tests {
             [[backends]]
             name = "third"
             url = "http://c:3"
-            allow = ["*"]
             [[backends]]
             name = "first"
             url = "http://a:1"
-            allow = ["*"]
             [[backends]]
             name = "second"
             url = "http://b:2"
-            allow = ["*"]
             [fallbacks]
             [aliases]
             "#,
@@ -655,7 +575,6 @@ mod tests {
             [[backends]]
             name = "a"
             url = "http://a:1"
-            allow = ["*"]
             stip_auth = true
             [fallbacks]
             [aliases]
@@ -667,7 +586,6 @@ mod tests {
             [[backends]]
             name = "a"
             url = "http://a:1"
-            allow = ["*"]
             [fallbacks]
             [aliases]
             [aliases.x]
@@ -688,71 +606,12 @@ mod tests {
         assert_rejects("[fallbacks]\n[aliases]\n", "backends");
         assert_rejects("backends = []\n[fallbacks]\n[aliases]\n", "at least one");
         assert_rejects(
-            "[[backends]]\nname = \"a\"\nurl = \"http://a:1\"\nallow = [\"*\"]\n[aliases]\n",
+            "[[backends]]\nname = \"a\"\nurl = \"http://a:1\"\n[aliases]\n",
             "fallbacks",
         );
         assert_rejects(
-            "[[backends]]\nname = \"a\"\nurl = \"http://a:1\"\nallow = [\"*\"]\n[fallbacks]\n",
+            "[[backends]]\nname = \"a\"\nurl = \"http://a:1\"\n[fallbacks]\n",
             "aliases",
-        );
-    }
-
-    // ── the spend boundary ───────────────────────────────────────────────
-
-    #[test]
-    fn absent_allow_is_rejected() {
-        // The bug this schema exists to kill: under the old grammar,
-        // deleting a backend's allow line was a *successful* parse that
-        // silently removed its spend boundary.
-        assert_rejects(
-            "[[backends]]\nname = \"a\"\nurl = \"http://a:1\"\n[fallbacks]\n[aliases]\n",
-            "allow",
-        );
-    }
-
-    #[test]
-    fn empty_allow_is_rejected() {
-        assert_rejects(
-            "[[backends]]\nname = \"a\"\nurl = \"http://a:1\"\nallow = []\n[fallbacks]\n[aliases]\n",
-            "publish nothing",
-        );
-    }
-
-    #[test]
-    fn wildcard_mixed_with_ids_is_rejected() {
-        assert_rejects(
-            r#"
-            [[backends]]
-            name = "a"
-            url = "http://a:1"
-            allow = ["*", "m"]
-            [fallbacks]
-            [aliases]
-            "#,
-            "mixes",
-        );
-    }
-
-    #[test]
-    fn wildcard_lowers_to_no_filter_and_ids_lower_to_a_set() {
-        let v = parse(
-            r#"
-            [[backends]]
-            name = "open"
-            url = "http://a:1"
-            allow = ["*"]
-            [[backends]]
-            name = "metered"
-            url = "http://b:2"
-            allow = ["x/one", "x/two"]
-            [fallbacks]
-            [aliases]
-            "#,
-        );
-        assert!(v.backends[0].allow_models.is_none());
-        assert_eq!(
-            v.backends[1].allow_models.as_ref().map(HashSet::len),
-            Some(2)
         );
     }
 
@@ -765,11 +624,9 @@ mod tests {
             [[backends]]
             name = "a"
             url = "http://a:1"
-            allow = ["*"]
             [[backends]]
             name = "a"
             url = "http://b:2"
-            allow = ["*"]
             [fallbacks]
             [aliases]
             "#,
@@ -781,7 +638,7 @@ mod tests {
     fn bad_name_or_url_is_rejected() {
         let doc = |name: &str, url: &str| {
             format!(
-                "[[backends]]\nname = \"{name}\"\nurl = \"{url}\"\nallow = [\"*\"]\n\
+                "[[backends]]\nname = \"{name}\"\nurl = \"{url}\"\n\
                  [fallbacks]\n[aliases]\n"
             )
         };
@@ -800,7 +657,7 @@ mod tests {
         // the exact opposite of the wholesale rejection promised above.
         let doc = |url: &str| {
             format!(
-                "[[backends]]\nname = \"a\"\nurl = \"{url}\"\nallow = [\"*\"]\n\
+                "[[backends]]\nname = \"a\"\nurl = \"{url}\"\n\
                  [fallbacks]\n[aliases]\n"
             )
         };
@@ -829,7 +686,7 @@ mod tests {
     #[test]
     fn trailing_slash_is_stripped() {
         let v = parse(
-            "[[backends]]\nname = \"a\"\nurl = \"http://a:1/\"\nallow = [\"*\"]\n\
+            "[[backends]]\nname = \"a\"\nurl = \"http://a:1/\"\n\
              [fallbacks]\n[aliases]\n",
         );
         assert_eq!(v.backends[0].url, "http://a:1");
@@ -844,7 +701,6 @@ mod tests {
             [[backends]]
             name = "a"
             url = "http://a:1"
-            allow = ["*"]
             [fallbacks]
             "qwen3.6-low" = "qwen/qwen3.8-27b"
             "gemma4:26b" = "google/gemma-4-26b-a4b-it"
@@ -869,7 +725,6 @@ mod tests {
             [[backends]]
             name = "a"
             url = "http://a:1"
-            allow = ["*"]
             [fallbacks]
             qwen3.6-low = "qwen/qwen3.8-27b"
             [aliases]
@@ -883,7 +738,7 @@ mod tests {
         for key in ["gemma4:26b", "haervwe/GLM-4.6V"] {
             assert_rejects(
                 &format!(
-                    "[[backends]]\nname = \"a\"\nurl = \"http://a:1\"\nallow = [\"*\"]\n\
+                    "[[backends]]\nname = \"a\"\nurl = \"http://a:1\"\n\
                      [fallbacks]\n{key} = \"x\"\n[aliases]\n"
                 ),
                 "expected",
@@ -895,7 +750,7 @@ mod tests {
     fn fallback_self_map_or_empty_side_is_rejected() {
         let doc = |body: &str| {
             format!(
-                "[[backends]]\nname = \"a\"\nurl = \"http://a:1\"\nallow = [\"*\"]\n\
+                "[[backends]]\nname = \"a\"\nurl = \"http://a:1\"\n\
                  [fallbacks]\n{body}\n[aliases]\n"
             )
         };
@@ -907,7 +762,7 @@ mod tests {
     #[test]
     fn duplicate_fallback_key_is_rejected_by_toml() {
         assert_rejects(
-            "[[backends]]\nname = \"a\"\nurl = \"http://a:1\"\nallow = [\"*\"]\n\
+            "[[backends]]\nname = \"a\"\nurl = \"http://a:1\"\n\
              [fallbacks]\n\"m\" = \"x\"\n\"m\" = \"y\"\n[aliases]\n",
             "duplicate",
         );
@@ -915,10 +770,10 @@ mod tests {
 
     #[test]
     fn fallback_target_need_not_be_published() {
-        // Its backend may simply be down, and it is unprovable at all
-        // against an `allow = ["*"]` backend — so this must be accepted.
+        // Its backend may simply be down, and every backend now serves
+        // whatever it advertises — so this must be accepted.
         let v = parse(
-            "[[backends]]\nname = \"a\"\nurl = \"http://a:1\"\nallow = [\"m\"]\n\
+            "[[backends]]\nname = \"a\"\nurl = \"http://a:1\"\n\
              [fallbacks]\n\"local\" = \"never-published\"\n[aliases]\n",
         );
         assert_eq!(v.fallbacks.len(), 1);
@@ -958,7 +813,6 @@ mod tests {
                 name = "swap"
                 url = "http://s:1"
                 external = {external}
-                allow = ["*"]
                 [fallbacks]
                 [aliases.financial]
                 local = true
@@ -1006,11 +860,11 @@ mod tests {
     }
 
     #[test]
-    fn alias_candidate_need_not_be_in_the_backends_allow_list() {
+    fn alias_candidate_need_not_be_served_yet() {
         // `freellmapi/auto:fast` is a deliberate placeholder until the
         // provider keys land; chains skip non-serving candidates by design.
         let v = parse(&aliases(
-            "[aliases.chat]\nchain = [\"nous/not-in-allow\", \"swap/m\"]\n",
+            "[aliases.chat]\nchain = [\"nous/not-yet-serving\", \"swap/m\"]\n",
         ));
         assert_eq!(v.aliases.get("chat").map(|a| a.candidates.len()), Some(2));
     }

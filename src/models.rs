@@ -20,16 +20,12 @@ fn models_response(models: impl serde::Serialize) -> Response {
 const PS_FANOUT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Build a merged `/api/tags` response from the registry's discovery cache.
-/// Deduplicates by model name, preferring the first backend encountered.
-/// Configured aliases are appended as synthesised entries so clients can
-/// discover and request them like any concrete model.
+/// Returns ONLY configured aliases — concrete backend models are not published.
 pub fn api_tags_response(reg: &Registry) -> Response {
-    let mut models: Vec<Value> = reg
-        .reachable_models()
+    let models = sorted_alias_names(reg)
         .into_iter()
-        .filter_map(|m| serde_json::to_value(m).ok())
-        .collect();
-    models.extend(sorted_alias_names(reg).into_iter().map(alias_tag_entry));
+        .map(alias_tag_entry)
+        .collect::<Vec<_>>();
     models_response(models)
 }
 
@@ -54,11 +50,12 @@ fn alias_tag_entry(name: &str) -> Value {
 }
 
 /// Build a merged `/v1/models` response (OpenAI-compatible list).
-/// Configured aliases are appended with `owned_by: "router-alias"` so
-/// they're distinguishable from discovered concrete models.
+/// Returns ONLY configured aliases — concrete backend models are not published.
 pub fn v1_models_response(reg: &Registry) -> Response {
-    let mut models = v1_model_objects(reg);
-    models.extend(sorted_alias_names(reg).into_iter().map(v1_alias_object));
+    let models = sorted_alias_names(reg)
+        .into_iter()
+        .map(v1_alias_object)
+        .collect::<Vec<_>>();
     json_ok(json!({ "object": "list", "data": models }))
 }
 
@@ -74,7 +71,7 @@ fn v1_alias_object(name: &str) -> Value {
 }
 
 /// `GET /v1/models/:model_id` — OpenAI-compatible single-model retrieval.
-/// Matches by exact name or prefix (before `:`), same as routing lookup.
+/// Returns ONLY configured aliases — concrete backend models are not published.
 pub fn v1_model_response(reg: &Registry, model_id: &str) -> Response {
     // Aliases shadow concrete models in routing, so retrieval resolves them
     // first too — anything /v1/models lists must be retrievable by id.
@@ -82,46 +79,16 @@ pub fn v1_model_response(reg: &Registry, model_id: &str) -> Response {
         return json_ok(v1_alias_object(canonical));
     }
 
-    // Try exact match against reachable models first, then prefix.
-    let found = reg.reachable_models().into_iter().find(|m| {
-        m.name == model_id
-            || m.name
-                .split_once(':')
-                .is_some_and(|(prefix, _)| prefix == model_id)
-    });
-
-    match found {
-        Some(m) => json_ok(v1_model_object(m)),
-        None => json_status(
-            StatusCode::NOT_FOUND,
-            json!({
-                "error": {
-                    "message": format!("The model `{model_id}` does not exist"),
-                    "type": "invalid_request_error",
-                    "code": "model_not_found"
-                }
-            }),
-        ),
-    }
-}
-
-fn v1_model_object(m: &crate::registry::ModelInfo) -> serde_json::Value {
-    // Strip the default `:latest` tag so clients that request the bare model
-    // name (e.g. "glm-4.7-flash") see an exact ID match.
-    let id = m.name.strip_suffix(":latest").unwrap_or(&m.name);
-    json!({
-        "id": id,
-        "object": "model",
-        "created": 0,
-        "owned_by": "library",
-    })
-}
-
-fn v1_model_objects(reg: &Registry) -> Vec<serde_json::Value> {
-    reg.reachable_models()
-        .into_iter()
-        .map(v1_model_object)
-        .collect()
+    json_status(
+        StatusCode::NOT_FOUND,
+        json!({
+            "error": {
+                "message": format!("The model `{model_id}` does not exist"),
+                "type": "invalid_request_error",
+                "code": "model_not_found"
+            }
+        }),
+    )
 }
 
 /// Aggregated `/api/ps` response: union of currently-loaded models across

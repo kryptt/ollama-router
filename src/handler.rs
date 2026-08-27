@@ -1290,7 +1290,7 @@ mod tests {
     /// directly now that they live in the library.
     fn test_state() -> AppState {
         let policy = crate::policy::FileConfig::parse(
-            "[[backends]]\nname = \"b\"\nurl = \"http://127.0.0.1:1\"\nallow = [\"*\"]\n\
+            "[[backends]]\nname = \"b\"\nurl = \"http://127.0.0.1:1\"\n\
              [fallbacks]\n[aliases]\n",
         )
         .expect("valid test policy");

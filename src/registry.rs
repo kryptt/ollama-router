@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -32,11 +32,11 @@ pub enum BackendProtocol {
     OpenAi,
 }
 
-/// Per-backend state. Split in two by lifecycle: `name`/`url`/`strip_auth`/
-/// `allow_models` come from the policy file and are replaced wholesale on
-/// every reload, while `healthy`/`protocol`/`models`/`last_seen`/
-/// `grace_deadline` are *learned* by discovery and carried across a reload
-/// whenever the backend is recognisably the same server.
+/// Per-backend state. Split in two by lifecycle: `name`/`url`/`strip_auth`
+/// come from the policy file and are replaced wholesale on every reload,
+/// while `healthy`/`protocol`/`models`/`last_seen`/`grace_deadline` are
+/// *learned* by discovery and carried across a reload whenever the backend
+/// is recognisably the same server.
 #[derive(Debug)]
 struct BackendState {
     name: String,
@@ -47,13 +47,6 @@ struct BackendState {
     last_seen: Option<Instant>,
     grace_deadline: Option<Instant>,
     strip_auth: bool,
-    /// Discovery allowlist, owned by the backend itself rather than looked
-    /// up positionally in a parallel `Vec`. `None` = publish everything.
-    ///
-    /// This is where the two-Vec hazard died: pairing a filter with the
-    /// wrong backend is now unrepresentable, and for a metered backend that
-    /// pairing IS the spend boundary.
-    allow_models: Option<HashSet<String>>,
 }
 
 impl BackendState {
@@ -69,31 +62,6 @@ impl BackendState {
             last_seen: None,
             grace_deadline: None,
             strip_auth: spec.strip_auth,
-            allow_models: spec.allow_models,
-        }
-    }
-
-    /// Drop every model this backend's `allow` list does not publish.
-    /// A filtered-out model is not merely hidden: it never enters the model
-    /// map, so requests for it 404 like any unknown model.
-    fn retain_allowed(&mut self) {
-        let Self {
-            allow_models: Some(allow),
-            models,
-            name,
-            ..
-        } = self
-        else {
-            return;
-        };
-        let before = models.len();
-        models.retain(|m| allow.contains(&m.name));
-        if models.is_empty() && before > 0 {
-            warn!(
-                backend = %name,
-                advertised = before,
-                "allowlist matched none of the backend's models; check the `allow` spelling in router.toml"
-            );
         }
     }
 
@@ -240,19 +208,14 @@ impl Registry {
                     // an OpenAI-only backend), empty `models` (a 404 storm
                     // until the next fetch lands) and clear the grace
                     // deadline (losing an in-progress outage's grace).
-                    let mut next = BackendState {
+                    BackendState {
                         healthy: prev.healthy,
                         protocol: prev.protocol,
                         models: prev.models,
                         last_seen: prev.last_seen,
                         grace_deadline: prev.grace_deadline,
                         ..BackendState::fresh(spec)
-                    };
-                    // Apply the (possibly tightened) allowlist to the models
-                    // being carried over rather than waiting for the next
-                    // fetch: the spend boundary must never lag its own edit.
-                    next.retain_allowed();
-                    next
+                    }
                 }
                 Some(prev) => {
                     // Same name, different URL: a different server wearing a
@@ -318,9 +281,6 @@ impl Registry {
                     backend.healthy = true;
                     backend.protocol = protocol;
                     backend.models = models;
-                    // Filtering here, against the backend's own allowlist,
-                    // is what makes positional mis-pairing unrepresentable.
-                    backend.retain_allowed();
                     backend.last_seen = Some(now);
                     backend.grace_deadline = None;
                 }
@@ -807,7 +767,7 @@ mod tests {
     /// The smallest valid policy document, for tests that only need *some*
     /// successfully-parsed value.
     const MINIMAL_POLICY: &str = "[[backends]]\nname = \"a\"\nurl = \"http://a:1\"\n\
-                                  allow = [\"*\"]\n[fallbacks]\n[aliases]\n";
+                                  [fallbacks]\n[aliases]\n";
 
     /// Parse a policy document, or fail the test with the validator's own
     /// error — every registry test goes through the real validator, so a
@@ -816,9 +776,9 @@ mod tests {
         FileConfig::parse(raw).expect("valid test policy")
     }
 
-    /// A backend table with the given name, url and allow list.
-    fn backend_toml(name: &str, url: &str, allow: &str) -> String {
-        format!("[[backends]]\nname = \"{name}\"\nurl = \"{url}\"\nallow = {allow}\n")
+    /// A backend table with the given name and url.
+    fn backend_toml(name: &str, url: &str) -> String {
+        format!("[[backends]]\nname = \"{name}\"\nurl = \"{url}\"\n")
     }
 
     /// The two-backend roster shared by most tests: `cuda` first (so it wins
@@ -826,8 +786,8 @@ mod tests {
     fn test_policy() -> Validated {
         policy(&format!(
             "{}{}[fallbacks]\n[aliases]\n",
-            backend_toml("cuda", "http://cuda:11434", "[\"*\"]"),
-            backend_toml("rocm", "http://rocm:11435", "[\"*\"]"),
+            backend_toml("cuda", "http://cuda:11434"),
+            backend_toml("rocm", "http://rocm:11435"),
         ))
     }
 
@@ -1247,8 +1207,8 @@ mod tests {
 
         let reversed = policy(&format!(
             "{}{}[fallbacks]\n[aliases]\n",
-            backend_toml("rocm", "http://rocm:11435", "[\"*\"]"),
-            backend_toml("cuda", "http://cuda:11434", "[\"*\"]"),
+            backend_toml("rocm", "http://rocm:11435"),
+            backend_toml("cuda", "http://cuda:11434"),
         ));
         assert!(reg.apply_file_config(reversed).is_empty());
 
@@ -1269,9 +1229,9 @@ mod tests {
         let mut reg = reg_with_learned_state();
         let grown = policy(&format!(
             "{}{}{}[fallbacks]\n[aliases]\n",
-            backend_toml("cuda", "http://cuda:11434", "[\"*\"]"),
-            backend_toml("rocm", "http://rocm:11435", "[\"*\"]"),
-            backend_toml("new", "http://new:1", "[\"*\"]"),
+            backend_toml("cuda", "http://cuda:11434"),
+            backend_toml("rocm", "http://rocm:11435"),
+            backend_toml("new", "http://new:1"),
         ));
         assert!(reg.apply_file_config(grown).is_empty());
 
@@ -1291,7 +1251,7 @@ mod tests {
         let mut reg = reg_with_learned_state();
         let shrunk = policy(&format!(
             "{}[fallbacks]\n[aliases]\n",
-            backend_toml("cuda", "http://cuda:11434", "[\"*\"]"),
+            backend_toml("cuda", "http://cuda:11434"),
         ));
         let removed = reg.apply_file_config(shrunk);
 
@@ -1314,8 +1274,8 @@ mod tests {
         let mut reg = reg_with_learned_state();
         let moved = policy(&format!(
             "{}{}[fallbacks]\n[aliases]\n",
-            backend_toml("cuda", "http://cuda:19999", "[\"*\"]"),
-            backend_toml("rocm", "http://rocm:11435", "[\"*\"]"),
+            backend_toml("cuda", "http://cuda:19999"),
+            backend_toml("rocm", "http://rocm:11435"),
         ));
         assert!(reg.apply_file_config(moved).is_empty());
 
@@ -1334,35 +1294,9 @@ mod tests {
         let stale = reg.backend_id_by_name("rocm").expect("rocm is configured");
         reg.apply_file_config(policy(&format!(
             "{}[fallbacks]\n[aliases]\n",
-            backend_toml("cuda", "http://cuda:11434", "[\"*\"]"),
+            backend_toml("cuda", "http://cuda:11434"),
         )));
         assert!(reg.backend(stale).is_none());
-    }
-
-    #[test]
-    fn reload_tightening_allow_drops_carried_over_models_immediately() {
-        // The spend boundary must not lag its own edit by a discovery cycle.
-        let mut reg = Registry::new(test_policy());
-        setup_backend(
-            &mut reg,
-            0,
-            true,
-            None,
-            vec![make_model("cheap:v1"), make_model("frontier:v1")],
-        );
-        assert!(reg.lookup("frontier:v1").is_some());
-
-        reg.apply_file_config(policy(&format!(
-            "{}{}[fallbacks]\n[aliases]\n",
-            backend_toml("cuda", "http://cuda:11434", "[\"cheap:v1\"]"),
-            backend_toml("rocm", "http://rocm:11435", "[\"*\"]"),
-        )));
-
-        assert!(reg.lookup("cheap:v1").is_some());
-        assert!(
-            reg.lookup("frontier:v1").is_none(),
-            "a tightened allowlist must take effect at reload, not at the next fetch"
-        );
     }
 
     #[test]
@@ -1371,8 +1305,8 @@ mod tests {
         let doc = format!(
             "{}{}[fallbacks]\n\"ghost\" = \"cuda-only:v1\"\n\
              [aliases.fast]\nchain = [\"cuda/cuda-only:v1\"]\n",
-            backend_toml("cuda", "http://cuda:11434", "[\"*\"]"),
-            backend_toml("rocm", "http://rocm:11435", "[\"*\"]"),
+            backend_toml("cuda", "http://cuda:11434"),
+            backend_toml("rocm", "http://rocm:11435"),
         );
         reg.apply_file_config(policy(&doc));
         assert_eq!(reg.fallback_for("ghost"), Some("cuda-only:v1"));
@@ -1447,30 +1381,6 @@ mod tests {
 
         assert!(reg.backends[1].healthy, "rocm must not be marked down");
         assert_lookup_name(&reg, "rocm-only:v1", "rocm");
-    }
-
-    #[test]
-    fn allowlist_pairs_with_its_own_backend_regardless_of_order() {
-        // cuda is metered (allowlisted), rocm publishes everything. The
-        // filter must follow the *name*, not the slot.
-        let mut reg = Registry::new(policy(&format!(
-            "{}{}[fallbacks]\n[aliases]\n",
-            backend_toml("cuda", "http://cuda:11434", "[\"kept:v1\"]"),
-            backend_toml("rocm", "http://rocm:11435", "[\"*\"]"),
-        )));
-        apply(
-            &mut reg,
-            vec![
-                ("rocm", ok_result(&["kept:v1", "dropped:v1"])),
-                ("cuda", ok_result(&["kept:v1", "dropped:v1"])),
-            ],
-        );
-
-        assert_eq!(reg.backends[0].models.len(), 1, "cuda is filtered");
-        assert_eq!(reg.backends[1].models.len(), 2, "rocm is not");
-        // First-writer-wins still puts the shared name on cuda.
-        assert_lookup_name(&reg, "kept:v1", "cuda");
-        assert_lookup_name(&reg, "dropped:v1", "rocm");
     }
 
     #[test]

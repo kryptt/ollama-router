@@ -69,7 +69,7 @@ fn policy_doc(backends: &[(&str, &str)], extra: &str) -> String {
     let mut doc = String::new();
     for (name, url) in backends {
         doc.push_str(&format!(
-            "[[backends]]\nname = \"{name}\"\nurl = \"{url}\"\nallow = [\"*\"]\n\n"
+            "[[backends]]\nname = \"{name}\"\nurl = \"{url}\"\n\n"
         ));
     }
     if !extra.contains("[fallbacks]") {
@@ -715,8 +715,8 @@ async fn local_alias_never_reaches_external_backend() {
     std::fs::write(
         &path,
         format!(
-            "[[backends]]\nname = \"loc\"\nurl = \"http://127.0.0.1:1\"\nallow = [\"*\"]\n\n\
-             [[backends]]\nname = \"ext\"\nurl = \"{}\"\nexternal = true\nallow = [\"*\"]\n\n\
+            "[[backends]]\nname = \"loc\"\nurl = \"http://127.0.0.1:1\"\n\n\
+             [[backends]]\nname = \"ext\"\nurl = \"{}\"\nexternal = true\n\n\
              [fallbacks]\n[aliases.secret]\nlocal = true\nchain = [\"loc/m:latest\"]\n",
             ext.url
         ),
@@ -771,8 +771,11 @@ async fn aliases_listed_in_v1_models_and_api_tags() {
         .find(|m| m["id"] == "ali")
         .expect("alias listed in /v1/models");
     assert_eq!(alias_entry["owned_by"], "router-alias");
-    // Concrete models keep listing (":latest" stripped for exact-id match).
-    assert!(data.iter().any(|m| m["id"] == "m"), "{data:?}");
+    // Only aliases are listed in /v1/models - no concrete models
+    assert!(
+        !data.iter().any(|m| m["id"] == "m"),
+        "concrete models should not be listed"
+    );
 
     let tags: serde_json::Value = client
         .get(format!("{base}/api/tags"))
@@ -791,7 +794,11 @@ async fn aliases_listed_in_v1_models_and_api_tags() {
     assert_eq!(alias_tag["model"], "ali");
     assert!(alias_tag["modified_at"].is_string());
     assert!(alias_tag["size"].is_u64());
-    assert!(models.iter().any(|m| m["name"] == "m:latest"), "{models:?}");
+    // Only aliases are listed in /api/tags - no concrete models
+    assert!(
+        !models.iter().any(|m| m["name"] == "m:latest"),
+        "concrete models should not be listed"
+    );
 
     // Anything /v1/models lists must be retrievable by id — the alias too.
     let one: serde_json::Value = client
@@ -804,13 +811,13 @@ async fn aliases_listed_in_v1_models_and_api_tags() {
         .unwrap();
     assert_eq!(one["id"], "ali");
     assert_eq!(one["owned_by"], "router-alias");
-    // Concrete retrieval still works alongside.
+    // Concrete model retrieval returns 404 (not published)
     let concrete = client
         .get(format!("{base}/v1/models/m"))
         .send()
         .await
         .unwrap();
-    assert_eq!(concrete.status(), StatusCode::OK);
+    assert_eq!(concrete.status(), StatusCode::NOT_FOUND);
 
     // The unknown-model 404 hint includes the alias.
     let resp = post_chat(&client, &base, "nope", false).await;
@@ -1276,7 +1283,7 @@ async fn flipping_a_chained_backend_to_external_is_rejected_end_to_end() {
     );
 
     h.edit(&format!(
-        "[[backends]]\nname = \"p1\"\nurl = \"{}\"\nexternal = true\nallow = [\"*\"]\n\n{PINNED}",
+        "[[backends]]\nname = \"p1\"\nurl = \"{}\"\nexternal = true\n\n{PINNED}",
         b1.url
     ))
     .await;

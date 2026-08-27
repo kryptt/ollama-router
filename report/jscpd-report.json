@@ -1,0 +1,3057 @@
+{
+  "duplicates": [
+    {
+      "firstFile": {
+        "end": 11,
+        "endLoc": {
+          "column": 3,
+          "line": 11,
+          "position": 357
+        },
+        "name": "src/handler.rs",
+        "start": 8,
+        "startLoc": {
+          "column": 0,
+          "line": 8,
+          "position": 309
+        }
+      },
+      "format": "rust",
+      "fragment": "use std::sync::Arc;\nuse std::time::Instant;\n\nuse axum::body::Body;",
+      "lines": 4,
+      "secondFile": {
+        "end": 3,
+        "endLoc": {
+          "column": 25,
+          "line": 3,
+          "position": 76
+        },
+        "name": "src/registry.rs",
+        "start": 2,
+        "startLoc": {
+          "column": 0,
+          "line": 2,
+          "position": 31
+        }
+      },
+      "tokens": 19
+    },
+    {
+      "firstFile": {
+        "end": 46,
+        "endLoc": {
+          "column": 30,
+          "line": 46,
+          "position": 1421
+        },
+        "name": "src/handler.rs",
+        "start": 42,
+        "startLoc": {
+          "column": 24,
+          "line": 42,
+          "position": 1324
+        }
+      },
+      "format": "rust",
+      "fragment": "    name = \"model_route\",\n    skip_all,\n    fields(\n        http.request.method = %method,\n        url.path = %uri.path(),",
+      "lines": 5,
+      "secondFile": {
+        "end": 375,
+        "endLoc": {
+          "column": 64,
+          "line": 375,
+          "position": 13475
+        },
+        "name": "src/handler.rs",
+        "start": 373,
+        "startLoc": {
+          "column": 30,
+          "line": 373,
+          "position": 13395
+        }
+      },
+      "tokens": 24
+    },
+    {
+      "firstFile": {
+        "end": 59,
+        "endLoc": {
+          "column": 7,
+          "line": 59,
+          "position": 1750
+        },
+        "name": "src/handler.rs",
+        "start": 54,
+        "startLoc": {
+          "column": 18,
+          "line": 54,
+          "position": 1650
+        }
+      },
+      "format": "rust",
+      "fragment": "    method: Method,\n    OriginalUri(uri): OriginalUri,\n    headers: HeaderMap,\n    body: Body,\n) -> Response {\n    let default_stream = routes::default_stream_for_path(uri.path());",
+      "lines": 6,
+      "secondFile": {
+        "end": 384,
+        "endLoc": {
+          "column": 7,
+          "line": 384,
+          "position": 13665
+        },
+        "name": "src/handler.rs",
+        "start": 379,
+        "startLoc": {
+          "column": 33,
+          "line": 379,
+          "position": 13565
+        }
+      },
+      "tokens": 22
+    },
+    {
+      "firstFile": {
+        "end": 67,
+        "endLoc": {
+          "column": 38,
+          "line": 67,
+          "position": 2106
+        },
+        "name": "src/handler.rs",
+        "start": 64,
+        "startLoc": {
+          "column": 91,
+          "line": 64,
+          "position": 2035
+        }
+      },
+      "format": "rust",
+      "fragment": "            return proxy::bad_request(\"request body must contain a non-empty 'model' field\");\n        }\n        Err(e) => {\n            tracing::warn!(error = %e, \"failed to spill request body\");",
+      "lines": 4,
+      "secondFile": {
+        "end": 138,
+        "endLoc": {
+          "column": 38,
+          "line": 138,
+          "position": 5326
+        },
+        "name": "src/proxy.rs",
+        "start": 135,
+        "startLoc": {
+          "column": 57,
+          "line": 135,
+          "position": 5255
+        }
+      },
+      "tokens": 21
+    },
+    {
+      "firstFile": {
+        "end": 437,
+        "endLoc": {
+          "column": 7,
+          "line": 437,
+          "position": 15236
+        },
+        "name": "src/handler.rs",
+        "start": 434,
+        "startLoc": {
+          "column": 69,
+          "line": 434,
+          "position": 15183
+        }
+      },
+      "format": "rust",
+      "fragment": "pub async fn status_route(State(state): State<AppState>) -> Response {\n    let reg = state.registry.read().await;\n\n    let backends: Vec<serde_json::Value> = reg",
+      "lines": 4,
+      "secondFile": {
+        "end": 467,
+        "endLoc": {
+          "column": 11,
+          "line": 467,
+          "position": 16168
+        },
+        "name": "src/handler.rs",
+        "start": 465,
+        "startLoc": {
+          "column": 4,
+          "line": 465,
+          "position": 16108
+        }
+      },
+      "tokens": 15
+    },
+    {
+      "firstFile": {
+        "end": 491,
+        "endLoc": {
+          "column": 49,
+          "line": 491,
+          "position": 17035
+        },
+        "name": "src/handler.rs",
+        "start": 488,
+        "startLoc": {
+          "column": 19,
+          "line": 488,
+          "position": 16941
+        }
+      },
+      "format": "rust",
+      "fragment": "        Ok(buf) => (\n            StatusCode::OK,\n            [(\n                axum::http::header::CONTENT_TYPE,",
+      "lines": 4,
+      "secondFile": {
+        "end": 925,
+        "endLoc": {
+          "column": 55,
+          "line": 925,
+          "position": 32840
+        },
+        "name": "src/heartbeat.rs",
+        "start": 923,
+        "startLoc": {
+          "column": 16,
+          "line": 923,
+          "position": 32747
+        }
+      },
+      "tokens": 19
+    },
+    {
+      "firstFile": {
+        "end": 545,
+        "endLoc": {
+          "column": 19,
+          "line": 545,
+          "position": 18805
+        },
+        "name": "src/handler.rs",
+        "start": 542,
+        "startLoc": {
+          "column": 36,
+          "line": 542,
+          "position": 18744
+        }
+      },
+      "format": "rust",
+      "fragment": "    match proxy::execute(req).await {\n        Ok(r) => r,\n        Err(e) => {\n            metrics",
+      "lines": 4,
+      "secondFile": {
+        "end": 487,
+        "endLoc": {
+          "column": 16,
+          "line": 487,
+          "position": 17700
+        },
+        "name": "src/heartbeat.rs",
+        "start": 484,
+        "startLoc": {
+          "column": 30,
+          "line": 484,
+          "position": 17642
+        }
+      },
+      "tokens": 16
+    },
+    {
+      "firstFile": {
+        "end": 744,
+        "endLoc": {
+          "column": 17,
+          "line": 744,
+          "position": 26079
+        },
+        "name": "src/handler.rs",
+        "start": 739,
+        "startLoc": {
+          "column": 4,
+          "line": 739,
+          "position": 26032
+        }
+      },
+      "format": "rust",
+      "fragment": "    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;",
+      "lines": 6,
+      "secondFile": {
+        "end": 433,
+        "endLoc": {
+          "column": 17,
+          "line": 433,
+          "position": 14884
+        },
+        "name": "src/registry.rs",
+        "start": 428,
+        "startLoc": {
+          "column": 4,
+          "line": 428,
+          "position": 14837
+        }
+      },
+      "tokens": 18
+    },
+    {
+      "firstFile": {
+        "end": 744,
+        "endLoc": {
+          "column": 17,
+          "line": 744,
+          "position": 26079
+        },
+        "name": "src/handler.rs",
+        "start": 739,
+        "startLoc": {
+          "column": 4,
+          "line": 739,
+          "position": 26032
+        }
+      },
+      "format": "rust",
+      "fragment": "    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;",
+      "lines": 6,
+      "secondFile": {
+        "end": 313,
+        "endLoc": {
+          "column": 17,
+          "line": 313,
+          "position": 10797
+        },
+        "name": "src/spill.rs",
+        "start": 307,
+        "startLoc": {
+          "column": 4,
+          "line": 307,
+          "position": 10749
+        }
+      },
+      "tokens": 18
+    },
+    {
+      "firstFile": {
+        "end": 744,
+        "endLoc": {
+          "column": 17,
+          "line": 744,
+          "position": 26079
+        },
+        "name": "src/handler.rs",
+        "start": 740,
+        "startLoc": {
+          "column": 0,
+          "line": 740,
+          "position": 26034
+        }
+      },
+      "format": "rust",
+      "fragment": "}\n\n#[cfg(test)]\nmod tests {\n    use super::*;",
+      "lines": 5,
+      "secondFile": {
+        "end": 323,
+        "endLoc": {
+          "column": 17,
+          "line": 323,
+          "position": 12222
+        },
+        "name": "src/models.rs",
+        "start": 319,
+        "startLoc": {
+          "column": 0,
+          "line": 319,
+          "position": 12177
+        }
+      },
+      "tokens": 17
+    },
+    {
+      "firstFile": {
+        "end": 746,
+        "endLoc": {
+          "column": 78,
+          "line": 746,
+          "position": 26159
+        },
+        "name": "src/handler.rs",
+        "start": 742,
+        "startLoc": {
+          "column": 0,
+          "line": 742,
+          "position": 26037
+        }
+      },
+      "format": "rust",
+      "fragment": "#[cfg(test)]\nmod tests {\n    use super::*;\n\n    /// Construct a minimal `AppState` for in-process handler tests — no TCP",
+      "lines": 5,
+      "secondFile": {
+        "end": 573,
+        "endLoc": {
+          "column": 5,
+          "line": 573,
+          "position": 21006
+        },
+        "name": "src/heartbeat.rs",
+        "start": 569,
+        "startLoc": {
+          "column": 0,
+          "line": 569,
+          "position": 20957
+        }
+      },
+      "tokens": 16
+    },
+    {
+      "firstFile": {
+        "end": 770,
+        "endLoc": {
+          "column": 21,
+          "line": 770,
+          "position": 27326
+        },
+        "name": "src/handler.rs",
+        "start": 767,
+        "startLoc": {
+          "column": 65,
+          "line": 767,
+          "position": 27152
+        }
+      },
+      "format": "rust",
+      "fragment": "        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);\n        let bytes = resp.into_body().collect().await.unwrap().to_bytes();\n        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();\n        assert_eq!(v[\"reason\"], \"awaiting first discovery\");",
+      "lines": 4,
+      "secondFile": {
+        "end": 1082,
+        "endLoc": {
+          "column": 26,
+          "line": 1082,
+          "position": 38447
+        },
+        "name": "src/heartbeat.rs",
+        "start": 1078,
+        "startLoc": {
+          "column": 48,
+          "line": 1078,
+          "position": 38270
+        }
+      },
+      "tokens": 51
+    },
+    {
+      "firstFile": {
+        "end": 845,
+        "endLoc": {
+          "column": 6,
+          "line": 845,
+          "position": 29815
+        },
+        "name": "src/handler.rs",
+        "start": 841,
+        "startLoc": {
+          "column": 45,
+          "line": 841,
+          "position": 29758
+        }
+      },
+      "format": "rust",
+      "fragment": "        assert_escalation(\"qwen3.6-medium\", 1_000, &one_step_rules(), None);\n    }\n\n    #[test]\n    fn escalation_above_threshold_rewrites() {",
+      "lines": 5,
+      "secondFile": {
+        "end": 881,
+        "endLoc": {
+          "column": 6,
+          "line": 881,
+          "position": 30699
+        },
+        "name": "src/handler.rs",
+        "start": 877,
+        "startLoc": {
+          "column": 47,
+          "line": 877,
+          "position": 30642
+        }
+      },
+      "tokens": 16
+    },
+    {
+      "firstFile": {
+        "end": 855,
+        "endLoc": {
+          "column": 6,
+          "line": 855,
+          "position": 30034
+        },
+        "name": "src/handler.rs",
+        "start": 849,
+        "startLoc": {
+          "column": 27,
+          "line": 849,
+          "position": 29960
+        }
+      },
+      "format": "rust",
+      "fragment": "            &one_step_rules(),\n            Some(\"qwen3.6-high\"),\n        );\n    }\n\n    #[test]\n    fn escalation_chains_through_multiple_hops() {",
+      "lines": 7,
+      "secondFile": {
+        "end": 876,
+        "endLoc": {
+          "column": 6,
+          "line": 876,
+          "position": 30554
+        },
+        "name": "src/handler.rs",
+        "start": 870,
+        "startLoc": {
+          "column": 27,
+          "line": 870,
+          "position": 30480
+        }
+      },
+      "tokens": 16
+    },
+    {
+      "firstFile": {
+        "end": 907,
+        "endLoc": {
+          "column": 18,
+          "line": 907,
+          "position": 31809
+        },
+        "name": "src/handler.rs",
+        "start": 903,
+        "startLoc": {
+          "column": 8,
+          "line": 903,
+          "position": 31644
+        }
+      },
+      "format": "rust",
+      "fragment": "        let rules = vec![\n            rule(\"a\", 10, \"b\"), // declared first\n            rule(\"a\", 5, \"c\"),  // declared second, lower threshold\n        ];\n        assert_eq!(",
+      "lines": 5,
+      "secondFile": {
+        "end": 932,
+        "endLoc": {
+          "column": 78,
+          "line": 932,
+          "position": 33005
+        },
+        "name": "src/handler.rs",
+        "start": 932,
+        "startLoc": {
+          "column": 8,
+          "line": 932,
+          "position": 32935
+        }
+      },
+      "tokens": 30
+    },
+    {
+      "firstFile": {
+        "end": 36,
+        "endLoc": {
+          "column": 3,
+          "line": 36,
+          "position": 1617
+        },
+        "name": "src/heartbeat.rs",
+        "start": 33,
+        "startLoc": {
+          "column": 30,
+          "line": 33,
+          "position": 1575
+        }
+      },
+      "format": "rust",
+      "fragment": "use std::task::{Context, Poll};\nuse std::time::{Duration, Instant};\n\nuse axum::body::Body;",
+      "lines": 4,
+      "secondFile": {
+        "end": 5,
+        "endLoc": {
+          "column": 3,
+          "line": 5,
+          "position": 91
+        },
+        "name": "src/registry.rs",
+        "start": 2,
+        "startLoc": {
+          "column": 18,
+          "line": 2,
+          "position": 49
+        }
+      },
+      "tokens": 15
+    },
+    {
+      "firstFile": {
+        "end": 41,
+        "endLoc": {
+          "column": 3,
+          "line": 41,
+          "position": 1788
+        },
+        "name": "src/heartbeat.rs",
+        "start": 38,
+        "startLoc": {
+          "column": 28,
+          "line": 38,
+          "position": 1726
+        }
+      },
+      "format": "rust",
+      "fragment": "use axum::response::Response;\nuse bytes::Bytes;\nuse futures_util::{Stream, StreamExt};\nuse reqwest::Client;",
+      "lines": 4,
+      "secondFile": {
+        "end": 7,
+        "endLoc": {
+          "column": 3,
+          "line": 7,
+          "position": 115
+        },
+        "name": "src/spill.rs",
+        "start": 4,
+        "startLoc": {
+          "column": 20,
+          "line": 4,
+          "position": 53
+        }
+      },
+      "tokens": 18
+    },
+    {
+      "firstFile": {
+        "end": 207,
+        "endLoc": {
+          "column": 35,
+          "line": 207,
+          "position": 8348
+        },
+        "name": "src/heartbeat.rs",
+        "start": 204,
+        "startLoc": {
+          "column": 36,
+          "line": 204,
+          "position": 8271
+        }
+      },
+      "format": "rust",
+      "fragment": "    kind: crate::models::BackendKind,\n    model: &str,\n    timeout: Duration,\n) -> Result<bool, PreflightError> {",
+      "lines": 4,
+      "secondFile": {
+        "end": 223,
+        "endLoc": {
+          "column": 35,
+          "line": 223,
+          "position": 8834
+        },
+        "name": "src/heartbeat.rs",
+        "start": 220,
+        "startLoc": {
+          "column": 21,
+          "line": 220,
+          "position": 8757
+        }
+      },
+      "tokens": 20
+    },
+    {
+      "firstFile": {
+        "end": 223,
+        "endLoc": {
+          "column": 35,
+          "line": 223,
+          "position": 8834
+        },
+        "name": "src/heartbeat.rs",
+        "start": 218,
+        "startLoc": {
+          "column": 28,
+          "line": 218,
+          "position": 8713
+        }
+      },
+      "format": "rust",
+      "fragment": "async fn preflight_ollama_ps(\n    client: &Client,\n    backend_url: &str,\n    model: &str,\n    timeout: Duration,\n) -> Result<bool, PreflightError> {",
+      "lines": 6,
+      "secondFile": {
+        "end": 272,
+        "endLoc": {
+          "column": 35,
+          "line": 272,
+          "position": 10187
+        },
+        "name": "src/heartbeat.rs",
+        "start": 267,
+        "startLoc": {
+          "column": 37,
+          "line": 267,
+          "position": 10066
+        }
+      },
+      "tokens": 30
+    },
+    {
+      "firstFile": {
+        "end": 249,
+        "endLoc": {
+          "column": 13,
+          "line": 249,
+          "position": 9437
+        },
+        "name": "src/heartbeat.rs",
+        "start": 237,
+        "startLoc": {
+          "column": 44,
+          "line": 237,
+          "position": 9158
+        }
+      },
+      "format": "rust",
+      "fragment": "    let url = format!(\"{backend_url}/api/ps\");\n    let resp = client\n        .get(&url)\n        .timeout(timeout)\n        .send()\n        .await\n        .map_err(PreflightError::from_send_error)?;\n\n    if !resp.status().is_success() {\n        return Err(PreflightError::Status(resp.status().as_u16()));\n    }\n\n    let body: PsResponse = resp",
+      "lines": 13,
+      "secondFile": {
+        "end": 285,
+        "endLoc": {
+          "column": 13,
+          "line": 285,
+          "position": 10512
+        },
+        "name": "src/heartbeat.rs",
+        "start": 273,
+        "startLoc": {
+          "column": 45,
+          "line": 273,
+          "position": 10233
+        }
+      },
+      "tokens": 69
+    },
+    {
+      "firstFile": {
+        "end": 252,
+        "endLoc": {
+          "column": 60,
+          "line": 252,
+          "position": 9547
+        },
+        "name": "src/heartbeat.rs",
+        "start": 249,
+        "startLoc": {
+          "column": 25,
+          "line": 249,
+          "position": 9449
+        }
+      },
+      "format": "rust",
+      "fragment": "    let body: PsResponse = resp\n        .json()\n        .await\n        .map_err(|e| PreflightError::Parse(e.to_string()))?;",
+      "lines": 4,
+      "secondFile": {
+        "end": 288,
+        "endLoc": {
+          "column": 60,
+          "line": 288,
+          "position": 10642
+        },
+        "name": "src/heartbeat.rs",
+        "start": 285,
+        "startLoc": {
+          "column": 45,
+          "line": 285,
+          "position": 10544
+        }
+      },
+      "tokens": 28
+    },
+    {
+      "firstFile": {
+        "end": 432,
+        "endLoc": {
+          "column": 11,
+          "line": 432,
+          "position": 15849
+        },
+        "name": "src/heartbeat.rs",
+        "start": 429,
+        "startLoc": {
+          "column": 23,
+          "line": 429,
+          "position": 15740
+        }
+      },
+      "format": "rust",
+      "fragment": "    type Item = S::Item;\n\n    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {\n        Pin::new(&mut self.inner).poll_next(cx)",
+      "lines": 4,
+      "secondFile": {
+        "end": 294,
+        "endLoc": {
+          "column": 12,
+          "line": 294,
+          "position": 11753
+        },
+        "name": "src/translate.rs",
+        "start": 291,
+        "startLoc": {
+          "column": 45,
+          "line": 291,
+          "position": 11643
+        }
+      },
+      "tokens": 21
+    },
+    {
+      "firstFile": {
+        "end": 605,
+        "endLoc": {
+          "column": 38,
+          "line": 605,
+          "position": 22176
+        },
+        "name": "src/heartbeat.rs",
+        "start": 601,
+        "startLoc": {
+          "column": 60,
+          "line": 601,
+          "position": 22060
+        }
+      },
+      "format": "rust",
+      "fragment": "            StreamProtocol::from_path(\"/v1/chat/completions\"),\n            Some(StreamProtocol::OpenAiSse)\n        );\n        assert_eq!(\n            StreamProtocol::from_path(\"/v1/completions\"),",
+      "lines": 5,
+      "secondFile": {
+        "end": 609,
+        "endLoc": {
+          "column": 38,
+          "line": 609,
+          "position": 22309
+        },
+        "name": "src/heartbeat.rs",
+        "start": 605,
+        "startLoc": {
+          "column": 55,
+          "line": 605,
+          "position": 22193
+        }
+      },
+      "tokens": 19
+    },
+    {
+      "firstFile": {
+        "end": 629,
+        "endLoc": {
+          "column": 14,
+          "line": 629,
+          "position": 23090
+        },
+        "name": "src/heartbeat.rs",
+        "start": 626,
+        "startLoc": {
+          "column": 65,
+          "line": 626,
+          "position": 23002
+        }
+      },
+      "format": "rust",
+      "fragment": "        let bytes = StreamProtocol::OllamaChat.heartbeat(\"llama3\");\n        let s = std::str::from_utf8(&bytes).unwrap();\n        assert!(\n            s.ends_with('\\n'),",
+      "lines": 4,
+      "secondFile": {
+        "end": 653,
+        "endLoc": {
+          "column": 18,
+          "line": 653,
+          "position": 24070
+        },
+        "name": "src/heartbeat.rs",
+        "start": 651,
+        "startLoc": {
+          "column": 65,
+          "line": 651,
+          "position": 23995
+        }
+      },
+      "tokens": 26
+    },
+    {
+      "firstFile": {
+        "end": 629,
+        "endLoc": {
+          "column": 14,
+          "line": 629,
+          "position": 23090
+        },
+        "name": "src/heartbeat.rs",
+        "start": 626,
+        "startLoc": {
+          "column": 65,
+          "line": 626,
+          "position": 23002
+        }
+      },
+      "format": "rust",
+      "fragment": "        let bytes = StreamProtocol::OllamaChat.heartbeat(\"llama3\");\n        let s = std::str::from_utf8(&bytes).unwrap();\n        assert!(\n            s.ends_with('\\n'),",
+      "lines": 4,
+      "secondFile": {
+        "end": 674,
+        "endLoc": {
+          "column": 18,
+          "line": 674,
+          "position": 24883
+        },
+        "name": "src/heartbeat.rs",
+        "start": 672,
+        "startLoc": {
+          "column": 73,
+          "line": 672,
+          "position": 24808
+        }
+      },
+      "tokens": 26
+    },
+    {
+      "firstFile": {
+        "end": 693,
+        "endLoc": {
+          "column": 5,
+          "line": 693,
+          "position": 25554
+        },
+        "name": "src/heartbeat.rs",
+        "start": 686,
+        "startLoc": {
+          "column": 27,
+          "line": 686,
+          "position": 25266
+        }
+      },
+      "format": "rust",
+      "fragment": "    async fn spawn_test_app(app: Router) -> String {\n        let listener = TcpListener::bind(\"127.0.0.1:0\").await.unwrap();\n        let addr = listener.local_addr().unwrap();\n        tokio::spawn(async move {\n            axum::serve(listener, app).await.unwrap();\n        });\n        format!(\"http://{addr}\")\n    }",
+      "lines": 8,
+      "secondFile": {
+        "end": 24,
+        "endLoc": {
+          "column": 1,
+          "line": 24,
+          "position": 892
+        },
+        "name": "tests/integration_test.rs",
+        "start": 17,
+        "startLoc": {
+          "column": 26,
+          "line": 17,
+          "position": 632
+        }
+      },
+      "tokens": 72
+    },
+    {
+      "firstFile": {
+        "end": 691,
+        "endLoc": {
+          "column": 11,
+          "line": 691,
+          "position": 25515
+        },
+        "name": "src/heartbeat.rs",
+        "start": 687,
+        "startLoc": {
+          "column": 8,
+          "line": 687,
+          "position": 25300
+        }
+      },
+      "format": "rust",
+      "fragment": "        let listener = TcpListener::bind(\"127.0.0.1:0\").await.unwrap();\n        let addr = listener.local_addr().unwrap();\n        tokio::spawn(async move {\n            axum::serve(listener, app).await.unwrap();\n        });",
+      "lines": 5,
+      "secondFile": {
+        "end": 1000,
+        "endLoc": {
+          "column": 11,
+          "line": 1000,
+          "position": 35388
+        },
+        "name": "src/heartbeat.rs",
+        "start": 996,
+        "startLoc": {
+          "column": 8,
+          "line": 996,
+          "position": 35173
+        }
+      },
+      "tokens": 57
+    },
+    {
+      "firstFile": {
+        "end": 695,
+        "endLoc": {
+          "column": 9,
+          "line": 695,
+          "position": 25565
+        },
+        "name": "src/heartbeat.rs",
+        "start": 690,
+        "startLoc": {
+          "column": 24,
+          "line": 690,
+          "position": 25473
+        }
+      },
+      "format": "rust",
+      "fragment": "            axum::serve(listener, app).await.unwrap();\n        });\n        format!(\"http://{addr}\")\n    }\n\n    async fn spawn_ps_server(models: Vec<&'static str>) -> String {",
+      "lines": 6,
+      "secondFile": {
+        "end": 26,
+        "endLoc": {
+          "column": 2,
+          "line": 26,
+          "position": 896
+        },
+        "name": "tests/integration_test.rs",
+        "start": 21,
+        "startLoc": {
+          "column": 20,
+          "line": 21,
+          "position": 823
+        }
+      },
+      "tokens": 20
+    },
+    {
+      "firstFile": {
+        "end": 700,
+        "endLoc": {
+          "column": 38,
+          "line": 700,
+          "position": 25845
+        },
+        "name": "src/heartbeat.rs",
+        "start": 697,
+        "startLoc": {
+          "column": 81,
+          "line": 697,
+          "position": 25747
+        }
+      },
+      "format": "rust",
+      "fragment": "            \"models\": models.iter().map(|m| serde_json::json!({\"name\": m, \"model\": m})).collect::<Vec<_>>()\n        })\n        .to_string();\n        let app = Router::new().route(",
+      "lines": 4,
+      "secondFile": {
+        "end": 54,
+        "endLoc": {
+          "column": 15,
+          "line": 54,
+          "position": 1846
+        },
+        "name": "tests/integration_test.rs",
+        "start": 49,
+        "startLoc": {
+          "column": 65,
+          "line": 49,
+          "position": 1750
+        }
+      },
+      "tokens": 36
+    },
+    {
+      "firstFile": {
+        "end": 711,
+        "endLoc": {
+          "column": 12,
+          "line": 711,
+          "position": 26086
+        },
+        "name": "src/heartbeat.rs",
+        "start": 701,
+        "startLoc": {
+          "column": 21,
+          "line": 701,
+          "position": 25867
+        }
+      },
+      "format": "rust",
+      "fragment": "            \"/api/ps\",\n            get(move || {\n                let p = payload.clone();\n                async move { (StatusCode::OK, p) }\n            }),\n        );\n        spawn_test_app(app).await\n    }\n\n    #[tokio::test]\n    async fn preflight_detects_loaded_model() {",
+      "lines": 11,
+      "secondFile": {
+        "end": 832,
+        "endLoc": {
+          "column": 12,
+          "line": 832,
+          "position": 29856
+        },
+        "name": "src/heartbeat.rs",
+        "start": 822,
+        "startLoc": {
+          "column": 22,
+          "line": 822,
+          "position": 29637
+        }
+      },
+      "tokens": 49
+    },
+    {
+      "firstFile": {
+        "end": 711,
+        "endLoc": {
+          "column": 12,
+          "line": 711,
+          "position": 26086
+        },
+        "name": "src/heartbeat.rs",
+        "start": 705,
+        "startLoc": {
+          "column": 12,
+          "line": 705,
+          "position": 25999
+        }
+      },
+      "format": "rust",
+      "fragment": "            }),\n        );\n        spawn_test_app(app).await\n    }\n\n    #[tokio::test]\n    async fn preflight_detects_loaded_model() {",
+      "lines": 7,
+      "secondFile": {
+        "end": 934,
+        "endLoc": {
+          "column": 12,
+          "line": 934,
+          "position": 33009
+        },
+        "name": "src/heartbeat.rs",
+        "start": 928,
+        "startLoc": {
+          "column": 12,
+          "line": 928,
+          "position": 32922
+        }
+      },
+      "tokens": 21
+    },
+    {
+      "firstFile": {
+        "end": 717,
+        "endLoc": {
+          "column": 47,
+          "line": 717,
+          "position": 26359
+        },
+        "name": "src/heartbeat.rs",
+        "start": 711,
+        "startLoc": {
+          "column": 43,
+          "line": 711,
+          "position": 26117
+        }
+      },
+      "format": "rust",
+      "fragment": "    async fn preflight_detects_loaded_model() {\n        let url = spawn_ps_server(vec![\"llama3:latest\"]).await;\n        let client = reqwest::Client::new();\n        let loaded = preflight_is_loaded(\n            &client,\n            &url,\n            crate::models::BackendKind::Ollama,",
+      "lines": 7,
+      "secondFile": {
+        "end": 733,
+        "endLoc": {
+          "column": 47,
+          "line": 733,
+          "position": 26805
+        },
+        "name": "src/heartbeat.rs",
+        "start": 727,
+        "startLoc": {
+          "column": 43,
+          "line": 727,
+          "position": 26563
+        }
+      },
+      "tokens": 52
+    },
+    {
+      "firstFile": {
+        "end": 723,
+        "endLoc": {
+          "column": 16,
+          "line": 723,
+          "position": 26485
+        },
+        "name": "src/heartbeat.rs",
+        "start": 712,
+        "startLoc": {
+          "column": 54,
+          "line": 712,
+          "position": 26176
+        }
+      },
+      "format": "rust",
+      "fragment": "        let url = spawn_ps_server(vec![\"llama3:latest\"]).await;\n        let client = reqwest::Client::new();\n        let loaded = preflight_is_loaded(\n            &client,\n            &url,\n            crate::models::BackendKind::Ollama,\n            \"llama3:latest\",\n            Duration::from_secs(2),\n        )\n        .await\n        .unwrap();\n        assert!(loaded);",
+      "lines": 12,
+      "secondFile": {
+        "end": 755,
+        "endLoc": {
+          "column": 16,
+          "line": 755,
+          "position": 27373
+        },
+        "name": "src/heartbeat.rs",
+        "start": 744,
+        "startLoc": {
+          "column": 53,
+          "line": 744,
+          "position": 27071
+        }
+      },
+      "tokens": 61
+    },
+    {
+      "firstFile": {
+        "end": 727,
+        "endLoc": {
+          "column": 43,
+          "line": 727,
+          "position": 26563
+        },
+        "name": "src/heartbeat.rs",
+        "start": 712,
+        "startLoc": {
+          "column": 54,
+          "line": 712,
+          "position": 26176
+        }
+      },
+      "format": "rust",
+      "fragment": "        let url = spawn_ps_server(vec![\"llama3:latest\"]).await;\n        let client = reqwest::Client::new();\n        let loaded = preflight_is_loaded(\n            &client,\n            &url,\n            crate::models::BackendKind::Ollama,\n            \"llama3:latest\",\n            Duration::from_secs(2),\n        )\n        .await\n        .unwrap();\n        assert!(loaded);\n    }\n\n    #[tokio::test]\n    async fn preflight_detects_prefix_match() {",
+      "lines": 16,
+      "secondFile": {
+        "end": 775,
+        "endLoc": {
+          "column": 12,
+          "line": 775,
+          "position": 27848
+        },
+        "name": "src/heartbeat.rs",
+        "start": 760,
+        "startLoc": {
+          "column": 39,
+          "line": 760,
+          "position": 27498
+        }
+      },
+      "tokens": 75
+    },
+    {
+      "firstFile": {
+        "end": 717,
+        "endLoc": {
+          "column": 40,
+          "line": 717,
+          "position": 26352
+        },
+        "name": "src/heartbeat.rs",
+        "start": 712,
+        "startLoc": {
+          "column": 54,
+          "line": 712,
+          "position": 26176
+        }
+      },
+      "format": "rust",
+      "fragment": "        let url = spawn_ps_server(vec![\"llama3:latest\"]).await;\n        let client = reqwest::Client::new();\n        let loaded = preflight_is_loaded(\n            &client,\n            &url,\n            crate::models::BackendKind::Ollama,",
+      "lines": 6,
+      "secondFile": {
+        "end": 838,
+        "endLoc": {
+          "column": 40,
+          "line": 838,
+          "position": 30151
+        },
+        "name": "src/heartbeat.rs",
+        "start": 833,
+        "startLoc": {
+          "column": 71,
+          "line": 833,
+          "position": 29975
+        }
+      },
+      "tokens": 38
+    },
+    {
+      "firstFile": {
+        "end": 728,
+        "endLoc": {
+          "column": 37,
+          "line": 728,
+          "position": 26605
+        },
+        "name": "src/heartbeat.rs",
+        "start": 712,
+        "startLoc": {
+          "column": 62,
+          "line": 712,
+          "position": 26184
+        }
+      },
+      "format": "rust",
+      "fragment": "        let url = spawn_ps_server(vec![\"llama3:latest\"]).await;\n        let client = reqwest::Client::new();\n        let loaded = preflight_is_loaded(\n            &client,\n            &url,\n            crate::models::BackendKind::Ollama,\n            \"llama3:latest\",\n            Duration::from_secs(2),\n        )\n        .await\n        .unwrap();\n        assert!(loaded);\n    }\n\n    #[tokio::test]\n    async fn preflight_detects_prefix_match() {\n        let url = spawn_ps_server(vec![\"llama3:latest\"]).await;",
+      "lines": 17,
+      "secondFile": {
+        "end": 1014,
+        "endLoc": {
+          "column": 33,
+          "line": 1014,
+          "position": 35879
+        },
+        "name": "src/heartbeat.rs",
+        "start": 1001,
+        "startLoc": {
+          "column": 42,
+          "line": 1001,
+          "position": 35431
+        }
+      },
+      "tokens": 80
+    },
+    {
+      "firstFile": {
+        "end": 727,
+        "endLoc": {
+          "column": 12,
+          "line": 727,
+          "position": 26532
+        },
+        "name": "src/heartbeat.rs",
+        "start": 718,
+        "startLoc": {
+          "column": 27,
+          "line": 718,
+          "position": 26387
+        }
+      },
+      "format": "rust",
+      "fragment": "            \"llama3:latest\",\n            Duration::from_secs(2),\n        )\n        .await\n        .unwrap();\n        assert!(loaded);\n    }\n\n    #[tokio::test]\n    async fn preflight_detects_prefix_match() {",
+      "lines": 10,
+      "secondFile": {
+        "end": 743,
+        "endLoc": {
+          "column": 12,
+          "line": 743,
+          "position": 26971
+        },
+        "name": "src/heartbeat.rs",
+        "start": 734,
+        "startLoc": {
+          "column": 20,
+          "line": 734,
+          "position": 26826
+        }
+      },
+      "tokens": 33
+    },
+    {
+      "firstFile": {
+        "end": 727,
+        "endLoc": {
+          "column": 12,
+          "line": 727,
+          "position": 26532
+        },
+        "name": "src/heartbeat.rs",
+        "start": 718,
+        "startLoc": {
+          "column": 27,
+          "line": 718,
+          "position": 26387
+        }
+      },
+      "format": "rust",
+      "fragment": "            \"llama3:latest\",\n            Duration::from_secs(2),\n        )\n        .await\n        .unwrap();\n        assert!(loaded);\n    }\n\n    #[tokio::test]\n    async fn preflight_detects_prefix_match() {",
+      "lines": 10,
+      "secondFile": {
+        "end": 848,
+        "endLoc": {
+          "column": 12,
+          "line": 848,
+          "position": 30335
+        },
+        "name": "src/heartbeat.rs",
+        "start": 839,
+        "startLoc": {
+          "column": 28,
+          "line": 839,
+          "position": 30190
+        }
+      },
+      "tokens": 33
+    },
+    {
+      "firstFile": {
+        "end": 727,
+        "endLoc": {
+          "column": 43,
+          "line": 727,
+          "position": 26563
+        },
+        "name": "src/heartbeat.rs",
+        "start": 718,
+        "startLoc": {
+          "column": 27,
+          "line": 718,
+          "position": 26387
+        }
+      },
+      "format": "rust",
+      "fragment": "            \"llama3:latest\",\n            Duration::from_secs(2),\n        )\n        .await\n        .unwrap();\n        assert!(loaded);\n    }\n\n    #[tokio::test]\n    async fn preflight_detects_prefix_match() {",
+      "lines": 10,
+      "secondFile": {
+        "end": 865,
+        "endLoc": {
+          "column": 12,
+          "line": 865,
+          "position": 30903
+        },
+        "name": "src/heartbeat.rs",
+        "start": 856,
+        "startLoc": {
+          "column": 26,
+          "line": 856,
+          "position": 30757
+        }
+      },
+      "tokens": 34
+    },
+    {
+      "firstFile": {
+        "end": 724,
+        "endLoc": {
+          "column": 5,
+          "line": 724,
+          "position": 26499
+        },
+        "name": "src/heartbeat.rs",
+        "start": 719,
+        "startLoc": {
+          "column": 33,
+          "line": 719,
+          "position": 26422
+        }
+      },
+      "format": "rust",
+      "fragment": "            Duration::from_secs(2),\n        )\n        .await\n        .unwrap();\n        assert!(loaded);\n    }",
+      "lines": 6,
+      "secondFile": {
+        "end": 911,
+        "endLoc": {
+          "column": 5,
+          "line": 911,
+          "position": 32348
+        },
+        "name": "src/heartbeat.rs",
+        "start": 906,
+        "startLoc": {
+          "column": 37,
+          "line": 906,
+          "position": 32271
+        }
+      },
+      "tokens": 17
+    },
+    {
+      "firstFile": {
+        "end": 735,
+        "endLoc": {
+          "column": 22,
+          "line": 735,
+          "position": 26850
+        },
+        "name": "src/heartbeat.rs",
+        "start": 732,
+        "startLoc": {
+          "column": 16,
+          "line": 732,
+          "position": 26756
+        }
+      },
+      "format": "rust",
+      "fragment": "            &url,\n            crate::models::BackendKind::Ollama,\n            \"llama3\",\n            Duration::from_secs(2),",
+      "lines": 4,
+      "secondFile": {
+        "end": 782,
+        "endLoc": {
+          "column": 22,
+          "line": 782,
+          "position": 28124
+        },
+        "name": "src/heartbeat.rs",
+        "start": 779,
+        "startLoc": {
+          "column": 32,
+          "line": 779,
+          "position": 28030
+        }
+      },
+      "tokens": 17
+    },
+    {
+      "firstFile": {
+        "end": 775,
+        "endLoc": {
+          "column": 12,
+          "line": 775,
+          "position": 27848
+        },
+        "name": "src/heartbeat.rs",
+        "start": 760,
+        "startLoc": {
+          "column": 33,
+          "line": 760,
+          "position": 27492
+        }
+      },
+      "format": "rust",
+      "fragment": "        let url = spawn_ps_server(vec![]).await;\n        let client = reqwest::Client::new();\n        let loaded = preflight_is_loaded(\n            &client,\n            &url,\n            crate::models::BackendKind::Ollama,\n            \"llama3\",\n            Duration::from_secs(2),\n        )\n        .await\n        .unwrap();\n        assert!(!loaded);\n    }\n\n    #[tokio::test]\n    async fn preflight_errors_on_unreachable_backend() {",
+      "lines": 16,
+      "secondFile": {
+        "end": 897,
+        "endLoc": {
+          "column": 12,
+          "line": 897,
+          "position": 31847
+        },
+        "name": "src/heartbeat.rs",
+        "start": 882,
+        "startLoc": {
+          "column": 38,
+          "line": 882,
+          "position": 31480
+        }
+      },
+      "tokens": 79
+    },
+    {
+      "firstFile": {
+        "end": 780,
+        "endLoc": {
+          "column": 40,
+          "line": 780,
+          "position": 28072
+        },
+        "name": "src/heartbeat.rs",
+        "start": 777,
+        "startLoc": {
+          "column": 16,
+          "line": 777,
+          "position": 27954
+        }
+      },
+      "format": "rust",
+      "fragment": "        let err = preflight_is_loaded(\n            &client,\n            \"http://127.0.0.1:1\",\n            crate::models::BackendKind::Ollama,",
+      "lines": 4,
+      "secondFile": {
+        "end": 904,
+        "endLoc": {
+          "column": 40,
+          "line": 904,
+          "position": 32185
+        },
+        "name": "src/heartbeat.rs",
+        "start": 901,
+        "startLoc": {
+          "column": 19,
+          "line": 901,
+          "position": 32067
+        }
+      },
+      "tokens": 17
+    },
+    {
+      "firstFile": {
+        "end": 838,
+        "endLoc": {
+          "column": 50,
+          "line": 838,
+          "position": 30161
+        },
+        "name": "src/heartbeat.rs",
+        "start": 833,
+        "startLoc": {
+          "column": 70,
+          "line": 833,
+          "position": 29974
+        }
+      },
+      "format": "rust",
+      "fragment": "        let url = spawn_running_server(vec![(\"qwen3.6-medium\", \"ready\")]).await;\n        let client = reqwest::Client::new();\n        let loaded = preflight_is_loaded(\n            &client,\n            &url,\n            crate::models::BackendKind::LlamaSwap,",
+      "lines": 6,
+      "secondFile": {
+        "end": 855,
+        "endLoc": {
+          "column": 50,
+          "line": 855,
+          "position": 30730
+        },
+        "name": "src/heartbeat.rs",
+        "start": 850,
+        "startLoc": {
+          "column": 71,
+          "line": 850,
+          "position": 30543
+        }
+      },
+      "tokens": 41
+    },
+    {
+      "firstFile": {
+        "end": 848,
+        "endLoc": {
+          "column": 62,
+          "line": 848,
+          "position": 30385
+        },
+        "name": "src/heartbeat.rs",
+        "start": 833,
+        "startLoc": {
+          "column": 61,
+          "line": 833,
+          "position": 29965
+        }
+      },
+      "format": "rust",
+      "fragment": "        let url = spawn_running_server(vec![(\"qwen3.6-medium\", \"ready\")]).await;\n        let client = reqwest::Client::new();\n        let loaded = preflight_is_loaded(\n            &client,\n            &url,\n            crate::models::BackendKind::LlamaSwap,\n            \"qwen3.6-medium\",\n            Duration::from_secs(2),\n        )\n        .await\n        .unwrap();\n        assert!(loaded);\n    }\n\n    #[tokio::test]\n    async fn preflight_llama_swap_starting_model_is_not_loaded() {",
+      "lines": 16,
+      "secondFile": {
+        "end": 881,
+        "endLoc": {
+          "column": 12,
+          "line": 881,
+          "position": 31388
+        },
+        "name": "src/heartbeat.rs",
+        "start": 866,
+        "startLoc": {
+          "column": 58,
+          "line": 866,
+          "position": 31017
+        }
+      },
+      "tokens": 78
+    },
+    {
+      "firstFile": {
+        "end": 921,
+        "endLoc": {
+          "column": 17,
+          "line": 921,
+          "position": 32661
+        },
+        "name": "src/heartbeat.rs",
+        "start": 918,
+        "startLoc": {
+          "column": 16,
+          "line": 918,
+          "position": 32578
+        }
+      },
+      "format": "rust",
+      "fragment": "    ) -> String {\n        let app = Router::new().route(\n            \"/api/chat\",\n            post(move || async move {",
+      "lines": 4,
+      "secondFile": {
+        "end": 991,
+        "endLoc": {
+          "column": 17,
+          "line": 991,
+          "position": 34981
+        },
+        "name": "src/heartbeat.rs",
+        "start": 988,
+        "startLoc": {
+          "column": 68,
+          "line": 988,
+          "position": 34898
+        }
+      },
+      "tokens": 17
+    },
+    {
+      "firstFile": {
+        "end": 922,
+        "endLoc": {
+          "column": 40,
+          "line": 922,
+          "position": 32722
+        },
+        "name": "src/heartbeat.rs",
+        "start": 919,
+        "startLoc": {
+          "column": 8,
+          "line": 919,
+          "position": 32588
+        }
+      },
+      "format": "rust",
+      "fragment": "        let app = Router::new().route(\n            \"/api/chat\",\n            post(move || async move {\n                tokio::time::sleep(delay).await;",
+      "lines": 4,
+      "secondFile": {
+        "end": 1043,
+        "endLoc": {
+          "column": 45,
+          "line": 1043,
+          "position": 36995
+        },
+        "name": "src/heartbeat.rs",
+        "start": 1040,
+        "startLoc": {
+          "column": 8,
+          "line": 1040,
+          "position": 36866
+        }
+      },
+      "tokens": 31
+    },
+    {
+      "firstFile": {
+        "end": 958,
+        "endLoc": {
+          "column": 58,
+          "line": 958,
+          "position": 33919
+        },
+        "name": "src/heartbeat.rs",
+        "start": 953,
+        "startLoc": {
+          "column": 73,
+          "line": 953,
+          "position": 33714
+        }
+      },
+      "format": "rust",
+      "fragment": "                body: Body::from(\"{\\\"model\\\":\\\"llama3\\\",\\\"stream\\\":true}\"),\n            },\n            protocol: StreamProtocol::OllamaChat,\n            model: \"llama3\".to_string(),\n            config: HeartbeatConfig {\n                heartbeat_interval: Duration::from_millis(100),",
+      "lines": 6,
+      "secondFile": {
+        "end": 1019,
+        "endLoc": {
+          "column": 58,
+          "line": 1019,
+          "position": 36088
+        },
+        "name": "src/heartbeat.rs",
+        "start": 1014,
+        "startLoc": {
+          "column": 37,
+          "line": 1014,
+          "position": 35883
+        }
+      },
+      "tokens": 30
+    },
+    {
+      "firstFile": {
+        "end": 966,
+        "endLoc": {
+          "column": 50,
+          "line": 966,
+          "position": 34181
+        },
+        "name": "src/heartbeat.rs",
+        "start": 960,
+        "startLoc": {
+          "column": 48,
+          "line": 960,
+          "position": 34033
+        }
+      },
+      "format": "rust",
+      "fragment": "                max_wait: Duration::from_secs(10),\n            },\n            translate: None,\n        };\n\n        let resp = execute(req).await;\n        assert_eq!(resp.status(), StatusCode::OK);",
+      "lines": 7,
+      "secondFile": {
+        "end": 1027,
+        "endLoc": {
+          "column": 50,
+          "line": 1027,
+          "position": 36347
+        },
+        "name": "src/heartbeat.rs",
+        "start": 1021,
+        "startLoc": {
+          "column": 47,
+          "line": 1021,
+          "position": 36199
+        }
+      },
+      "tokens": 35
+    },
+    {
+      "firstFile": {
+        "end": 967,
+        "endLoc": {
+          "column": 17,
+          "line": 967,
+          "position": 34199
+        },
+        "name": "src/heartbeat.rs",
+        "start": 960,
+        "startLoc": {
+          "column": 48,
+          "line": 960,
+          "position": 34033
+        }
+      },
+      "format": "rust",
+      "fragment": "                max_wait: Duration::from_secs(10),\n            },\n            translate: None,\n        };\n\n        let resp = execute(req).await;\n        assert_eq!(resp.status(), StatusCode::OK);\n        assert_eq!(",
+      "lines": 8,
+      "secondFile": {
+        "end": 1079,
+        "endLoc": {
+          "column": 11,
+          "line": 1079,
+          "position": 38284
+        },
+        "name": "src/heartbeat.rs",
+        "start": 1072,
+        "startLoc": {
+          "column": 51,
+          "line": 1072,
+          "position": 38124
+        }
+      },
+      "tokens": 36
+    },
+    {
+      "firstFile": {
+        "end": 1021,
+        "endLoc": {
+          "column": 36,
+          "line": 1021,
+          "position": 36188
+        },
+        "name": "src/heartbeat.rs",
+        "start": 993,
+        "startLoc": {
+          "column": 74,
+          "line": 993,
+          "position": 35136
+        }
+      },
+      "format": "rust",
+      "fragment": "                (StatusCode::INTERNAL_SERVER_ERROR, \"model failed to load\")\n            }),\n        );\n        let listener = TcpListener::bind(\"127.0.0.1:0\").await.unwrap();\n        let addr = listener.local_addr().unwrap();\n        tokio::spawn(async move {\n            axum::serve(listener, app).await.unwrap();\n        });\n        let url = format!(\"http://{addr}\");\n\n        let client = reqwest::Client::new();\n        let headers = HeaderMap::new();\n        let req = HeartbeatRequest {\n            proxy: crate::proxy::ProxyRequest {\n                client: &client,\n                backend_url: &url,\n                path: \"/api/chat\",\n                override_path: None,\n                query: None,\n                method: Method::POST,\n                headers: &headers,\n                body: Body::from(\"{}\"),\n            },\n            protocol: StreamProtocol::OllamaChat,\n            model: \"llama3\".to_string(),\n            config: HeartbeatConfig {\n                heartbeat_interval: Duration::from_millis(50),\n                preflight_timeout: Duration::from_secs(5),\n                max_wait: Duration::from_secs(5),",
+      "lines": 29,
+      "secondFile": {
+        "end": 1072,
+        "endLoc": {
+          "column": 36,
+          "line": 1072,
+          "position": 38109
+        },
+        "name": "src/heartbeat.rs",
+        "start": 1044,
+        "startLoc": {
+          "column": 40,
+          "line": 1044,
+          "position": 37057
+        }
+      },
+      "tokens": 200
+    },
+    {
+      "firstFile": {
+        "end": 213,
+        "endLoc": {
+          "column": 10,
+          "line": 213,
+          "position": 7818
+        },
+        "name": "src/metrics.rs",
+        "start": 208,
+        "startLoc": {
+          "column": 14,
+          "line": 208,
+          "position": 7712
+        }
+      },
+      "format": "rust",
+      "fragment": "    pub method: String,\n    pub stream: bool,\n}\n\n#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]\npub struct DurationLabels {",
+      "lines": 6,
+      "secondFile": {
+        "end": 220,
+        "endLoc": {
+          "column": 10,
+          "line": 220,
+          "position": 7980
+        },
+        "name": "src/metrics.rs",
+        "start": 215,
+        "startLoc": {
+          "column": 15,
+          "line": 215,
+          "position": 7874
+        }
+      },
+      "tokens": 28
+    },
+    {
+      "firstFile": {
+        "end": 213,
+        "endLoc": {
+          "column": 10,
+          "line": 213,
+          "position": 7818
+        },
+        "name": "src/metrics.rs",
+        "start": 209,
+        "startLoc": {
+          "column": 20,
+          "line": 209,
+          "position": 7742
+        }
+      },
+      "format": "rust",
+      "fragment": "    pub stream: bool,\n}\n\n#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]\npub struct DurationLabels {",
+      "lines": 5,
+      "secondFile": {
+        "end": 225,
+        "endLoc": {
+          "column": 10,
+          "line": 225,
+          "position": 8092
+        },
+        "name": "src/metrics.rs",
+        "start": 221,
+        "startLoc": {
+          "column": 21,
+          "line": 221,
+          "position": 8016
+        }
+      },
+      "tokens": 21
+    },
+    {
+      "firstFile": {
+        "end": 225,
+        "endLoc": {
+          "column": 10,
+          "line": 225,
+          "position": 8092
+        },
+        "name": "src/metrics.rs",
+        "start": 221,
+        "startLoc": {
+          "column": 13,
+          "line": 221,
+          "position": 8008
+        }
+      },
+      "format": "rust",
+      "fragment": "    pub route: String,\n}\n\n#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]\npub struct EscalationLabels {",
+      "lines": 5,
+      "secondFile": {
+        "end": 231,
+        "endLoc": {
+          "column": 10,
+          "line": 231,
+          "position": 8228
+        },
+        "name": "src/metrics.rs",
+        "start": 227,
+        "startLoc": {
+          "column": 10,
+          "line": 227,
+          "position": 8144
+        }
+      },
+      "tokens": 23
+    },
+    {
+      "firstFile": {
+        "end": 225,
+        "endLoc": {
+          "column": 10,
+          "line": 225,
+          "position": 8092
+        },
+        "name": "src/metrics.rs",
+        "start": 221,
+        "startLoc": {
+          "column": 13,
+          "line": 221,
+          "position": 8008
+        }
+      },
+      "format": "rust",
+      "fragment": "    pub route: String,\n}\n\n#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]\npub struct EscalationLabels {",
+      "lines": 5,
+      "secondFile": {
+        "end": 236,
+        "endLoc": {
+          "column": 10,
+          "line": 236,
+          "position": 8350
+        },
+        "name": "src/metrics.rs",
+        "start": 232,
+        "startLoc": {
+          "column": 14,
+          "line": 232,
+          "position": 8266
+        }
+      },
+      "tokens": 23
+    },
+    {
+      "firstFile": {
+        "end": 225,
+        "endLoc": {
+          "column": 10,
+          "line": 225,
+          "position": 8092
+        },
+        "name": "src/metrics.rs",
+        "start": 221,
+        "startLoc": {
+          "column": 13,
+          "line": 221,
+          "position": 8008
+        }
+      },
+      "format": "rust",
+      "fragment": "    pub route: String,\n}\n\n#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]\npub struct EscalationLabels {",
+      "lines": 5,
+      "secondFile": {
+        "end": 241,
+        "endLoc": {
+          "column": 10,
+          "line": 241,
+          "position": 8466
+        },
+        "name": "src/metrics.rs",
+        "start": 237,
+        "startLoc": {
+          "column": 15,
+          "line": 237,
+          "position": 8382
+        }
+      },
+      "tokens": 23
+    },
+    {
+      "firstFile": {
+        "end": 323,
+        "endLoc": {
+          "column": 17,
+          "line": 323,
+          "position": 12222
+        },
+        "name": "src/models.rs",
+        "start": 318,
+        "startLoc": {
+          "column": 23,
+          "line": 318,
+          "position": 12175
+        }
+      },
+      "format": "rust",
+      "fragment": "    (ctx_size, parallel)\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;",
+      "lines": 6,
+      "secondFile": {
+        "end": 187,
+        "endLoc": {
+          "column": 17,
+          "line": 187,
+          "position": 6678
+        },
+        "name": "src/proxy.rs",
+        "start": 182,
+        "startLoc": {
+          "column": 49,
+          "line": 182,
+          "position": 6631
+        }
+      },
+      "tokens": 18
+    },
+    {
+      "firstFile": {
+        "end": 323,
+        "endLoc": {
+          "column": 17,
+          "line": 323,
+          "position": 12222
+        },
+        "name": "src/models.rs",
+        "start": 318,
+        "startLoc": {
+          "column": 23,
+          "line": 318,
+          "position": 12175
+        }
+      },
+      "format": "rust",
+      "fragment": "    (ctx_size, parallel)\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;",
+      "lines": 6,
+      "secondFile": {
+        "end": 103,
+        "endLoc": {
+          "column": 17,
+          "line": 103,
+          "position": 4027
+        },
+        "name": "src/routes.rs",
+        "start": 98,
+        "startLoc": {
+          "column": 23,
+          "line": 98,
+          "position": 3980
+        }
+      },
+      "tokens": 18
+    },
+    {
+      "firstFile": {
+        "end": 325,
+        "endLoc": {
+          "column": 6,
+          "line": 325,
+          "position": 12230
+        },
+        "name": "src/models.rs",
+        "start": 318,
+        "startLoc": {
+          "column": 23,
+          "line": 318,
+          "position": 12175
+        }
+      },
+      "format": "rust",
+      "fragment": "    (ctx_size, parallel)\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn make_model_info(name: &str, extra: Value) -> ModelInfo {",
+      "lines": 8,
+      "secondFile": {
+        "end": 379,
+        "endLoc": {
+          "column": 7,
+          "line": 379,
+          "position": 14954
+        },
+        "name": "src/translate.rs",
+        "start": 373,
+        "startLoc": {
+          "column": 69,
+          "line": 373,
+          "position": 14899
+        }
+      },
+      "tokens": 19
+    },
+    {
+      "firstFile": {
+        "end": 251,
+        "endLoc": {
+          "column": 8,
+          "line": 251,
+          "position": 8204
+        },
+        "name": "src/registry.rs",
+        "start": 247,
+        "startLoc": {
+          "column": 72,
+          "line": 247,
+          "position": 8122
+        }
+      },
+      "format": "rust",
+      "fragment": "    let grace_duration = Duration::from_secs(config.grace_period_secs());\n\n    run_discovery(&client, &registry, &config, grace_duration).await;\n\n    loop {",
+      "lines": 5,
+      "secondFile": {
+        "end": 254,
+        "endLoc": {
+          "column": 5,
+          "line": 254,
+          "position": 8330
+        },
+        "name": "src/registry.rs",
+        "start": 252,
+        "startLoc": {
+          "column": 42,
+          "line": 252,
+          "position": 8249
+        }
+      },
+      "tokens": 17
+    },
+    {
+      "firstFile": {
+        "end": 578,
+        "endLoc": {
+          "column": 6,
+          "line": 578,
+          "position": 19873
+        },
+        "name": "src/registry.rs",
+        "start": 574,
+        "startLoc": {
+          "column": 49,
+          "line": 574,
+          "position": 19830
+        }
+      },
+      "format": "rust",
+      "fragment": "        assert_eq!(backend_names_for(&reg, \"m:v1\"), vec![\"rocm\"]);\n    }\n\n    #[test]\n    fn healthy_backends_for_excludes_grace_period_backend() {",
+      "lines": 5,
+      "secondFile": {
+        "end": 590,
+        "endLoc": {
+          "column": 6,
+          "line": 590,
+          "position": 20409
+        },
+        "name": "src/registry.rs",
+        "start": 586,
+        "startLoc": {
+          "column": 54,
+          "line": 586,
+          "position": 20366
+        }
+      },
+      "tokens": 15
+    },
+    {
+      "firstFile": {
+        "end": 221,
+        "endLoc": {
+          "column": 6,
+          "line": 221,
+          "position": 8194
+        },
+        "name": "src/routes.rs",
+        "start": 213,
+        "startLoc": {
+          "column": 71,
+          "line": 213,
+          "position": 8092
+        }
+      },
+      "format": "rust",
+      "fragment": "                    \"{} is mounted under /v1/ but defaults stream=true\",\n                    entry.path,\n                );\n            }\n        }\n    }\n\n    #[test]\n    fn every_api_path_defaults_true() {",
+      "lines": 9,
+      "secondFile": {
+        "end": 235,
+        "endLoc": {
+          "column": 6,
+          "line": 235,
+          "position": 8601
+        },
+        "name": "src/routes.rs",
+        "start": 227,
+        "startLoc": {
+          "column": 73,
+          "line": 227,
+          "position": 8499
+        }
+      },
+      "tokens": 15
+    },
+    {
+      "firstFile": {
+        "end": 355,
+        "endLoc": {
+          "column": 6,
+          "line": 355,
+          "position": 11926
+        },
+        "name": "src/spill.rs",
+        "start": 349,
+        "startLoc": {
+          "column": 32,
+          "line": 349,
+          "position": 11862
+        }
+      },
+      "format": "rust",
+      "fragment": "            Some(\"glm-4.7-flash\"),\n            Some(false),\n        );\n    }\n\n    #[test]\n    fn stream_before_model() {",
+      "lines": 7,
+      "secondFile": {
+        "end": 364,
+        "endLoc": {
+          "column": 6,
+          "line": 364,
+          "position": 12123
+        },
+        "name": "src/spill.rs",
+        "start": 358,
+        "startLoc": {
+          "column": 28,
+          "line": 358,
+          "position": 12059
+        }
+      },
+      "tokens": 15
+    },
+    {
+      "firstFile": {
+        "end": 491,
+        "endLoc": {
+          "column": 12,
+          "line": 491,
+          "position": 16278
+        },
+        "name": "src/spill.rs",
+        "start": 487,
+        "startLoc": {
+          "column": 58,
+          "line": 487,
+          "position": 16226
+        }
+      },
+      "format": "rust",
+      "fragment": "        assert!(spill_and_detect(body, true).await.unwrap().is_none());\n    }\n\n    #[tokio::test]\n    async fn spill_chunked_body() {",
+      "lines": 5,
+      "secondFile": {
+        "end": 132,
+        "endLoc": {
+          "column": 8,
+          "line": 132,
+          "position": 4444
+        },
+        "name": "tests/integration_test.rs",
+        "start": 128,
+        "startLoc": {
+          "column": 34,
+          "line": 128,
+          "position": 4404
+        }
+      },
+      "tokens": 17
+    },
+    {
+      "firstFile": {
+        "end": 125,
+        "endLoc": {
+          "column": 38,
+          "line": 125,
+          "position": 5070
+        },
+        "name": "src/translate.rs",
+        "start": 122,
+        "startLoc": {
+          "column": 59,
+          "line": 122,
+          "position": 4917
+        }
+      },
+      "format": "rust",
+      "fragment": "    let mut out = ollama_message_frame(model_name, &content);\n    let frame = out.as_object_mut().expect(\"frame is an object\");\n    frame.insert(\"done\".into(), json!(true));\n    frame.insert(\"done_reason\".into(), finish_reason);",
+      "lines": 4,
+      "secondFile": {
+        "end": 275,
+        "endLoc": {
+          "column": 42,
+          "line": 275,
+          "position": 11010
+        },
+        "name": "src/translate.rs",
+        "start": 272,
+        "startLoc": {
+          "column": 62,
+          "line": 272,
+          "position": 10845
+        }
+      },
+      "tokens": 43
+    },
+    {
+      "firstFile": {
+        "end": 128,
+        "endLoc": {
+          "column": 51,
+          "line": 128,
+          "position": 5249
+        },
+        "name": "src/translate.rs",
+        "start": 125,
+        "startLoc": {
+          "column": 52,
+          "line": 125,
+          "position": 5084
+        }
+      },
+      "format": "rust",
+      "fragment": "    frame.insert(\"done_reason\".into(), finish_reason);\n    frame.insert(\"total_duration\".into(), json!(0u64));\n    frame.insert(\"load_duration\".into(), json!(0u64));\n    frame.insert(\"prompt_eval_count\".into(), json!(prompt_tokens));",
+      "lines": 4,
+      "secondFile": {
+        "end": 278,
+        "endLoc": {
+          "column": 55,
+          "line": 278,
+          "position": 11214
+        },
+        "name": "src/translate.rs",
+        "start": 275,
+        "startLoc": {
+          "column": 69,
+          "line": 275,
+          "position": 11037
+        }
+      },
+      "tokens": 51
+    },
+    {
+      "firstFile": {
+        "end": 133,
+        "endLoc": {
+          "column": 14,
+          "line": 133,
+          "position": 5463
+        },
+        "name": "src/translate.rs",
+        "start": 130,
+        "startLoc": {
+          "column": 44,
+          "line": 130,
+          "position": 5372
+        }
+      },
+      "format": "rust",
+      "fragment": "    frame.insert(\"eval_count\".into(), json!(completion_tokens));\n    frame.insert(\"eval_duration\".into(), json!(0u64));\n\n    serde_json::to_vec(&out)",
+      "lines": 4,
+      "secondFile": {
+        "end": 282,
+        "endLoc": {
+          "column": 11,
+          "line": 282,
+          "position": 11446
+        },
+        "name": "src/translate.rs",
+        "start": 280,
+        "startLoc": {
+          "column": 53,
+          "line": 280,
+          "position": 11355
+        }
+      },
+      "tokens": 22
+    },
+    {
+      "firstFile": {
+        "end": 390,
+        "endLoc": {
+          "column": 6,
+          "line": 390,
+          "position": 15254
+        },
+        "name": "src/translate.rs",
+        "start": 386,
+        "startLoc": {
+          "column": 53,
+          "line": 386,
+          "position": 15183
+        }
+      },
+      "format": "rust",
+      "fragment": "        let out = ollama_chat_to_openai_request(input).unwrap();\n        serde_json::from_slice(&out).unwrap()\n    }\n\n    fn parse_response(input: &[u8], model: &str) -> Value {",
+      "lines": 5,
+      "secondFile": {
+        "end": 395,
+        "endLoc": {
+          "column": 6,
+          "line": 395,
+          "position": 15440
+        },
+        "name": "src/translate.rs",
+        "start": 391,
+        "startLoc": {
+          "column": 61,
+          "line": 391,
+          "position": 15369
+        }
+      },
+      "tokens": 20
+    },
+    {
+      "firstFile": {
+        "end": 434,
+        "endLoc": {
+          "column": 21,
+          "line": 434,
+          "position": 16912
+        },
+        "name": "src/translate.rs",
+        "start": 431,
+        "startLoc": {
+          "column": 69,
+          "line": 431,
+          "position": 16837
+        }
+      },
+      "format": "rust",
+      "fragment": "        assert!(v.get(\"num_ctx\").is_none(), \"num_ctx must be dropped\");\n\n        assert_eq!(v[\"model\"], \"qwen3.6-medium\");\n        assert_eq!(v[\"stream\"], true);",
+      "lines": 4,
+      "secondFile": {
+        "end": 509,
+        "endLoc": {
+          "column": 21,
+          "line": 509,
+          "position": 19582
+        },
+        "name": "src/translate.rs",
+        "start": 506,
+        "startLoc": {
+          "column": 54,
+          "line": 506,
+          "position": 19507
+        }
+      },
+      "tokens": 18
+    },
+    {
+      "firstFile": {
+        "end": 588,
+        "endLoc": {
+          "column": 50,
+          "line": 588,
+          "position": 22469
+        },
+        "name": "src/translate.rs",
+        "start": 585,
+        "startLoc": {
+          "column": 58,
+          "line": 585,
+          "position": 22364
+        }
+      },
+      "format": "rust",
+      "fragment": "            Ok(Bytes::from(sse_chunk(\"world\", Some(\"stop\")))),\n            Ok(Bytes::from(SSE_DONE)),\n        ];\n        let lines = run_translation(chunks).await;",
+      "lines": 4,
+      "secondFile": {
+        "end": 614,
+        "endLoc": {
+          "column": 50,
+          "line": 614,
+          "position": 23565
+        },
+        "name": "src/translate.rs",
+        "start": 611,
+        "startLoc": {
+          "column": 52,
+          "line": 611,
+          "position": 23460
+        }
+      },
+      "tokens": 27
+    },
+    {
+      "firstFile": {
+        "end": 591,
+        "endLoc": {
+          "column": 31,
+          "line": 591,
+          "position": 22561
+        },
+        "name": "src/translate.rs",
+        "start": 585,
+        "startLoc": {
+          "column": 44,
+          "line": 585,
+          "position": 22350
+        }
+      },
+      "format": "rust",
+      "fragment": "            Ok(Bytes::from(sse_chunk(\"world\", Some(\"stop\")))),\n            Ok(Bytes::from(SSE_DONE)),\n        ];\n        let lines = run_translation(chunks).await;\n\n        // 3 deltas with content + 1 final done:true frame\n        assert_eq!(lines.len(), 4, \"got {} lines: {lines:?}\", lines.len());",
+      "lines": 7,
+      "secondFile": {
+        "end": 660,
+        "endLoc": {
+          "column": 33,
+          "line": 660,
+          "position": 25607
+        },
+        "name": "src/translate.rs",
+        "start": 656,
+        "startLoc": {
+          "column": 40,
+          "line": 656,
+          "position": 25454
+        }
+      },
+      "tokens": 42
+    },
+    {
+      "firstFile": {
+        "end": 588,
+        "endLoc": {
+          "column": 50,
+          "line": 588,
+          "position": 22469
+        },
+        "name": "src/translate.rs",
+        "start": 585,
+        "startLoc": {
+          "column": 58,
+          "line": 585,
+          "position": 22364
+        }
+      },
+      "format": "rust",
+      "fragment": "            Ok(Bytes::from(sse_chunk(\"world\", Some(\"stop\")))),\n            Ok(Bytes::from(SSE_DONE)),\n        ];\n        let lines = run_translation(chunks).await;",
+      "lines": 4,
+      "secondFile": {
+        "end": 675,
+        "endLoc": {
+          "column": 50,
+          "line": 675,
+          "position": 26402
+        },
+        "name": "src/translate.rs",
+        "start": 672,
+        "startLoc": {
+          "column": 54,
+          "line": 672,
+          "position": 26297
+        }
+      },
+      "tokens": 27
+    },
+    {
+      "firstFile": {
+        "end": 616,
+        "endLoc": {
+          "column": 35,
+          "line": 616,
+          "position": 23602
+        },
+        "name": "src/translate.rs",
+        "start": 613,
+        "startLoc": {
+          "column": 8,
+          "line": 613,
+          "position": 23512
+        }
+      },
+      "format": "rust",
+      "fragment": "        ];\n        let lines = run_translation(chunks).await;\n\n        assert_eq!(lines.len(), 2);",
+      "lines": 4,
+      "secondFile": {
+        "end": 643,
+        "endLoc": {
+          "column": 35,
+          "line": 643,
+          "position": 24812
+        },
+        "name": "src/translate.rs",
+        "start": 641,
+        "startLoc": {
+          "column": 11,
+          "line": 641,
+          "position": 24723
+        }
+      },
+      "tokens": 24
+    },
+    {
+      "firstFile": {
+        "end": 57,
+        "endLoc": {
+          "column": 9,
+          "line": 57,
+          "position": 2061
+        },
+        "name": "tests/config_test.rs",
+        "start": 54,
+        "startLoc": {
+          "column": 4,
+          "line": 54,
+          "position": 1951
+        }
+      },
+      "format": "rust",
+      "fragment": "    with_clean_env(|| {\n        for &(key, val) in vars {\n            unsafe { env::set_var(key, val) };\n        }",
+      "lines": 4,
+      "secondFile": {
+        "end": 69,
+        "endLoc": {
+          "column": 9,
+          "line": 69,
+          "position": 2468
+        },
+        "name": "tests/config_test.rs",
+        "start": 66,
+        "startLoc": {
+          "column": 4,
+          "line": 66,
+          "position": 2358
+        }
+      },
+      "tokens": 29
+    },
+    {
+      "firstFile": {
+        "end": 85,
+        "endLoc": {
+          "column": 2,
+          "line": 85,
+          "position": 2837
+        },
+        "name": "tests/config_test.rs",
+        "start": 80,
+        "startLoc": {
+          "column": 35,
+          "line": 80,
+          "position": 2771
+        }
+      },
+      "format": "rust",
+      "fragment": "    let config = parse_with_vars(&[]);\n    assert!(config.escalation_rules.is_empty());\n}\n\n#[test]\nfn escalation_parsed_from_env() {",
+      "lines": 6,
+      "secondFile": {
+        "end": 106,
+        "endLoc": {
+          "column": 2,
+          "line": 106,
+          "position": 3682
+        },
+        "name": "tests/config_test.rs",
+        "start": 101,
+        "startLoc": {
+          "column": 65,
+          "line": 101,
+          "position": 3616
+        }
+      },
+      "tokens": 21
+    },
+    {
+      "firstFile": {
+        "end": 107,
+        "endLoc": {
+          "column": 8,
+          "line": 107,
+          "position": 3593
+        },
+        "name": "tests/integration_test.rs",
+        "start": 103,
+        "startLoc": {
+          "column": 38,
+          "line": 103,
+          "position": 3557
+        }
+      },
+      "format": "rust",
+      "fragment": "    assert!(!store.validate(\"anything\").await);\n}\n\n#[tokio::test]\nasync fn model_routing_to_correct_backend() {",
+      "lines": 5,
+      "secondFile": {
+        "end": 165,
+        "endLoc": {
+          "column": 8,
+          "line": 165,
+          "position": 5640
+        },
+        "name": "tests/integration_test.rs",
+        "start": 161,
+        "startLoc": {
+          "column": 30,
+          "line": 161,
+          "position": 5604
+        }
+      },
+      "tokens": 15
+    },
+    {
+      "firstFile": {
+        "end": 107,
+        "endLoc": {
+          "column": 8,
+          "line": 107,
+          "position": 3593
+        },
+        "name": "tests/integration_test.rs",
+        "start": 103,
+        "startLoc": {
+          "column": 38,
+          "line": 103,
+          "position": 3557
+        }
+      },
+      "format": "rust",
+      "fragment": "    assert!(!store.validate(\"anything\").await);\n}\n\n#[tokio::test]\nasync fn model_routing_to_correct_backend() {",
+      "lines": 5,
+      "secondFile": {
+        "end": 188,
+        "endLoc": {
+          "column": 8,
+          "line": 188,
+          "position": 6319
+        },
+        "name": "tests/integration_test.rs",
+        "start": 184,
+        "startLoc": {
+          "column": 38,
+          "line": 184,
+          "position": 6283
+        }
+      },
+      "tokens": 15
+    },
+    {
+      "firstFile": {
+        "end": 117,
+        "endLoc": {
+          "column": 11,
+          "line": 117,
+          "position": 3986
+        },
+        "name": "tests/integration_test.rs",
+        "start": 114,
+        "startLoc": {
+          "column": 4,
+          "line": 114,
+          "position": 3925
+        }
+      },
+      "format": "rust",
+      "fragment": "    ]);\n\n    let reg = registry::new_shared(&config);\n    let r = run_discovery_to_completion(&reg, &config).await;",
+      "lines": 4,
+      "secondFile": {
+        "end": 135,
+        "endLoc": {
+          "column": 11,
+          "line": 135,
+          "position": 4637
+        },
+        "name": "tests/integration_test.rs",
+        "start": 133,
+        "startLoc": {
+          "column": 91,
+          "line": 133,
+          "position": 4577
+        }
+      },
+      "tokens": 18
+    },
+    {
+      "firstFile": {
+        "end": 119,
+        "endLoc": {
+          "column": 7,
+          "line": 119,
+          "position": 4045
+        },
+        "name": "tests/integration_test.rs",
+        "start": 116,
+        "startLoc": {
+          "column": 8,
+          "line": 116,
+          "position": 3938
+        }
+      },
+      "format": "rust",
+      "fragment": "    let reg = registry::new_shared(&config);\n    let r = run_discovery_to_completion(&reg, &config).await;\n\n    let cuda_id = r.lookup(\"fixt/home-3b-v3:latest\").unwrap();",
+      "lines": 4,
+      "secondFile": {
+        "end": 144,
+        "endLoc": {
+          "column": 10,
+          "line": 144,
+          "position": 4977
+        },
+        "name": "tests/integration_test.rs",
+        "start": 142,
+        "startLoc": {
+          "column": 8,
+          "line": 142,
+          "position": 4868
+        }
+      },
+      "tokens": 25
+    },
+    {
+      "firstFile": {
+        "end": 136,
+        "endLoc": {
+          "column": 12,
+          "line": 136,
+          "position": 4668
+        },
+        "name": "tests/integration_test.rs",
+        "start": 133,
+        "startLoc": {
+          "column": 68,
+          "line": 133,
+          "position": 4554
+        }
+      },
+      "format": "rust",
+      "fragment": "    let config = Config::from_backends(vec![Backend::for_test(\"test\", \"http://127.0.0.1:1\")]);\n    let reg = registry::new_shared(&config);\n    let r = reg.read().await;\n    assert!(!r.is_discovery_done());",
+      "lines": 4,
+      "secondFile": {
+        "end": 143,
+        "endLoc": {
+          "column": 61,
+          "line": 143,
+          "position": 4966
+        },
+        "name": "tests/integration_test.rs",
+        "start": 141,
+        "startLoc": {
+          "column": 68,
+          "line": 141,
+          "position": 4833
+        }
+      },
+      "tokens": 32
+    },
+    {
+      "firstFile": {
+        "end": 152,
+        "endLoc": {
+          "column": 25,
+          "line": 152,
+          "position": 5232
+        },
+        "name": "tests/integration_test.rs",
+        "start": 149,
+        "startLoc": {
+          "column": 40,
+          "line": 149,
+          "position": 5116
+        }
+      },
+      "format": "rust",
+      "fragment": "async fn token_store_validates_correctly() {\n    let dir = tempfile::tempdir().unwrap();\n    let path = dir.path().join(\"tokens\");\n    std::fs::write(&path, \"token-abc\\ntoken-def\\n# comment\\n\\n\").unwrap();",
+      "lines": 4,
+      "secondFile": {
+        "end": 174,
+        "endLoc": {
+          "column": 25,
+          "line": 174,
+          "position": 5930
+        },
+        "name": "tests/integration_test.rs",
+        "start": 171,
+        "startLoc": {
+          "column": 44,
+          "line": 171,
+          "position": 5814
+        }
+      },
+      "tokens": 42
+    },
+    {
+      "firstFile": {
+        "end": 152,
+        "endLoc": {
+          "column": 25,
+          "line": 152,
+          "position": 5232
+        },
+        "name": "tests/integration_test.rs",
+        "start": 149,
+        "startLoc": {
+          "column": 40,
+          "line": 149,
+          "position": 5116
+        }
+      },
+      "format": "rust",
+      "fragment": "async fn token_store_validates_correctly() {\n    let dir = tempfile::tempdir().unwrap();\n    let path = dir.path().join(\"tokens\");\n    std::fs::write(&path, \"token-abc\\ntoken-def\\n# comment\\n\\n\").unwrap();",
+      "lines": 4,
+      "secondFile": {
+        "end": 191,
+        "endLoc": {
+          "column": 25,
+          "line": 191,
+          "position": 6471
+        },
+        "name": "tests/integration_test.rs",
+        "start": 188,
+        "startLoc": {
+          "column": 44,
+          "line": 188,
+          "position": 6355
+        }
+      },
+      "tokens": 42
+    },
+    {
+      "firstFile": {
+        "end": 156,
+        "endLoc": {
+          "column": 18,
+          "line": 156,
+          "position": 5365
+        },
+        "name": "tests/integration_test.rs",
+        "start": 152,
+        "startLoc": {
+          "column": 63,
+          "line": 152,
+          "position": 5270
+        }
+      },
+      "format": "rust",
+      "fragment": "    std::fs::write(&path, \"token-abc\\ntoken-def\\n# comment\\n\\n\").unwrap();\n\n    let store = TokenStore::new(Some(path.to_str().unwrap()));\n\n    assert!(store.is_enabled());",
+      "lines": 5,
+      "secondFile": {
+        "end": 177,
+        "endLoc": {
+          "column": 18,
+          "line": 177,
+          "position": 6038
+        },
+        "name": "tests/integration_test.rs",
+        "start": 174,
+        "startLoc": {
+          "column": 39,
+          "line": 174,
+          "position": 5944
+        }
+      },
+      "tokens": 33
+    }
+  ],
+  "statistics": {
+    "detectionDate": "2026-06-29T07:35:08.992Z",
+    "formats": {
+      "bash": {
+        "clones": 0,
+        "duplicatedLines": 0,
+        "duplicatedTokens": 0,
+        "lines": 35,
+        "newClones": 0,
+        "newDuplicatedLines": 0,
+        "percentage": 0.0,
+        "percentageTokens": 0.0,
+        "sources": 3,
+        "tokens": 136
+      },
+      "rust": {
+        "clones": 83,
+        "duplicatedLines": 444,
+        "duplicatedTokens": 2647,
+        "lines": 6824,
+        "newClones": 0,
+        "newDuplicatedLines": 0,
+        "percentage": 6.506447831184056,
+        "percentageTokens": 6.866585384834885,
+        "sources": 17,
+        "tokens": 38549
+      },
+      "toml": {
+        "clones": 0,
+        "duplicatedLines": 0,
+        "duplicatedTokens": 0,
+        "lines": 31,
+        "newClones": 0,
+        "newDuplicatedLines": 0,
+        "percentage": 0.0,
+        "percentageTokens": 0.0,
+        "sources": 1,
+        "tokens": 221
+      },
+      "yaml": {
+        "clones": 0,
+        "duplicatedLines": 0,
+        "duplicatedTokens": 0,
+        "lines": 159,
+        "newClones": 0,
+        "newDuplicatedLines": 0,
+        "percentage": 0.0,
+        "percentageTokens": 0.0,
+        "sources": 3,
+        "tokens": 848
+      }
+    },
+    "total": {
+      "clones": 83,
+      "duplicatedLines": 444,
+      "duplicatedTokens": 2647,
+      "lines": 7049,
+      "newClones": 0,
+      "newDuplicatedLines": 0,
+      "percentage": 6.298765782380479,
+      "percentageTokens": 6.65844946420486,
+      "sources": 24,
+      "tokens": 39754
+    }
+  }
+}

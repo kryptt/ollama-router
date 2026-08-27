@@ -88,7 +88,7 @@ Two surfaces, split by lifecycle:
 | Live — `router.toml`, picked up within one discovery cycle (≤60 s) | Restart-scoped — environment |
 |---|---|
 | backend roster, URLs, **declaration order (= routing priority)** | connect / request timeouts, `OLLAMA_ROUTER_EXTRA_CA_FILE` (frozen inside the two reqwest clients) |
-| per-backend `allow` (the spend boundary) | ports (bound listeners) |
+| the backend roster itself | ports (bound listeners) |
 | `external`, `strip_auth` | `OLLAMA_ROUTER_TOKENS_FILE` (its own 60 s reloader) |
 | alias chains and their `local` pins | discovery interval, grace multiplier, heartbeat knobs |
 | the fallback map | `OLLAMA_ROUTER_ESCALATE`, the inert retry / breaker / cache knobs, `OTEL_*`, `RUST_LOG` |
@@ -101,8 +101,8 @@ migration, for a feature that is unset in production.
 
 ### The policy file
 
-`OLLAMA_ROUTER_CONFIG` names a TOML document holding the backend roster, the
-per-backend model allowlist, alias chains, and the fallback map. It is
+`OLLAMA_ROUTER_CONFIG` names a TOML document holding the backend roster,
+alias chains, and the fallback map. It is
 **required and has no default**: the roster and the spend boundary both live
 in it, so a router without one has nothing to route to.
 
@@ -113,17 +113,12 @@ in it, so a router without one has nothing to route to.
 [[backends]]
 name  = "llama-swap-cuda"
 url   = "http://llama-swap-cuda.ai:8080"
-allow = ["*"]                      # on-LAN, unmetered: publish everything
 
 [[backends]]
 name  = "nous"
 url   = "https://inference-api.nousresearch.com"
 external   = true                  # => can never appear in a `local` alias
 strip_auth = true                  # our inbound token is not a Nous credential
-allow = [                          # THE SPEND BOUNDARY — prices per M tok (in/out)
-  "nousresearch/hermes-4-70b",     # 0.05 / 0.20
-  "qwen/qwen3.8-max",              # 1.60 / 4.80
-]
 
 [fallbacks]                        # QUOTE EVERY KEY — see the dotted-key trap
 "qwen3.6-low" = "qwen/qwen3.8-27b"
@@ -140,24 +135,17 @@ order is a security boundary and a map would lose it):
 |---|---|---|
 | `name` | yes | Routing key. Unique; what alias chains and metric labels refer to. |
 | `url` | yes | `http(s)://host[:port]`; any trailing slash is stripped. |
-| `allow` | yes | Discovery allowlist of exact model ids, or `["*"]` to publish everything. Mixing `"*"` with ids, or an empty list, is rejected. |
 | `external` | no (`false`) | Hosted / off-LAN. A `local` alias whose chain touches an `external` backend rejects the whole file. |
 | `strip_auth` | no (`false`) | Drop the client's `authorization` header before forwarding. For backends whose credential is injected downstream by an egress proxy: the inbound token is a *router* token, useless to the backend and not something to hand a third party. |
 
-Notes on `allow`:
-
-- It exists for **hosted aggregator backends**. A local llama-swap serves a
-  handful of models and wants none of this; a hosted endpoint may advertise
-  hundreds, which buries the local models in every consumer's picker.
-- It is also the **spend boundary**. Anything that can reach the router can
-  request any model the router publishes. For a metered backend, `allow` is
-  what stops a client from putting a frontier model on your bill.
-- Filtering happens at discovery, so an excluded model is not merely hidden —
-  it never enters the model map and requests for it 404 like any unknown
-  model.
-- It is required rather than optional on purpose: making it optional means a
-  deleted line is a *successful* parse that silently removes a backend's
-  spend boundary.
+Every backend serves whatever it advertises: there is no per-backend model
+allowlist. Concrete backend models are never *published* (`/v1/models` and
+`/api/tags` list only alias names — see [Aliases](#aliases-priority-chains)),
+so the roster is reached through alias chains and the fallback map rather than
+by picking a raw model id out of a catalogue. Spend on metered backends is
+bounded by which aliases and fallbacks you point at them, and by backend
+declaration order (local, unmetered backends come first and win colliding
+model names).
 
 **Fallbacks** (`[fallbacks]`, `local-model = "hosted-stand-in"`): when no
 reachable backend serves a requested model, the request is transparently
@@ -179,7 +167,7 @@ same pass against the same roster. Rejected outright: an unreadable or
 unparseable file; an unknown field (`stip_auth = true` must be a rejection,
 not a shrug — the file is hand-edited and has no CI in front of it); absent
 or empty `backends`; a duplicate backend name; an empty name or non-`http(s)`
-url; an absent, empty, or wildcard-mixed `allow`; an alias naming an
+url; an alias naming an
 unconfigured backend; a `local` alias whose chain touches an `external`
 backend; an alias named `local`; an empty chain; a malformed candidate; and a
 fallback that maps to itself or has an empty side.
@@ -261,9 +249,9 @@ or 5xx response heads.
   never leave the local backends: even when every local candidate is down the
   chain exhausts (client gets the last upstream failure, or 502) rather than
   escaping.
-- A candidate's model does **not** have to appear in that backend's `allow`
-  list. Chains skip non-serving candidates by design, and a placeholder
-  candidate for a not-yet-provisioned provider is a deliberate pattern.
+- A candidate's model does **not** have to be serving yet. Chains skip
+  non-serving candidates by design, and a placeholder candidate for a
+  not-yet-provisioned provider is a deliberate pattern.
 - Aliases are a **distinct namespace**, resolved before — and shadowing —
   concrete model lookup. Escalation and the single-hop fallback map are
   skipped entirely for alias requests: the chain is the failover mechanism.

@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::metrics::{BackendLabels, ConfigReloadLabels, Metrics};
-use crate::policy::{Alias, BackendSpec, FileConfig, PolicyError, Validated};
+use crate::policy::{Alias, BackendSpec, FileConfig, PolicyError, Pricing, Validated};
 
 /// Ceiling on a single policy-file read. Matches the discovery client's
 /// timeout: both are "this filesystem/host is not answering" budgets, and a
@@ -93,6 +93,81 @@ pub struct ModelInfo {
     pub name: String,
     #[serde(flatten)]
     pub extra: serde_json::Value,
+}
+
+/// Capabilities reported by a backend for a single model, parsed from
+/// its `/v1/models` response. All fields optional — a backend may
+/// report none, some, or all.
+#[derive(Debug, Clone, Default)]
+pub struct ModelCapabilities {
+    pub context_length: Option<u64>,
+    pub max_completion_tokens: Option<u64>,
+    pub input_modalities: Option<Vec<String>>,
+    pub tools: Option<bool>,
+    pub reasoning: Option<bool>,
+    pub pricing: Option<Pricing>,
+}
+
+impl ModelInfo {
+    /// Extract capability metadata from the raw model object, if present.
+    /// Returns None when the backend doesn't report any capabilities.
+    pub fn capabilities(&self) -> Option<ModelCapabilities> {
+        let extra = &self.extra;
+        let mut caps = ModelCapabilities::default();
+        let mut found_any = false;
+
+        if let Some(cl) = extra.get("context_length").and_then(|v| v.as_u64()) {
+            caps.context_length = Some(cl);
+            found_any = true;
+        }
+
+        if let Some(mods) = extra
+            .get("architecture")
+            .and_then(|a| a.get("input_modalities"))
+            .and_then(|v| v.as_array())
+        {
+            caps.input_modalities = Some(
+                mods.iter()
+                    .filter_map(|m| m.as_str().map(String::from))
+                    .collect(),
+            );
+            found_any = true;
+        }
+
+        if let Some(pricing) = extra.get("pricing") {
+            let prompt = pricing.get("prompt").and_then(|v| v.as_str());
+            let completion = pricing.get("completion").and_then(|v| v.as_str());
+            if let (Some(p), Some(c)) = (prompt, completion) {
+                caps.pricing = Some(Pricing {
+                    prompt: p.to_string(),
+                    completion: c.to_string(),
+                });
+                found_any = true;
+            }
+        }
+
+        if let Some(mct) = extra
+            .get("top_provider")
+            .and_then(|tp| tp.get("max_completion_tokens"))
+            .and_then(|v| v.as_u64())
+        {
+            caps.max_completion_tokens = Some(mct);
+            found_any = true;
+        }
+
+        if let Some(params) = extra.get("supported_parameters").and_then(|v| v.as_array()) {
+            caps.tools = Some(params.iter().any(|p| p.as_str() == Some("tools")));
+            caps.reasoning = Some(params.iter().any(|p| p.as_str() == Some("reasoning")));
+            found_any = true;
+        }
+
+        if extra.get("reasoning").is_some() {
+            caps.reasoning = Some(true);
+            found_any = true;
+        }
+
+        if found_any { Some(caps) } else { None }
+    }
 }
 
 #[derive(Deserialize)]
@@ -340,6 +415,21 @@ impl Registry {
     /// All configured alias names, in arbitrary order.
     pub fn alias_names(&self) -> impl Iterator<Item = &str> {
         self.aliases.keys().map(String::as_str)
+    }
+
+    /// The capabilities a backend reports for one of its models, if any.
+    /// None when the backend doesn't carry the model, hasn't been probed
+    /// yet, or reports no capability metadata (llama-swap today).
+    pub fn model_capabilities(
+        &self,
+        backend_name: &str,
+        model_name: &str,
+    ) -> Option<ModelCapabilities> {
+        self.backends
+            .iter()
+            .find(|b| b.name == backend_name)
+            .and_then(|b| b.models.iter().find(|m| m.name == model_name))
+            .and_then(|m| m.capabilities())
     }
 
     /// Look up a backend by its configured name. Aliases are validated
@@ -841,6 +931,7 @@ mod tests {
                     backend: "cuda".to_string(),
                     model: "qwen3.6:latest".to_string(),
                 }],
+                fallback: crate::policy::AliasFallback::default(),
             },
         )]);
 

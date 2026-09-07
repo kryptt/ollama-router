@@ -33,14 +33,14 @@
 # hr-main (CUDA): gemma4 e2b/e4b, GLM-4.6V, jina-code + qwen3 embeddings,
 # whisper/qwen3-asr/chatterbox.
 [[backends]]
-name = "llama-swap-cuda"
-url = "http://llama-swap-cuda.ai:8080"
+name = "llama-swap-hr-main"
+url = "http://llama-swap-hr-main.ai:8080"
 
 # rh-anine (Vulkan): qwen3.6 effort tiers, gpt-oss, gemma4:26b,
 # nemotron3-super, glm-5.2-rivoli, qwen3 embeddings.
 [[backends]]
-name = "llama-swap"
-url = "http://llama-swap.ai:8080"
+name = "llama-swap-rh-anine"
+url = "http://llama-swap-rh-anine.ai:8080"
 
 # Nous Portal — hosted and metered, reached through postern, which injects
 # the API key so this pod holds no credential.
@@ -94,7 +94,7 @@ external = true                          # => can never appear in a `local` alia
 "coder" = "auto:coding"
 "vision" = "auto:vision"
 
-# llama-swap (rh-anine, vulkan) — the qwen3.6 effort tiers
+# llama-swap-rh-anine (rh-anine, vulkan) — the qwen3.6 effort tiers
 "qwen3.6-low" = "auto:fast"
 "qwen3.6-medium" = "auto"
 "qwen3.6" = "auto"
@@ -106,7 +106,7 @@ external = true                          # => can never appear in a `local` alia
 "gemma4:26b" = "auto"
 "nemotron3-super" = "auto:smart"
 "glm-5.2-rivoli" = "auto:smart"
-# llama-swap-cuda (hr-main)
+# llama-swap-hr-main (hr-main)
 "gemma4" = "auto:fast"
 "gemma4:e2b" = "auto:fast"
 "gemma4:e4b" = "auto:fast"
@@ -141,9 +141,9 @@ external = true                          # => can never appear in a `local` alia
 [aliases."auto:financial"]
 local = true
 chain = [
-  "llama-swap-cuda/gemma4:e2b",
-  "llama-swap-cuda/gemma4:e4b",
-  "llama-swap/qwen3.6-low",
+  "llama-swap-hr-main/gemma4:e2b",
+  "llama-swap-hr-main/gemma4:e4b",
+  "llama-swap-rh-anine/qwen3.6-low",
 ]
 
 # hindsight + hr-home-palace: personal memory, financial classification.
@@ -151,8 +151,8 @@ chain = [
 [aliases."auto:memory"]
 local = true
 chain = [
-  "llama-swap/qwen3.6-medium",
-  "llama-swap-cuda/gemma4:e4b",
+  "llama-swap-rh-anine/qwen3.6-medium",
+  "llama-swap-hr-main/gemma4:e4b",
 ]
 
 # ---- embeddings: ONE MODEL PER ALIAS, NEVER A MIXED CHAIN ----
@@ -168,17 +168,17 @@ chain = [
 [aliases."embed:qwen3"]
 local = true
 chain = [
-  "llama-swap-cuda/qwen3-embedding-4b",
-  "llama-swap/qwen3-embedding-4b",
+  "llama-swap-hr-main/qwen3-embedding-4b",
+  "llama-swap-rh-anine/qwen3-embedding-4b",
 ]
 
 # 1536-dim, grepai's indexer. Single-homed on hr-main: one hop is all there
 # is, and that is honest. Give it a second hop by adding the model to
-# fleet/ai/llama-swap.yaml — NOT by pointing it at a different embedder.
+# fleet/ai/llama-swap-rh-anine.yaml — NOT by pointing it at a different embedder.
 [aliases."embed:jina-code"]
 local = true
 chain = [
-  "llama-swap-cuda/jina-code-embeddings",
+  "llama-swap-hr-main/jina-code-embeddings",
 ]
 
 # ---- purpose chains ----
@@ -186,7 +186,7 @@ chain = [
 # The default. Anything that just wants a competent answer.
 [aliases."auto"]
 chain = [
-  "llama-swap/qwen3.6-medium",
+  "llama-swap-rh-anine/qwen3.6-medium",
   "freellmapi/auto",
   "nous/nousresearch/hermes-4-70b",
 ]
@@ -194,8 +194,8 @@ chain = [
 # Short turns, classification, tool-shaped work. Cheapest that can answer.
 [aliases."auto:fast"]
 chain = [
-  "llama-swap-cuda/gemma4:e4b",
-  "llama-swap/qwen3.6-low",
+  "llama-swap-hr-main/gemma4:e4b",
+  "llama-swap-rh-anine/qwen3.6-low",
   "freellmapi/auto",
   "nous/openai/gpt-oss-120b",
 ]
@@ -204,7 +204,7 @@ chain = [
 [aliases."auto:smart"]
 chain = [
   "freellmapi/auto",
-  "llama-swap/qwen3.6-high",
+  "llama-swap-rh-anine/qwen3.6-high",
   "nous/nousresearch/hermes-4-405b",
 ]
 
@@ -212,7 +212,7 @@ chain = [
 [aliases."auto:coding"]
 chain = [
   "freellmapi/auto:coding",
-  "llama-swap/qwen3.6-high",
+  "llama-swap-rh-anine/qwen3.6-high",
   "nous/qwen/qwen3.8-max",
 ]
 
@@ -220,7 +220,7 @@ chain = [
 # the frames are household camera captures.
 [aliases."auto:vision"]
 chain = [
-  "llama-swap-cuda/haervwe/GLM-4.6V-Flash-9B:latest",
+  "llama-swap-hr-main/haervwe/GLM-4.6V-Flash-9B:latest",
   "freellmapi/auto:vision",
   "nous/z-ai/glm-4.6v",
 ]

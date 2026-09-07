@@ -6,7 +6,9 @@ use futures_util::future::join_all;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tracing::warn;
 
+use crate::policy::{Alias, Pricing};
 use crate::registry::{ModelInfo, Registry, SharedRegistry};
 use crate::response::{json_ok, json_status};
 
@@ -54,20 +56,251 @@ fn alias_tag_entry(name: &str) -> Value {
 pub fn v1_models_response(reg: &Registry) -> Response {
     let models = sorted_alias_names(reg)
         .into_iter()
-        .map(v1_alias_object)
+        .filter_map(|name| reg.alias_for(name))
+        .map(|(name, alias)| v1_alias_object(reg, name, alias))
         .collect::<Vec<_>>();
     json_ok(json!({ "object": "list", "data": models }))
 }
 
-/// The `/v1/models` object for an alias entry. Shared by the list and the
-/// single-model retrieval so the two shapes cannot drift.
-fn v1_alias_object(name: &str) -> Value {
-    json!({
+/// The capabilities an alias advertises: the worst case across all chain
+/// candidates, computed from what each candidate's backend reports at
+/// discovery time, falling back to the config-declared values only for
+/// backends that report nothing. This is what `/v1/models` publishes.
+struct AdvertisedCapabilities {
+    context_length: Option<u64>,
+    max_completion_tokens: Option<u64>,
+    input_modalities: Vec<String>,
+    tools: bool,
+    reasoning: bool,
+    pricing: Pricing,
+}
+
+/// One candidate's capabilities after resolving backend-reported values
+/// against the alias's config fallbacks.
+struct ResolvedCandidate {
+    context_length: Option<u64>,
+    max_completion_tokens: Option<u64>,
+    input_modalities: Vec<String>,
+    tools: bool,
+    reasoning: bool,
+    pricing: Pricing,
+}
+
+impl ResolvedCandidate {
+    /// Resolve a candidate's capabilities: backend-reported value wins;
+    /// the alias's config fallback fills in only when the backend reports
+    /// nothing for that field.
+    fn resolve(
+        reg: &Registry,
+        candidate: &crate::policy::AliasCandidate,
+        fb: &crate::policy::AliasFallback,
+    ) -> Self {
+        let caps = reg
+            .model_capabilities(&candidate.backend, &candidate.model)
+            .unwrap_or_default();
+        Self {
+            context_length: caps.context_length.or(fb.context_length),
+            max_completion_tokens: caps.max_completion_tokens.or(fb.max_completion_tokens),
+            input_modalities: caps
+                .input_modalities
+                .or_else(|| fb.input_modalities.clone())
+                .unwrap_or_else(|| vec!["text".to_string()]),
+            tools: caps.tools.or(fb.tools).unwrap_or(true),
+            reasoning: caps.reasoning.or(fb.reasoning).unwrap_or(false),
+            pricing: caps
+                .pricing
+                .or_else(|| fb.pricing.clone())
+                .unwrap_or_else(|| Pricing {
+                    prompt: "0".to_string(),
+                    completion: "0".to_string(),
+                }),
+        }
+    }
+}
+
+/// Compute the advertised capabilities for an alias by intersecting
+/// across all chain candidates. The chain is only as capable as its
+/// weakest link: min for token budgets, set intersection for modalities,
+/// AND for boolean capabilities, max for pricing (worst case = most
+/// expensive). Logs a warning for each mismatch found, because aliases
+/// are meant to group similarly capable models.
+fn compute_alias_capabilities(reg: &Registry, name: &str, alias: &Alias) -> AdvertisedCapabilities {
+    let resolved: Vec<ResolvedCandidate> = alias
+        .candidates
+        .iter()
+        .map(|c| ResolvedCandidate::resolve(reg, c, &alias.fallback))
+        .collect();
+
+    let mut mismatches: Vec<String> = Vec::new();
+
+    // context_length: min.
+    let cl_vals: Vec<u64> = resolved.iter().filter_map(|c| c.context_length).collect();
+    let context_length = cl_vals.iter().min().copied();
+    if cl_vals.len() > 1
+        && let (Some(lo), Some(hi)) = (cl_vals.iter().min(), cl_vals.iter().max())
+        && lo != hi
+    {
+        mismatches.push(format!("context_length: {lo} vs {hi} (advertising {lo})"));
+    }
+
+    // max_completion_tokens: min.
+    let mct_vals: Vec<u64> = resolved
+        .iter()
+        .filter_map(|c| c.max_completion_tokens)
+        .collect();
+    let max_completion_tokens = mct_vals.iter().min().copied();
+    if mct_vals.len() > 1
+        && let (Some(lo), Some(hi)) = (mct_vals.iter().min(), mct_vals.iter().max())
+        && lo != hi
+    {
+        mismatches.push(format!(
+            "max_completion_tokens: {lo} vs {hi} (advertising {lo})"
+        ));
+    }
+
+    // input_modalities: intersection (always at least ["text"]).
+    let mut input_modalities = resolved
+        .first()
+        .map(|c| c.input_modalities.clone())
+        .unwrap_or_else(|| vec!["text".to_string()]);
+    for c in resolved.iter().skip(1) {
+        input_modalities.retain(|m| c.input_modalities.contains(m));
+    }
+    if input_modalities.is_empty() {
+        input_modalities = vec!["text".to_string()];
+    }
+    if resolved.len() > 1 {
+        let all_same = resolved.windows(2).all(|w| {
+            let mut a = w[0].input_modalities.clone();
+            let mut b = w[1].input_modalities.clone();
+            a.sort();
+            b.sort();
+            a == b
+        });
+        if !all_same {
+            mismatches.push(format!(
+                "input_modalities vary (advertising {input_modalities:?})"
+            ));
+        }
+    }
+
+    // tools: false if ANY candidate lacks it.
+    let tools = resolved.iter().all(|c| c.tools);
+    if resolved.len() > 1 {
+        let supporting = resolved.iter().filter(|c| c.tools).count();
+        if supporting > 0 && supporting < resolved.len() {
+            mismatches.push(format!(
+                "tools: {supporting}/{} candidates support it",
+                resolved.len()
+            ));
+        }
+    }
+
+    // reasoning: false if ANY candidate lacks it.
+    let reasoning = resolved.iter().all(|c| c.reasoning);
+    if resolved.len() > 1 {
+        let supporting = resolved.iter().filter(|c| c.reasoning).count();
+        if supporting > 0 && supporting < resolved.len() {
+            mismatches.push(format!(
+                "reasoning: {supporting}/{} candidates support it",
+                resolved.len()
+            ));
+        }
+    }
+
+    // pricing: max prompt, max completion (worst case = most expensive).
+    let price_of = |s: &str| s.parse::<f64>().unwrap_or(0.0);
+    let mut pricing = resolved
+        .first()
+        .map(|c| c.pricing.clone())
+        .unwrap_or_else(|| Pricing {
+            prompt: "0".to_string(),
+            completion: "0".to_string(),
+        });
+    for c in resolved.iter().skip(1) {
+        if price_of(&c.pricing.prompt) > price_of(&pricing.prompt) {
+            pricing.prompt = c.pricing.prompt.clone();
+        }
+        if price_of(&c.pricing.completion) > price_of(&pricing.completion) {
+            pricing.completion = c.pricing.completion.clone();
+        }
+    }
+    if resolved.len() > 1 {
+        let prompts: Vec<f64> = resolved
+            .iter()
+            .map(|c| price_of(&c.pricing.prompt))
+            .collect();
+        let lo = prompts.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = prompts.iter().cloned().fold(0.0_f64, f64::max);
+        if (hi - lo).abs() > 1e-12 {
+            mismatches.push(format!("pricing.prompt: {lo} to {hi} (advertising max)"));
+        }
+    }
+
+    for m in &mismatches {
+        warn!(alias = name, mismatch = %m, "alias capability mismatch");
+    }
+
+    AdvertisedCapabilities {
+        context_length,
+        max_completion_tokens,
+        input_modalities,
+        tools,
+        reasoning,
+        pricing,
+    }
+}
+
+/// The `/v1/models` object for an alias entry, in OpenRouter's shape.
+/// Shared by the list and the single-model retrieval so the two cannot drift.
+fn v1_alias_object(reg: &Registry, name: &str, alias: &Alias) -> Value {
+    let caps = compute_alias_capabilities(reg, name, alias);
+
+    let modality = if caps.input_modalities == ["text"] {
+        "text->text".to_string()
+    } else {
+        format!("{}->text", caps.input_modalities.join("+"))
+    };
+
+    let mut supported = vec!["max_tokens", "temperature", "stop"];
+    if caps.tools {
+        supported.push("tools");
+        supported.push("tool_choice");
+    }
+    if caps.reasoning {
+        supported.push("reasoning");
+        supported.push("reasoning_effort");
+    }
+
+    let mut obj = json!({
         "id": name,
         "object": "model",
         "created": 0,
         "owned_by": "router-alias",
-    })
+        "architecture": {
+            "modality": modality,
+            "input_modalities": caps.input_modalities,
+            "output_modalities": ["text"],
+        },
+        "pricing": {
+            "prompt": caps.pricing.prompt,
+            "completion": caps.pricing.completion,
+        },
+        "supported_parameters": supported,
+    });
+
+    if let Some(cl) = caps.context_length {
+        obj["context_length"] = json!(cl);
+        obj["top_provider"] = json!({ "context_length": cl });
+    }
+    if let Some(mct) = caps.max_completion_tokens {
+        if obj.get("top_provider").is_none() {
+            obj["top_provider"] = json!({});
+        }
+        obj["top_provider"]["max_completion_tokens"] = json!(mct);
+    }
+
+    obj
 }
 
 /// `GET /v1/models/:model_id` — OpenAI-compatible single-model retrieval.
@@ -75,8 +308,8 @@ fn v1_alias_object(name: &str) -> Value {
 pub fn v1_model_response(reg: &Registry, model_id: &str) -> Response {
     // Aliases shadow concrete models in routing, so retrieval resolves them
     // first too — anything /v1/models lists must be retrievable by id.
-    if let Some((canonical, _)) = reg.alias_for(model_id) {
-        return json_ok(v1_alias_object(canonical));
+    if let Some((canonical, alias)) = reg.alias_for(model_id) {
+        return json_ok(v1_alias_object(reg, canonical, alias));
     }
 
     json_status(

@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The raw TOML document, before validation.
 ///
@@ -62,6 +62,32 @@ struct RawBackend {
     strip_auth: bool,
 }
 
+/// Per-token pricing in OpenRouter string format.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pricing {
+    pub prompt: String,
+    pub completion: String,
+}
+
+/// Per-alias capability fallbacks from config. Used only when a
+/// candidate's backend doesn't report the corresponding field.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AliasFallback {
+    pub context_length: Option<u64>,
+    pub max_completion_tokens: Option<u64>,
+    pub input_modalities: Option<Vec<String>>,
+    pub tools: Option<bool>,
+    pub reasoning: Option<bool>,
+    pub pricing: Option<Pricing>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPricing {
+    prompt: String,
+    completion: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAlias {
@@ -70,6 +96,18 @@ struct RawAlias {
     #[serde(default)]
     local: bool,
     chain: Vec<String>,
+    /// Fallback context window for backends that don't report it.
+    context_length: Option<u64>,
+    /// Fallback max completion tokens.
+    max_completion_tokens: Option<u64>,
+    /// Fallback input modalities (e.g. `["text", "image"]`).
+    input_modalities: Option<Vec<String>>,
+    /// Fallback tool support.
+    tools: Option<bool>,
+    /// Fallback reasoning support.
+    reasoning: Option<bool>,
+    /// Fallback pricing (per-token strings).
+    pricing: Option<RawPricing>,
 }
 
 /// One `backend/model` candidate in an alias chain.
@@ -91,6 +129,9 @@ pub struct Alias {
     /// Invariant: non-empty, every candidate's backend is a configured
     /// backend name.
     pub candidates: Vec<AliasCandidate>,
+    /// Config-declared capability fallbacks. Used only for candidates
+    /// whose backend doesn't report the corresponding field.
+    pub fallback: AliasFallback,
 }
 
 /// A validated backend declaration. Position in [`Validated::backends`] is
@@ -270,7 +311,7 @@ impl FileConfig {
 /// concatenates cleanly with the `/api/tags`-style suffixes discovery
 /// appends.
 ///
-/// The host check is not pedantry. `http:///llama-swap.ai:8080` (a
+/// The host check is not pedantry. `http:///llama-swap-rh-anine.ai:8080` (a
 /// triple-slash typo) and `http://:8080` are both scheme-correct and
 /// host-less: they would be *accepted*, counted as an applied reload, and
 /// then fail every probe — so the backend's models would quietly drop out
@@ -366,6 +407,17 @@ fn validate_alias(
     Ok(Alias {
         local_only: raw.local,
         candidates,
+        fallback: AliasFallback {
+            context_length: raw.context_length,
+            max_completion_tokens: raw.max_completion_tokens,
+            input_modalities: raw.input_modalities.clone(),
+            tools: raw.tools,
+            reasoning: raw.reasoning,
+            pricing: raw.pricing.as_ref().map(|p| Pricing {
+                prompt: p.prompt.clone(),
+                completion: p.completion.clone(),
+            }),
+        },
     })
 }
 
@@ -437,11 +489,16 @@ mod tests {
         let names: Vec<&str> = v.backends.iter().map(|b| b.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["llama-swap-cuda", "llama-swap", "nous", "freellmapi"]
+            vec![
+                "llama-swap-hr-main",
+                "llama-swap-rh-anine",
+                "nous",
+                "freellmapi"
+            ]
         );
 
         // The on-LAN, unmetered backends forward auth.
-        for name in ["llama-swap-cuda", "llama-swap"] {
+        for name in ["llama-swap-hr-main", "llama-swap-rh-anine"] {
             let b = v
                 .backends
                 .iter()
@@ -518,7 +575,7 @@ mod tests {
         // The vision chain exercises the first-'/' split on a model id that
         // contains both '/' and ':'.
         let vision = v.aliases.get("auto:vision").expect("auto:vision alias");
-        assert_eq!(vision.candidates[0].backend, "llama-swap-cuda");
+        assert_eq!(vision.candidates[0].backend, "llama-swap-hr-main");
         assert_eq!(
             vision.candidates[0].model,
             "haervwe/GLM-4.6V-Flash-9B:latest"
@@ -662,7 +719,7 @@ mod tests {
             )
         };
         for url in [
-            "http:///llama-swap.ai:8080",
+            "http:///llama-swap-rh-anine.ai:8080",
             "https:///a",
             "http://:8080",
             "http:///",

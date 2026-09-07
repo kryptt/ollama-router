@@ -111,8 +111,8 @@ in it, so a router without one has nothing to route to.
 # so the backend declared first wins a colliding model name. Local,
 # unmetered backends therefore come first and metered ones last.
 [[backends]]
-name  = "llama-swap-cuda"
-url   = "http://llama-swap-cuda.ai:8080"
+name  = "llama-swap-hr-main"
+url   = "http://llama-swap-hr-main.ai:8080"
 
 [[backends]]
 name  = "nous"
@@ -125,7 +125,7 @@ strip_auth = true                  # our inbound token is not a Nous credential
 
 [aliases.financial]
 local = true                       # privacy pin, re-proved on every reload
-chain = ["llama-swap-cuda/gemma4:e2b", "llama-swap/qwen3.6-low"]
+chain = ["llama-swap-hr-main/gemma4:e2b", "llama-swap-rh-anine/qwen3.6-low"]
 ```
 
 **Backends** (`[[backends]]`, an array of tables — *not* a map, because the

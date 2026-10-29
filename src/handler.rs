@@ -211,6 +211,7 @@ pub async fn model_route(
     let backend_name = view.name.to_string();
     let backend_protocol = view.protocol;
     let backend_strip_auth = view.strip_auth;
+    let backend_images_via_chat = view.images_via_chat;
     drop(reg);
 
     let span = tracing::Span::current();
@@ -252,6 +253,7 @@ pub async fn model_route(
         name: backend_name,
         protocol: backend_protocol,
         strip_auth: backend_strip_auth,
+        images_via_chat: backend_images_via_chat,
     };
 
     let outcome = match execute_attempt(&ctx, &spilled.model, spilled.body, &target, true).await {
@@ -262,15 +264,10 @@ pub async fn model_route(
         AttemptOutcome::Committed(r) => r,
         AttemptOutcome::Upstream {
             response,
-            needs_translation,
+            translation,
         } => {
-            finish_upstream_response(
-                response,
-                needs_translation,
-                spilled.stream,
-                spilled.model.clone(),
-            )
-            .await
+            finish_upstream_response(response, translation, spilled.stream, spilled.model.clone())
+                .await
         }
         AttemptOutcome::Failed(e) => e.into_response(),
     };
@@ -301,6 +298,19 @@ struct AttemptTarget {
     name: String,
     protocol: BackendProtocol,
     strip_auth: bool,
+    images_via_chat: bool,
+}
+
+/// Which response-side reshaping an attempt's request-side translation
+/// committed it to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Translation {
+    None,
+    /// Ollama `/api/chat` sent to an OpenAI-only backend.
+    OllamaChat,
+    /// `/v1/images/generations` sent as chat-completions to an
+    /// `images_via_chat` backend.
+    ImagesViaChat,
 }
 
 /// Outcome of one forwarding attempt against one backend.
@@ -315,7 +325,7 @@ enum AttemptOutcome {
     /// chain path — signals an advance to the next candidate.
     Upstream {
         response: Response,
-        needs_translation: bool,
+        translation: Translation,
     },
     /// No response could be obtained at all (connect / timeout / transport).
     Failed(proxy::ProxyError),
@@ -379,8 +389,29 @@ async fn execute_attempt(
     let needs_effort_translation =
         is_local_llama && matches!(ctx.uri.path(), "/api/chat" | "/v1/chat/completions");
 
+    // Images: a backend without `/v1/images/generations` (Nous Portal) makes
+    // images through chat-completions with `modalities`. Never combined with
+    // the two rewrites above — those are chat-path only.
+    let needs_images_translation =
+        target.images_via_chat && ctx.uri.path() == "/v1/images/generations";
+
     let mut body = body;
-    if needs_translation || needs_effort_translation {
+    if needs_images_translation {
+        let body_bytes = collect_body_to_bytes(body).await.map_err(|e| {
+            tracing::warn!(error = %e, "failed to buffer request body for images translation");
+            proxy::bad_gateway("failed to buffer request body for translation")
+        })?;
+        tracing::info!(
+            backend = %target.name,
+            requested_model = %model,
+            "translating /v1/images/generations → /v1/chat/completions"
+        );
+        ctx.state.metrics.protocol_translations.inc();
+        body = Body::from(translate::images_request_to_chat(&body_bytes).map_err(|e| {
+            tracing::warn!(error = %e, "failed to translate images body");
+            proxy::bad_request("body is not valid JSON")
+        })?);
+    } else if needs_translation || needs_effort_translation {
         // Buffer once, then apply whichever rewrites this hop needs. The
         // alias-chain walk already buffers every body it forwards, so for the
         // aliased traffic this is the same read, not a second one.
@@ -438,7 +469,7 @@ async fn execute_attempt(
         && protocol.is_some()
         && !preflight_model_loaded(ctx.state, &target.url, &target.name, model).await;
 
-    let upstream_path: Option<&str> = if needs_translation {
+    let upstream_path: Option<&str> = if needs_translation || needs_images_translation {
         Some("/v1/chat/completions")
     } else {
         None
@@ -486,7 +517,13 @@ async fn execute_attempt(
         match proxy::execute(proxy_req).await {
             Ok(response) => Ok(AttemptOutcome::Upstream {
                 response,
-                needs_translation,
+                translation: if needs_images_translation {
+                    Translation::ImagesViaChat
+                } else if needs_translation {
+                    Translation::OllamaChat
+                } else {
+                    Translation::None
+                },
             }),
             Err(e) => {
                 record_upstream_error(&ctx.state.metrics, &e);
@@ -500,14 +537,14 @@ async fn execute_attempt(
 /// pass the upstream response through untouched otherwise.
 async fn finish_upstream_response(
     response: Response,
-    needs_translation: bool,
+    translation: Translation,
     stream: bool,
     model: String,
 ) -> Response {
-    if needs_translation {
-        translate_proxy_response(response, stream, model).await
-    } else {
-        response
+    match translation {
+        Translation::None => response,
+        Translation::OllamaChat => translate_proxy_response(response, stream, model).await,
+        Translation::ImagesViaChat => translate_images_response(response).await,
     }
 }
 
@@ -566,6 +603,7 @@ fn snapshot_alias_chain(reg: &Registry, model: &str) -> Option<(String, Vec<Chai
                     name: view.name.to_string(),
                     protocol: view.protocol,
                     strip_auth: view.strip_auth,
+                    images_via_chat: view.images_via_chat,
                 },
             })
         })
@@ -677,7 +715,7 @@ async fn route_alias_chain(
             }
             AttemptOutcome::Upstream {
                 response,
-                needs_translation,
+                translation,
             } => {
                 let status = response.status();
                 let reason = match status {
@@ -702,7 +740,7 @@ async fn route_alias_chain(
                     None => {
                         let response = finish_upstream_response(
                             response,
-                            needs_translation,
+                            translation,
                             ctx.stream,
                             cand.model.clone(),
                         )
@@ -1200,6 +1238,45 @@ async fn translate_proxy_response(resp: Response, streaming: bool, model: String
                 tracing::warn!(error = %e, "failed to translate non-streaming response");
                 proxy::bad_gateway("failed to translate upstream response")
             }
+        }
+    }
+}
+
+/// Reshape a chat-completions image reply into an `/v1/images/generations`
+/// response. Error statuses pass through untouched, like
+/// `translate_proxy_response`. A 2xx reply with no image in it (the model
+/// answered in text) is a 502: the client asked for an image and the
+/// upstream text is surfaced in the error message.
+async fn translate_images_response(resp: Response) -> Response {
+    use http_body_util::BodyExt;
+    let status = resp.status();
+    if !status.is_success() {
+        return resp;
+    }
+    let bytes = match resp.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to buffer images response body");
+            return proxy::bad_gateway("failed to read upstream response");
+        }
+    };
+    match translate::chat_response_to_images(&bytes) {
+        Ok(Some(out)) => response_with_content_type(Body::from(out), status, "application/json"),
+        Ok(None) => {
+            let text = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/choices/0/message/content")?
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            tracing::warn!(reply = %text, "images-via-chat reply carried no image");
+            proxy::bad_gateway(&format!("upstream returned no image: {text}"))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to translate images response");
+            proxy::bad_gateway("failed to translate upstream response")
         }
     }
 }

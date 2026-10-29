@@ -45,7 +45,8 @@ compatible inference endpoints behind a single OpenAI-compatible API.
   such as Home Assistant's Ollama integration — one bad model no longer takes
   down the whole list.
 - **Multi-API surface.** `/v1/chat/completions`, `/v1/completions`,
-  `/v1/messages` (Anthropic), `/v1/embeddings`, `/api/chat`, `/api/generate`,
+  `/v1/messages` (Anthropic), `/v1/embeddings`, `/v1/images/generations`,
+  `/api/chat`, `/api/generate`,
   `/api/embed`, `/api/embeddings`, `/api/show` — each with the correct
   `stream` default per protocol. Mutating endpoints (`/api/pull`, `/api/push`,
   …) are blocked; unknown paths pass through to a healthy backend.
@@ -89,7 +90,7 @@ Two surfaces, split by lifecycle:
 |---|---|
 | backend roster, URLs, **declaration order (= routing priority)** | connect / request timeouts, `OLLAMA_ROUTER_EXTRA_CA_FILE` (frozen inside the two reqwest clients) |
 | the backend roster itself | ports (bound listeners) |
-| `external`, `strip_auth` | `OLLAMA_ROUTER_TOKENS_FILE` (its own 60 s reloader) |
+| `external`, `strip_auth`, `images_via_chat` | `OLLAMA_ROUTER_TOKENS_FILE` (its own 60 s reloader) |
 | alias chains and their `local` pins | discovery interval, grace multiplier, heartbeat knobs |
 | the fallback map | `OLLAMA_ROUTER_ESCALATE`, the inert retry / breaker / cache knobs, `OTEL_*`, `RUST_LOG` |
 
@@ -137,6 +138,7 @@ order is a security boundary and a map would lose it):
 | `url` | yes | `http(s)://host[:port]`; any trailing slash is stripped. |
 | `external` | no (`false`) | Hosted / off-LAN. A `local` alias whose chain touches an `external` backend rejects the whole file. |
 | `strip_auth` | no (`false`) | Drop the client's `authorization` header before forwarding. For backends whose credential is injected downstream by an egress proxy: the inbound token is a *router* token, useless to the backend and not something to hand a third party. |
+| `images_via_chat` | no (`false`) | The backend has no `/v1/images/generations` and makes images through chat-completions instead (OpenRouter-style `modalities: ["image","text"]`, as Nous Portal does). An images request routed here is sent to `/v1/chat/completions` (`prompt` becomes the user message, `size` becomes `image_config.aspect_ratio`), and the `choices[].message.images[]` reply is reshaped into `{"created", "data": [{"b64_json"}]}`. A reply with no image is a 502 carrying the model's text. |
 
 Every backend serves whatever it advertises: there is no per-backend model
 allowlist. Concrete backend models are never *published* (`/v1/models` and
@@ -380,6 +382,7 @@ Public router (`OLLAMA_ROUTER_PUBLIC_PORT`):
 |---|---|
 | `POST /api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/api/show` | Ollama-native API, routed to the backend hosting the requested model. |
 | `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/messages` | OpenAI / Anthropic compat, routed by model. |
+| `POST /v1/images/generations` | OpenAI image generation, routed by model (aliases chain like any other path). Translated per backend when it sets `images_via_chat`. `/v1/images/edits` is not routed. |
 | `GET /api/tags` | Aggregated `/api/tags` across all backends. |
 | `GET /api/ps` | Aggregated `/api/ps` showing currently-loaded models across every backend (with per-backend protocol shimming for llama-swap and always-resident backends). |
 | `GET /v1/models`, `GET /v1/models/{id}` | Aggregated OpenAI-style model list. |

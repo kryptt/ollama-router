@@ -1437,3 +1437,77 @@ async fn empty_roster_is_never_ready_even_with_discovery_done() {
     assert_eq!(body["reason"], "awaiting first discovery");
     assert!(!reg.read().await.is_ready());
 }
+
+/// `/v1/images/generations` walks an alias chain like any routed path: a
+/// failing images-API backend advances to an `images_via_chat` backend, which
+/// receives a chat-completions call with `modalities` and whose image reply
+/// comes back reshaped as an images response.
+#[tokio::test]
+async fn images_alias_falls_through_to_images_via_chat_backend() {
+    let free = mock_backend_router(vec!["auto"], StatusCode::OK, Arc::new(AtomicUsize::new(0)))
+        .route(
+            "/v1/images/generations",
+            post(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    r#"{"error":"all providers busy"}"#,
+                )
+            }),
+        );
+    let nous = mock_backend_router(vec!["img"], StatusCode::OK, Arc::new(AtomicUsize::new(0)))
+        .route(
+            "/v1/chat/completions",
+            post(|payload: Bytes| async move {
+                let req: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                if req["modalities"] != json!(["image", "text"])
+                    || req["model"] != "img"
+                    || req["messages"][0]["content"] != "an apple"
+                {
+                    return (StatusCode::BAD_REQUEST, format!("unexpected body: {req}"));
+                }
+                let reply = json!({"created": 7, "choices": [{"message": {"content": "", "images": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}]}}]});
+                (StatusCode::OK, reply.to_string())
+            }),
+        );
+    let (free_url, _free) = spawn_test_server_abortable(free).await;
+    let (nous_url, _nous) = spawn_test_server_abortable(nous).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = policy_path(&dir);
+    std::fs::write(
+        &path,
+        format!(
+            "[[backends]]\nname = \"free\"\nurl = \"{free_url}\"\n\n\
+             [[backends]]\nname = \"nous\"\nurl = \"{nous_url}\"\nimages_via_chat = true\n\n\
+             [fallbacks]\n{}",
+            alias_toml("\"auto:imaging\"", &["free/auto", "nous/img"]),
+        ),
+    )
+    .unwrap();
+    let config = Config {
+        config_path: path,
+        ..Config::default()
+    };
+    let reg = new_registry(&config);
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+
+    let resp = Client::new()
+        .post(format!("{base}/v1/images/generations"))
+        .json(&json!({"model": "auto:imaging", "prompt": "an apple", "size": "1024x1024"}))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({"created": 7, "data": [{"b64_json": "QUJD"}]}));
+
+    let text = state.metrics.encode().unwrap();
+    assert!(
+        text.contains(r#"reason="upstream_5xx""#) && text.contains(r#"to="free""#),
+        "{text}"
+    );
+}

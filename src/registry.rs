@@ -47,6 +47,7 @@ struct BackendState {
     last_seen: Option<Instant>,
     grace_deadline: Option<Instant>,
     strip_auth: bool,
+    images_via_chat: bool,
 }
 
 impl BackendState {
@@ -62,6 +63,7 @@ impl BackendState {
             last_seen: None,
             grace_deadline: None,
             strip_auth: spec.strip_auth,
+            images_via_chat: spec.images_via_chat,
         }
     }
 
@@ -83,6 +85,7 @@ impl BackendState {
             models: &self.models,
             in_grace_period: self.grace_deadline.is_some(),
             strip_auth: self.strip_auth,
+            images_via_chat: self.images_via_chat,
         }
     }
 }
@@ -196,6 +199,7 @@ pub struct BackendView<'a> {
     pub models: &'a [ModelInfo],
     pub in_grace_period: bool,
     pub strip_auth: bool,
+    pub images_via_chat: bool,
 }
 
 impl BackendView<'_> {

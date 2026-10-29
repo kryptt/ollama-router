@@ -77,6 +77,12 @@ pub const ROUTED_PATHS: &[PathConfig] = &[
         path: "/v1/embeddings",
         default_stream: false,
     },
+    // OpenAI image generation. Routed (not passthrough) so `model` aliases
+    // chain across backends; `images_via_chat` backends get it translated.
+    PathConfig {
+        path: "/v1/images/generations",
+        default_stream: false,
+    },
     // Anthropic-compat — spec defaults stream=false.
     PathConfig {
         path: "/v1/messages",
@@ -148,6 +154,11 @@ mod tests {
     #[test]
     fn default_for_v1_embeddings() {
         assert!(!default_stream_for_path("/v1/embeddings"));
+    }
+
+    #[test]
+    fn default_for_v1_images_generations() {
+        assert!(!default_stream_for_path("/v1/images/generations"));
     }
 
     #[test]
@@ -246,6 +257,7 @@ mod tests {
             "/v1/chat/completions",
             "/v1/completions",
             "/v1/embeddings",
+            "/v1/images/generations",
             "/v1/messages",
         ];
 

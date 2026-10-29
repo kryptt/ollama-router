@@ -60,6 +60,12 @@ struct RawBackend {
     /// Drop the client's `authorization` header before forwarding.
     #[serde(default)]
     strip_auth: bool,
+    /// The backend has no `/v1/images/generations`; image requests are sent
+    /// as a `/v1/chat/completions` call with `modalities: ["image","text"]`
+    /// (the OpenRouter-style protocol Nous Portal speaks) and the reply is
+    /// reshaped back into an images response.
+    #[serde(default)]
+    images_via_chat: bool,
 }
 
 /// Per-token pricing in OpenRouter string format.
@@ -150,6 +156,7 @@ pub struct BackendSpec {
     pub name: String,
     pub url: String,
     pub strip_auth: bool,
+    pub images_via_chat: bool,
 }
 
 /// A fully validated policy document. The only way to obtain one is
@@ -269,6 +276,7 @@ impl FileConfig {
                 name,
                 url,
                 strip_auth: raw.strip_auth,
+                images_via_chat: raw.images_via_chat,
             });
         }
 

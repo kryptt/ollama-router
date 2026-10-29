@@ -535,6 +535,80 @@ pub fn format_rfc3339_utc(secs: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
 
+/// Translate an OpenAI `/v1/images/generations` body into the chat-completions
+/// image protocol (`modalities: ["image","text"]`) for backends flagged
+/// `images_via_chat`. `size` (`"WxH"`) becomes `image_config.aspect_ratio`;
+/// the remaining images-only knobs (`n`, `quality`, `style`,
+/// `response_format`) have no chat equivalent and are dropped.
+pub fn images_request_to_chat(bytes: &[u8]) -> Result<Vec<u8>, serde_json::Error> {
+    let req: Value = serde_json::from_slice(bytes)?;
+    let prompt = req
+        .get("prompt")
+        .cloned()
+        .unwrap_or_else(|| Value::String(String::new()));
+    let mut out = json!({
+        "model": req.get("model").cloned().unwrap_or(Value::Null),
+        "messages": [{"role": "user", "content": prompt}],
+        "modalities": ["image", "text"],
+        "stream": false,
+    });
+    if let Some(ratio) = req
+        .get("size")
+        .and_then(Value::as_str)
+        .and_then(aspect_ratio)
+    {
+        out["image_config"] = json!({ "aspect_ratio": ratio });
+    }
+    serde_json::to_vec(&out)
+}
+
+/// `"1024x1536"` -> `"2:3"`. `None` for anything that is not two positive
+/// integers (including OpenAI's `"auto"`).
+fn aspect_ratio(size: &str) -> Option<String> {
+    let (w, h) = size.split_once('x')?;
+    let (w, h): (u64, u64) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let (mut a, mut b) = (w, h);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    Some(format!("{}:{}", w / a, h / a))
+}
+
+/// Reshape a chat-completions image reply (`choices[].message.images[]
+/// .image_url.url`) into an `/v1/images/generations` response. Data URLs
+/// become `b64_json`; plain URLs stay `url`. `Ok(None)` when the reply
+/// carries no image at all (the model answered in text only).
+pub fn chat_response_to_images(bytes: &[u8]) -> Result<Option<Vec<u8>>, serde_json::Error> {
+    let resp: Value = serde_json::from_slice(bytes)?;
+    let data: Vec<Value> = resp
+        .get("choices")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|c| c.pointer("/message/images").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|img| img.pointer("/image_url/url").and_then(Value::as_str))
+        .map(|url| match url.split_once(";base64,") {
+            Some((prefix, b64)) if prefix.starts_with("data:") => json!({ "b64_json": b64 }),
+            _ => json!({ "url": url }),
+        })
+        .collect();
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let created = resp.get("created").cloned().unwrap_or_else(|| {
+        json!(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs())
+        )
+    });
+    serde_json::to_vec(&json!({ "created": created, "data": data })).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1032,5 +1106,59 @@ mod tests {
         assert_eq!(find_double_newline(b"no break here\n"), None);
         assert_eq!(find_double_newline(b""), None);
         assert_eq!(find_double_newline(b"\n\n"), Some(0));
+    }
+
+    // ── images via chat ──────────────────────────────────────────────────
+
+    #[test]
+    fn images_request_becomes_chat_with_modalities() {
+        let out = images_request_to_chat(
+            br#"{"model":"google/gemini-nano-banana-2.1","prompt":"a red apple","n":1,"size":"1024x1536","response_format":"b64_json"}"#,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "google/gemini-nano-banana-2.1");
+        assert_eq!(v["messages"][0]["role"], "user");
+        assert_eq!(v["messages"][0]["content"], "a red apple");
+        assert_eq!(v["modalities"], json!(["image", "text"]));
+        assert_eq!(v["stream"], false);
+        assert_eq!(v["image_config"]["aspect_ratio"], "2:3");
+        assert!(v.get("n").is_none() && v.get("size").is_none() && v.get("prompt").is_none());
+    }
+
+    #[test]
+    fn images_request_without_parseable_size_has_no_aspect_ratio() {
+        for body in [
+            &br#"{"model":"m","prompt":"p"}"#[..],
+            br#"{"model":"m","prompt":"p","size":"auto"}"#,
+        ] {
+            let v: Value = serde_json::from_slice(&images_request_to_chat(body).unwrap()).unwrap();
+            assert!(v.get("image_config").is_none(), "{v}");
+        }
+    }
+
+    #[test]
+    fn chat_image_reply_becomes_images_response() {
+        let out = chat_response_to_images(
+            br#"{"created":42,"choices":[{"message":{"content":"here","images":[
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},
+                {"type":"image_url","image_url":{"url":"https://cdn.example/x.png"}}]}}]}"#,
+        )
+        .unwrap()
+        .unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["created"], 42);
+        assert_eq!(
+            v["data"],
+            json!([{"b64_json": "AAAA"}, {"url": "https://cdn.example/x.png"}])
+        );
+    }
+
+    #[test]
+    fn chat_text_only_reply_is_none() {
+        let out =
+            chat_response_to_images(br#"{"choices":[{"message":{"content":"I cannot draw"}}]}"#)
+                .unwrap();
+        assert!(out.is_none());
     }
 }

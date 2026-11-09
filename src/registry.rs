@@ -30,6 +30,10 @@ pub enum BackendProtocol {
     Ollama,
     /// Backend only speaks /v1/* (e.g. llama.cpp's llama-server, llama-swap).
     OpenAi,
+    /// HuggingFace Text Embeddings Inference: no model listing, one model
+    /// described by `/info`. Speaks `/v1/embeddings` natively; `/v1/rerank`
+    /// is translated to its native `/rerank`.
+    Tei,
 }
 
 /// Per-backend state. Split in two by lifecycle: `name`/`url`/`strip_auth`
@@ -186,6 +190,15 @@ struct V1ModelsResponse {
 #[derive(Deserialize)]
 struct V1Model {
     id: String,
+    #[serde(flatten)]
+    extra: serde_json::Value,
+}
+
+/// TEI's `/info` response; only the model name is interpreted.
+#[derive(Deserialize)]
+struct TeiInfo {
+    model_id: String,
+    served_model_name: Option<String>,
     #[serde(flatten)]
     extra: serde_json::Value,
 }
@@ -735,10 +748,10 @@ fn fetch_err(name: &str, error: &dyn std::fmt::Display, context: &str) -> FetchR
     FetchResult::Err
 }
 
-/// Try Ollama `/api/tags` first, then fall back to OpenAI `/v1/models`.
+/// Try Ollama `/api/tags` first, then OpenAI `/v1/models`, then TEI `/info`.
 /// The successful endpoint determines `protocol`: an `/api/tags` 200 means
-/// the backend speaks Ollama-native; only `/v1/models` succeeding marks it
-/// as OpenAI-only.
+/// the backend speaks Ollama-native; `/v1/models` succeeding marks it
+/// OpenAI-only; only `/info` succeeding marks it TEI.
 async fn fetch_models(client: &Client, name: &str, url: &str) -> FetchResult {
     // Try Ollama /api/tags
     let tags_url = format!("{url}/api/tags");
@@ -756,25 +769,47 @@ async fn fetch_models(client: &Client, name: &str, url: &str) -> FetchResult {
     // Fallback: OpenAI /v1/models
     let v1_url = format!("{url}/v1/models");
     match client.get(&v1_url).send().await {
-        Ok(resp) if resp.status().is_success() => match resp.json::<V1ModelsResponse>().await {
-            Ok(v1) => {
-                let models = v1
-                    .data
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|m| ModelInfo {
-                        name: m.id,
-                        extra: m.extra,
-                    })
-                    .collect();
-                fetch_ok(BackendProtocol::OpenAi, models)
+        Ok(resp) if resp.status().is_success() => {
+            return match resp.json::<V1ModelsResponse>().await {
+                Ok(v1) => {
+                    let models = v1
+                        .data
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|m| ModelInfo {
+                            name: m.id,
+                            extra: m.extra,
+                        })
+                        .collect();
+                    fetch_ok(BackendProtocol::OpenAi, models)
+                }
+                Err(e) => fetch_err(name, &e, "failed to parse /v1/models"),
+            };
+        }
+        Ok(_) => {} // non-success — try TEI fallback
+        Err(e) => return fetch_err(name, &e, "failed to reach backend"),
+    }
+
+    // Fallback: TEI `/info` — a single model, named by `served_model_name`.
+    let info_url = format!("{url}/info");
+    match client.get(&info_url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<TeiInfo>().await {
+            Ok(info) => {
+                let name = info.served_model_name.unwrap_or(info.model_id);
+                fetch_ok(
+                    BackendProtocol::Tei,
+                    vec![ModelInfo {
+                        name,
+                        extra: info.extra,
+                    }],
+                )
             }
-            Err(e) => fetch_err(name, &e, "failed to parse /v1/models"),
+            Err(e) => fetch_err(name, &e, "failed to parse /info"),
         },
         Ok(resp) => fetch_err(
             name,
             &resp.status(),
-            "unhealthy backend (tried /api/tags and /v1/models)",
+            "unhealthy backend (tried /api/tags, /v1/models and /info)",
         ),
         Err(e) => fetch_err(name, &e, "failed to reach backend"),
     }

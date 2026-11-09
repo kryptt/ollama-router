@@ -609,6 +609,67 @@ pub fn chat_response_to_images(bytes: &[u8]) -> Result<Option<Vec<u8>>, serde_js
     serde_json::to_vec(&json!({ "created": created, "data": data })).map(Some)
 }
 
+/// Translate a `/v1/rerank` body (the Cohere / Jina / llama.cpp shape:
+/// `query`, `documents`, `top_n`, `return_documents`) into TEI's native
+/// `/rerank` body (`query`, `texts`, `return_text`). `documents` entries may
+/// be plain strings or `{"text": ...}` objects. Returns the TEI body and the
+/// requested `top_n`, which TEI has no equivalent for and the response side
+/// applies instead.
+pub fn rerank_request_to_tei(bytes: &[u8]) -> Result<(Vec<u8>, Option<usize>), serde_json::Error> {
+    let req: Value = serde_json::from_slice(bytes)?;
+    let texts: Vec<Value> = req
+        .get("documents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|d| d.get("text").cloned().unwrap_or_else(|| d.clone()))
+        .collect();
+    let top_n = req
+        .get("top_n")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok());
+    let out = json!({
+        "query": req.get("query").cloned().unwrap_or(Value::Null),
+        "texts": texts,
+        "return_text": req.get("return_documents").and_then(Value::as_bool).unwrap_or(false),
+        "truncate": true,
+    });
+    Ok((serde_json::to_vec(&out)?, top_n))
+}
+
+/// Reshape TEI's `/rerank` reply (`[{"index","score","text"?}]`, already
+/// sorted by descending score) into the `/v1/rerank` response
+/// `{"model","results":[{"index","relevance_score","document"?}]}`,
+/// truncated to `top_n`.
+pub fn tei_rerank_to_v1(
+    bytes: &[u8],
+    model: &str,
+    top_n: Option<usize>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut hits: Vec<Value> = serde_json::from_slice(bytes)?;
+    hits.sort_by(|a, b| {
+        let score = |v: &Value| v.get("score").and_then(Value::as_f64).unwrap_or(f64::MIN);
+        score(b).total_cmp(&score(a))
+    });
+    if let Some(n) = top_n {
+        hits.truncate(n);
+    }
+    let results: Vec<Value> = hits
+        .into_iter()
+        .map(|h| {
+            let mut r = json!({
+                "index": h.get("index").cloned().unwrap_or(Value::Null),
+                "relevance_score": h.get("score").cloned().unwrap_or(Value::Null),
+            });
+            if let Some(text) = h.get("text") {
+                r["document"] = json!({ "text": text });
+            }
+            r
+        })
+        .collect();
+    serde_json::to_vec(&json!({ "model": model, "results": results }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1160,5 +1221,48 @@ mod tests {
             chat_response_to_images(br#"{"choices":[{"message":{"content":"I cannot draw"}}]}"#)
                 .unwrap();
         assert!(out.is_none());
+    }
+
+    // ── rerank via TEI ───────────────────────────────────────────────────
+
+    #[test]
+    fn rerank_request_becomes_tei_body() {
+        let (out, top_n) = rerank_request_to_tei(
+            br#"{"model":"rerank:hs-rerank-1","query":"cat","documents":["a cat",{"text":"stocks"}],"top_n":1,"return_documents":true}"#,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["query"], "cat");
+        assert_eq!(v["texts"], json!(["a cat", "stocks"]));
+        assert_eq!(v["return_text"], true);
+        assert!(v.get("model").is_none() && v.get("documents").is_none());
+        assert_eq!(top_n, Some(1));
+    }
+
+    #[test]
+    fn rerank_request_defaults_return_text_false() {
+        let (out, top_n) = rerank_request_to_tei(br#"{"query":"q","documents":["a"]}"#).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["return_text"], false);
+        assert_eq!(top_n, None);
+    }
+
+    #[test]
+    fn tei_reply_becomes_v1_rerank_sorted_and_truncated() {
+        let out = tei_rerank_to_v1(
+            br#"[{"index":1,"score":0.2},{"index":0,"score":0.9,"text":"a cat"},{"index":2,"score":0.5}]"#,
+            "rerank:hs-rerank-1",
+            Some(2),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["model"], "rerank:hs-rerank-1");
+        assert_eq!(
+            v["results"],
+            json!([
+                {"index": 0, "relevance_score": 0.9, "document": {"text": "a cat"}},
+                {"index": 2, "relevance_score": 0.5}
+            ])
+        );
     }
 }

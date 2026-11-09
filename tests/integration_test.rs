@@ -1511,3 +1511,68 @@ async fn images_alias_falls_through_to_images_via_chat_backend() {
         "{text}"
     );
 }
+
+/// A TEI backend has no model listing: discovery finds its one model through
+/// `/info`, and `/v1/rerank` (via an alias) is translated to TEI's native
+/// `/rerank` with the reply reshaped, sorted, and cut to `top_n`.
+#[tokio::test]
+async fn rerank_alias_translates_to_tei_native_rerank() {
+    let tei = Router::new()
+        .route(
+            "/info",
+            get(|| async {
+                axum::Json(
+                    json!({"model_id": "org/hs-rerank-1", "served_model_name": "hs-rerank-1",
+                    "model_type": {"reranker": {}}}),
+                )
+            }),
+        )
+        .route(
+            "/rerank",
+            post(|payload: Bytes| async move {
+                let req: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                if req["query"] != "cat" || req["texts"] != json!(["stocks", "a cat"]) {
+                    return (StatusCode::BAD_REQUEST, format!("unexpected body: {req}"));
+                }
+                (
+                    StatusCode::OK,
+                    r#"[{"index":1,"score":0.9},{"index":0,"score":0.1}]"#.to_string(),
+                )
+            }),
+        );
+    let (tei_url, _tei) = spawn_test_server_abortable(tei).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = policy_path(&dir);
+    std::fs::write(
+        &path,
+        format!(
+            "[[backends]]\nname = \"tei-rerank\"\nurl = \"{tei_url}\"\n\n[fallbacks]\n{}",
+            alias_toml("\"rerank:hs-rerank-1\"", &["tei-rerank/hs-rerank-1"]),
+        ),
+    )
+    .unwrap();
+    let config = Config {
+        config_path: path,
+        ..Config::default()
+    };
+    let reg = new_registry(&config);
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+
+    let resp = Client::new()
+        .post(format!("{base}/v1/rerank"))
+        .json(&json!({"model": "rerank:hs-rerank-1", "query": "cat",
+            "documents": ["stocks", {"text": "a cat"}], "top_n": 1}))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["results"],
+        json!([{"index": 1, "relevance_score": 0.9}])
+    );
+}

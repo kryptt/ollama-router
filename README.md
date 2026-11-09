@@ -45,7 +45,7 @@ compatible inference endpoints behind a single OpenAI-compatible API.
   such as Home Assistant's Ollama integration — one bad model no longer takes
   down the whole list.
 - **Multi-API surface.** `/v1/chat/completions`, `/v1/completions`,
-  `/v1/messages` (Anthropic), `/v1/embeddings`, `/v1/images/generations`,
+  `/v1/messages` (Anthropic), `/v1/embeddings`, `/v1/images/generations`, `/v1/rerank`,
   `/api/chat`, `/api/generate`,
   `/api/embed`, `/api/embeddings`, `/api/show` — each with the correct
   `stream` default per protocol. Mutating endpoints (`/api/pull`, `/api/push`,
@@ -383,6 +383,7 @@ Public router (`OLLAMA_ROUTER_PUBLIC_PORT`):
 | `POST /api/chat`, `/api/generate`, `/api/embed`, `/api/embeddings`, `/api/show` | Ollama-native API, routed to the backend hosting the requested model. |
 | `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/messages` | OpenAI / Anthropic compat, routed by model. |
 | `POST /v1/images/generations` | OpenAI image generation, routed by model (aliases chain like any other path). Translated per backend when it sets `images_via_chat`. `/v1/images/edits` is not routed. |
+| `POST /v1/rerank` | Rerank (Cohere / Jina / llama.cpp shape: `query`, `documents`, `top_n`, `return_documents`), routed by model. A TEI backend gets it translated to its native `/rerank` and the reply reshaped into `{"model", "results": [{"index", "relevance_score", "document"?}]}`; other backends receive it untouched. |
 | `GET /api/tags` | Aggregated `/api/tags` across all backends. |
 | `GET /api/ps` | Aggregated `/api/ps` showing currently-loaded models across every backend (with per-backend protocol shimming for llama-swap and always-resident backends). |
 | `GET /v1/models`, `GET /v1/models/{id}` | Aggregated OpenAI-style model list. |

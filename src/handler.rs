@@ -311,6 +311,11 @@ enum Translation {
     /// `/v1/images/generations` sent as chat-completions to an
     /// `images_via_chat` backend.
     ImagesViaChat,
+    /// `/v1/rerank` sent to a TEI backend's native `/rerank`; `top_n` is
+    /// applied to the reply because TEI has no equivalent.
+    TeiRerank {
+        top_n: Option<usize>,
+    },
 }
 
 /// Outcome of one forwarding attempt against one backend.
@@ -395,8 +400,26 @@ async fn execute_attempt(
     let needs_images_translation =
         target.images_via_chat && ctx.uri.path() == "/v1/images/generations";
 
+    // Rerank: TEI has no `/v1/rerank`, only its native `/rerank` with a
+    // different body (`texts`, not `documents`) and a bare-array reply.
+    let needs_rerank_translation =
+        target.protocol == BackendProtocol::Tei && ctx.uri.path() == "/v1/rerank";
+    let mut rerank_top_n = None;
+
     let mut body = body;
-    if needs_images_translation {
+    if needs_rerank_translation {
+        let body_bytes = collect_body_to_bytes(body).await.map_err(|e| {
+            tracing::warn!(error = %e, "failed to buffer request body for rerank translation");
+            proxy::bad_gateway("failed to buffer request body for translation")
+        })?;
+        ctx.state.metrics.protocol_translations.inc();
+        let (tei_body, top_n) = translate::rerank_request_to_tei(&body_bytes).map_err(|e| {
+            tracing::warn!(error = %e, "failed to translate rerank body");
+            proxy::bad_request("body is not valid JSON")
+        })?;
+        rerank_top_n = top_n;
+        body = Body::from(tei_body);
+    } else if needs_images_translation {
         let body_bytes = collect_body_to_bytes(body).await.map_err(|e| {
             tracing::warn!(error = %e, "failed to buffer request body for images translation");
             proxy::bad_gateway("failed to buffer request body for translation")
@@ -471,6 +494,8 @@ async fn execute_attempt(
 
     let upstream_path: Option<&str> = if needs_translation || needs_images_translation {
         Some("/v1/chat/completions")
+    } else if needs_rerank_translation {
+        Some("/rerank")
     } else {
         None
     };
@@ -517,7 +542,11 @@ async fn execute_attempt(
         match proxy::execute(proxy_req).await {
             Ok(response) => Ok(AttemptOutcome::Upstream {
                 response,
-                translation: if needs_images_translation {
+                translation: if needs_rerank_translation {
+                    Translation::TeiRerank {
+                        top_n: rerank_top_n,
+                    }
+                } else if needs_images_translation {
                     Translation::ImagesViaChat
                 } else if needs_translation {
                     Translation::OllamaChat
@@ -545,6 +574,9 @@ async fn finish_upstream_response(
         Translation::None => response,
         Translation::OllamaChat => translate_proxy_response(response, stream, model).await,
         Translation::ImagesViaChat => translate_images_response(response).await,
+        Translation::TeiRerank { top_n } => {
+            translate_rerank_response(response, &model, top_n).await
+        }
     }
 }
 
@@ -1276,6 +1308,30 @@ async fn translate_images_response(resp: Response) -> Response {
         }
         Err(e) => {
             tracing::warn!(error = %e, "failed to translate images response");
+            proxy::bad_gateway("failed to translate upstream response")
+        }
+    }
+}
+
+/// Reshape TEI's `/rerank` reply into a `/v1/rerank` response. Error
+/// statuses pass through untouched, like `translate_images_response`.
+async fn translate_rerank_response(resp: Response, model: &str, top_n: Option<usize>) -> Response {
+    use http_body_util::BodyExt;
+    let status = resp.status();
+    if !status.is_success() {
+        return resp;
+    }
+    let bytes = match resp.into_body().collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to buffer rerank response body");
+            return proxy::bad_gateway("failed to read upstream response");
+        }
+    };
+    match translate::tei_rerank_to_v1(&bytes, model, top_n) {
+        Ok(out) => response_with_content_type(Body::from(out), status, "application/json"),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to translate rerank response");
             proxy::bad_gateway("failed to translate upstream response")
         }
     }

@@ -83,6 +83,12 @@ pub const ROUTED_PATHS: &[PathConfig] = &[
         path: "/v1/images/generations",
         default_stream: false,
     },
+    // Rerank (Cohere / Jina / llama.cpp shape). Routed so aliases chain;
+    // TEI backends get it translated to their native `/rerank`.
+    PathConfig {
+        path: "/v1/rerank",
+        default_stream: false,
+    },
     // Anthropic-compat — spec defaults stream=false.
     PathConfig {
         path: "/v1/messages",
@@ -159,6 +165,11 @@ mod tests {
     #[test]
     fn default_for_v1_images_generations() {
         assert!(!default_stream_for_path("/v1/images/generations"));
+    }
+
+    #[test]
+    fn default_for_v1_rerank() {
+        assert!(!default_stream_for_path("/v1/rerank"));
     }
 
     #[test]
@@ -258,6 +269,7 @@ mod tests {
             "/v1/completions",
             "/v1/embeddings",
             "/v1/images/generations",
+            "/v1/rerank",
             "/v1/messages",
         ];
 

@@ -352,6 +352,10 @@ enum AttemptOutcome {
 /// `Err(response)` is a request-side failure (unreadable or non-JSON body)
 /// that goes straight back to the client — trying another backend cannot
 /// fix the client's own body.
+#[expect(
+    clippy::result_large_err,
+    reason = "Ok already carries a full Response (AttemptOutcome::Committed), so boxing Err saves nothing"
+)]
 async fn execute_attempt(
     ctx: &AttemptContext<'_>,
     model: &str,

@@ -16,6 +16,12 @@ pub struct EscalationRule {
     pub to_model: String,
 }
 
+/// Sent on every outbound request that has no client User-Agent of its own.
+/// Some hosted backends sit behind a WAF that 403s UA-less requests: Nous
+/// returned 403 on discovery `/v1/models` while chat (which forwards the
+/// client UA) succeeded, so the backend read as permanently down.
+pub const USER_AGENT: &str = concat!("ollama-router/", env!("CARGO_PKG_VERSION"));
+
 impl EscalationRule {
     /// Parse a `from:max_input_tokens:to` triple. All three fields must be
     /// non-empty; the middle field must be a positive integer.
@@ -220,12 +226,16 @@ impl Config {
     /// Ready, publish nothing, and 404 every request. One construction
     /// site, one failure mode, and it fails the process at startup.
     pub fn discovery_client(&self) -> Result<reqwest::Client, ConfigError> {
-        self.apply_extra_ca(reqwest::Client::builder().timeout(Duration::from_secs(10)))?
-            .build()
-            .map_err(|e| ConfigError::Invalid {
-                key: "OLLAMA_ROUTER_EXTRA_CA_FILE",
-                reason: format!("could not build the discovery HTTP client: {e}"),
-            })
+        self.apply_extra_ca(
+            reqwest::Client::builder()
+                .user_agent(USER_AGENT)
+                .timeout(Duration::from_secs(10)),
+        )?
+        .build()
+        .map_err(|e| ConfigError::Invalid {
+            key: "OLLAMA_ROUTER_EXTRA_CA_FILE",
+            reason: format!("could not build the discovery HTTP client: {e}"),
+        })
     }
 
     /// Add `extra_ca_file`'s certificates to an outbound HTTP client.

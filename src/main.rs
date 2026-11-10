@@ -109,6 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config
             .apply_extra_ca(
                 reqwest::Client::builder()
+                    .user_agent(ollama_router::config::USER_AGENT)
                     .pool_max_idle_per_host(10)
                     .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
                     .timeout(Duration::from_secs(config.request_timeout_secs)),

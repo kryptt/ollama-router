@@ -688,6 +688,10 @@ async fn route_alias_chain(
         }
     };
 
+    if survey_enabled() {
+        survey_log(&alias, ctx.headers, &body_bytes);
+    }
+
     // Startup-race guard: before the first discovery cycle completes (or
     // during a registry-visible total outage) every candidate reads
     // unreachable, and skipping them all would 502 without trying anyone.
@@ -860,6 +864,52 @@ fn record_fallback(metrics: &Metrics, from: &str, to: &str) {
         from,
         to,
         "no reachable backend serves model; applying fallback"
+    );
+}
+
+/// `OLLAMA_ROUTER_SURVEY=1`: log which session-ish fields clients send.
+/// Temporary, to decide how session affinity reads its key. Read once.
+fn survey_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OLLAMA_ROUTER_SURVEY").is_ok_and(|v| v == "1"))
+}
+
+/// One `client survey` line per alias request: header NAMES, top-level body
+/// keys and `metadata` keys. Never values, except a truncated User-Agent
+/// (needed to tell clients apart).
+fn survey_log(alias: &str, headers: &HeaderMap, body: &[u8]) {
+    use serde::de::IgnoredAny;
+    use std::collections::BTreeMap;
+    #[derive(serde::Deserialize)]
+    struct Meta {
+        metadata: Option<BTreeMap<String, IgnoredAny>>,
+    }
+    let keys = |m: Option<BTreeMap<String, IgnoredAny>>| {
+        m.map(|m| m.into_keys().collect::<Vec<_>>().join(","))
+            .unwrap_or_default()
+    };
+    let body_keys = keys(serde_json::from_slice(body).ok());
+    let metadata_keys = keys(
+        serde_json::from_slice::<Meta>(body)
+            .ok()
+            .and_then(|m| m.metadata),
+    );
+    let mut header_names: Vec<&str> = headers.keys().map(|k| k.as_str()).collect();
+    header_names.sort_unstable();
+    let user_agent: String = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .chars()
+        .take(80)
+        .collect();
+    tracing::info!(
+        alias,
+        user_agent,
+        headers = header_names.join(","),
+        body_keys,
+        metadata_keys,
+        "client survey"
     );
 }
 

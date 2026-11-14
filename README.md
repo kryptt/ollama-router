@@ -380,6 +380,7 @@ only when the chat template exposes a thinking end tag.
 | `OLLAMA_ROUTER_REQUEST_TIMEOUT` | `300` | End-to-end request timeout (seconds). Long enough for streaming LLM responses. |
 | `OLLAMA_ROUTER_TOKENS_FILE` | (unset, no auth) | Path to a newline-separated file of valid bearer tokens. Reloaded every 60 s without restart. **Set-but-empty is a startup error**, not "no auth": treating it as unset would silently disable authentication entirely (a `valueFrom` that renders empty would bring the router up wide open), and keeping it would 401 every request against an unreadable path. Only an *absent* variable disables auth — and when it is absent the router logs a warning and reports `ollama_router_auth_enabled 0`. |
 | `OLLAMA_ROUTER_EXTRA_CA_FILE` | (unset, built-in roots only) | Path to a PEM bundle of additional root certificates to trust on outbound requests. Needed when a backend is reached through a TLS-intercepting egress proxy whose CA is private. Applied to both the proxy and discovery clients, and fatal at startup if unreadable. |
+| `OLLAMA_ROUTER_SURVEY` | (unset) | `1` logs one `client survey` line per alias request: header names, top-level body keys and `metadata` keys, plus a truncated User-Agent. Never values. Temporary, for sizing session affinity. |
 
 Cold-load heartbeat (kicks in when an upstream model isn't loaded):
 

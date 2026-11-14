@@ -11,7 +11,13 @@
 //! probe success -------------> HEALTHY (entry removed, strikes reset)
 //! probe failure -------------> BENCHED, strikes+1,
 //!                              delay = min(base * 2^(strikes-1), cap)
+//! failure while still benched -> no change
 //! ```
+//!
+//! Only a probe (or a failure after the bench ran out) adds a strike. A
+//! failure while the bench is live comes from a request admitted anyway (the
+//! all-benched "try everyone" pass, or one already in flight) and says
+//! nothing new; counting it would double the bench on every request.
 //!
 //! The lease doubles as the abandoned-probe guard: a probe whose client
 //! hung up never reports an outcome, and the next request after the lease
@@ -188,6 +194,8 @@ struct Bench {
     reason: Reason,
     until: Instant,
     strikes: u32,
+    /// A probe was admitted and `until` is its lease, not a real bench.
+    probing: bool,
 }
 
 /// One benched entry, for `/status`.
@@ -250,6 +258,7 @@ impl Health {
         for key in &keys {
             if let Some(b) = map.get_mut(key) {
                 b.until = now + PROBE_LEASE;
+                b.probing = true;
             }
         }
         Admit::Go
@@ -272,6 +281,12 @@ impl Health {
         };
         let delay = delays.get(reason);
         let mut map = self.lock();
+        if let Some(b) = map.get(&key)
+            && now < b.until
+            && !b.probing
+        {
+            return b.until - now;
+        }
         let strikes = map.get(&key).map_or(0, |b| b.strikes) + 1;
         let wait = retry_after.map_or_else(|| delay.for_strike(strikes), |d| d.min(delay.cap));
         map.insert(
@@ -280,6 +295,7 @@ impl Health {
                 reason,
                 until: now + wait,
                 strikes,
+                probing: false,
             },
         );
         wait
@@ -372,13 +388,28 @@ mod tests {
     }
 
     #[test]
-    fn cap_and_retry_after() {
+    fn failures_while_benched_do_not_escalate() {
         let h = Health::default();
         let d = Delays::default();
         let t = Instant::now();
+        let w = h.record_failure("b", "m", Reason::Payment, None, &d, t);
+        for i in 1..10 {
+            // e.g. the all-benched pass hitting the hop on every request
+            let left = h.record_failure("b", "m", Reason::Payment, None, &d, t + i * S);
+            assert_eq!(left, w - i * S);
+        }
+        assert_eq!(h.benched(t)[0].strikes, 1);
+    }
+
+    #[test]
+    fn cap_and_retry_after() {
+        let h = Health::default();
+        let d = Delays::default();
+        let mut t = Instant::now();
         let mut last = Duration::ZERO;
         for _ in 0..30 {
             last = h.record_failure("b", "m", Reason::Upstream5xx, None, &d, t);
+            t += last; // each failure lands after the previous bench ran out
         }
         assert_eq!(last, 3600 * S, "capped");
         assert_eq!(

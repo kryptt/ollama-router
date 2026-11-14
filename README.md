@@ -296,7 +296,9 @@ answer straight away instead of re-paying the same failure.
 | connect / timeout / transport | yes | the hop | 60s / 2h |
 | 2xx, other 4xx | no, commits | — | — |
 
-- Consecutive failures double the delay, up to the cap. A success clears the
+- Consecutive failed probes double the delay, up to the cap. A failure while
+  the hop is still benched (the all-benched pass, an in-flight request) adds
+  no strike. A success clears the
   hop's bench (and its backend's).
 - When a bench expires, exactly one request is let through as the probe; the
   rest keep skipping for up to 600s while it runs. A probe that never reports

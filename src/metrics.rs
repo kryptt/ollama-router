@@ -47,13 +47,19 @@ pub struct Metrics {
     /// past candidate backend `to` because of `reason`. The hop it came
     /// from is implied by the chain order in the alias file, so it is not
     /// a label. `reason` is one of: unreachable | connect | timeout |
-    /// transport | auth | rate_limited | model_missing | upstream_5xx.
+    /// transport | payment | auth | rate_limited | model_missing |
+    /// upstream_5xx | benched.
     /// Cardinality is bounded by the operator's alias file (aliases ×
-    /// chain length × 8 reasons).
+    /// chain length × 10 reasons).
     pub chain_advance: Family<ChainAdvanceLabels, Counter>,
     /// Alias chains that ran out of candidates without committing a
     /// response — every candidate was unreachable or failed.
     pub chain_exhausted: Family<ChainLabels, Counter>,
+    /// Alias-chain hops benched after a classified failure (`reason`:
+    /// payment | auth | model_missing | rate_limited | upstream_5xx |
+    /// transport). Skips while benched show as `chain_advance{reason="benched"}`.
+    /// Cardinality bounded by the alias file's hops × 6 reasons.
+    pub hop_benched: Family<HopBenchLabels, Counter>,
 
     // --- Self-health (set at startup / refreshed at scrape time) ---
     /// Process start time as a Unix timestamp (seconds). A sawtooth that
@@ -191,6 +197,13 @@ impl Metrics {
             chain_exhausted.clone(),
         );
 
+        let hop_benched = Family::default();
+        registry.register(
+            "ollama_router_hop_benched",
+            "Alias-chain hops benched after a classified failure (per backend/model/reason)",
+            hop_benched.clone(),
+        );
+
         let start_time_seconds = Gauge::default();
         registry.register(
             "ollama_router_start_time_seconds",
@@ -273,6 +286,7 @@ impl Metrics {
             reasoning_translations,
             chain_advance,
             chain_exhausted,
+            hop_benched,
             start_time_seconds,
             ready,
             backends_reachable,
@@ -333,6 +347,13 @@ pub struct EscalationSkipLabels {
 pub struct ChainAdvanceLabels {
     pub alias: String,
     pub to: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct HopBenchLabels {
+    pub backend: String,
+    pub model: String,
     pub reason: String,
 }
 

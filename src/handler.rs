@@ -17,6 +17,7 @@ use serde_json::json;
 
 use crate::auth::TokenStore;
 use crate::config::EscalationRule;
+use crate::health::{self, Admit, Health, Reason};
 use crate::heartbeat::{self, HeartbeatConfig, StreamProtocol};
 use crate::metrics::{self, Metrics};
 use crate::models;
@@ -36,6 +37,8 @@ pub struct AppState {
     pub token_store: Arc<TokenStore>,
     pub heartbeat: HeartbeatConfig,
     pub escalation_rules: Arc<Vec<EscalationRule>>,
+    /// Benched alias-chain hops (see `health`).
+    pub health: Arc<Health>,
 }
 
 #[tracing::instrument(
@@ -691,12 +694,28 @@ async fn route_alias_chain(
     // When NO candidate is reachable, attempt all of them in order instead —
     // the connect/timeout advance path weeds out the truly-dead ones, and a
     // live-but-not-yet-discovered backend serves the request.
-    let attempt_all = !candidates.iter().any(|c| c.reachable);
+    //
+    // Benched hops (see `health`) count as unreachable here for the same
+    // reason: when every hop is benched or down, try them all anyway so the
+    // client gets a real upstream answer instead of a blind 502.
+    let health = &ctx.state.health;
+    let now = Instant::now();
+    let attempt_all = !candidates
+        .iter()
+        .any(|c| c.reachable && !health.is_benched(&c.target.name, &c.model, now));
 
     let mut last_failure: Option<(Response, String)> = None;
     for cand in candidates {
         if !attempt_all && !cand.reachable {
             record_chain_advance(&ctx.state.metrics, &alias, &cand.target.name, "unreachable");
+            continue;
+        }
+        if !attempt_all
+            && let Admit::Skip(reason) =
+                health.admit(&cand.target.name, &cand.model, Instant::now())
+        {
+            tracing::debug!(alias = %alias, backend = %cand.target.name, model = %cand.model, reason = reason.as_str(), "hop benched; skipping");
+            record_chain_advance(&ctx.state.metrics, &alias, &cand.target.name, "benched");
             continue;
         }
 
@@ -746,6 +765,7 @@ async fn route_alias_chain(
         };
         match outcome {
             AttemptOutcome::Committed(response) => {
+                health.record_success(&cand.target.name, &cand.model);
                 record_commit(ctx, &response, cand.model, cand.target.name, start);
                 return response;
             }
@@ -753,20 +773,24 @@ async fn route_alias_chain(
                 response,
                 translation,
             } => {
-                let status = response.status();
-                let reason = match status {
-                    StatusCode::TOO_MANY_REQUESTS => Some("rate_limited"),
-                    StatusCode::NOT_FOUND => Some("model_missing"),
-                    // Expired or missing credentials on a hosted backend is
-                    // the steady-state failure this feature exists to
-                    // absorb — fail over rather than relay the auth error.
-                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Some("auth"),
-                    s if s.is_server_error() => Some("upstream_5xx"),
-                    _ => None,
-                };
-                match reason {
+                // 402 / 401 / 403 / 404 / 429 / 5xx advance and bench the
+                // hop; anything else (2xx, the client's own 4xx) commits.
+                match Reason::from_status(response.status()) {
                     Some(reason) => {
-                        record_chain_advance(&ctx.state.metrics, &alias, &cand.target.name, reason);
+                        bench(
+                            ctx,
+                            &alias,
+                            &cand,
+                            reason,
+                            health::retry_after(response.headers()),
+                        )
+                        .await;
+                        record_chain_advance(
+                            &ctx.state.metrics,
+                            &alias,
+                            &cand.target.name,
+                            reason.as_str(),
+                        );
                         // Keep the failure (and whose it was) so an
                         // exhausted chain can relay the most recent honest
                         // upstream signal under honest labels.
@@ -774,6 +798,9 @@ async fn route_alias_chain(
                         continue;
                     }
                     None => {
+                        if response.status().is_success() {
+                            health.record_success(&cand.target.name, &cand.model);
+                        }
                         let response = finish_upstream_response(
                             response,
                             translation,
@@ -787,6 +814,7 @@ async fn route_alias_chain(
                 }
             }
             AttemptOutcome::Failed(e) => {
+                bench(ctx, &alias, &cand, Reason::Transport, None).await;
                 record_chain_advance(&ctx.state.metrics, &alias, &cand.target.name, e.kind_str());
                 continue;
             }
@@ -833,6 +861,35 @@ fn record_fallback(metrics: &Metrics, from: &str, to: &str) {
         to,
         "no reachable backend serves model; applying fallback"
     );
+}
+
+/// Bench a failed hop with the live `[health]` delays, count it and log it.
+async fn bench(
+    ctx: &AttemptContext<'_>,
+    alias: &str,
+    cand: &ChainCandidate,
+    reason: Reason,
+    retry_after: Option<std::time::Duration>,
+) {
+    let delays = ctx.state.registry.read().await.health_delays().clone();
+    let wait = ctx.state.health.record_failure(
+        &cand.target.name,
+        &cand.model,
+        reason,
+        retry_after,
+        &delays,
+        Instant::now(),
+    );
+    ctx.state
+        .metrics
+        .hop_benched
+        .get_or_create(&metrics::HopBenchLabels {
+            backend: cand.target.name.clone(),
+            model: cand.model.clone(),
+            reason: reason.as_str().to_string(),
+        })
+        .inc();
+    tracing::info!(alias, backend = %cand.target.name, model = %cand.model, reason = reason.as_str(), bench_secs = wait.as_secs(), "hop benched");
 }
 
 /// Increment `chain_advance` and emit the matching structured log line.
@@ -1056,13 +1113,31 @@ pub async fn status_route(State(state): State<AppState>) -> Response {
         .collect();
 
     let model_count = view.reachable_models().len();
+    let discovery_done = view.is_discovery_done();
+    drop(view);
+
+    let benched: Vec<serde_json::Value> = state
+        .health
+        .benched(Instant::now())
+        .into_iter()
+        .map(|b| {
+            json!({
+                "backend": b.backend,
+                "model": b.model,
+                "reason": b.reason.as_str(),
+                "strikes": b.strikes,
+                "remaining_secs": b.remaining.as_secs(),
+            })
+        })
+        .collect();
 
     json_status(
         StatusCode::OK,
         json!({
             "backends": backends,
-            "discovery_done": view.is_discovery_done(),
+            "discovery_done": discovery_done,
             "model_count": model_count,
+            "benched": benched,
         }),
     )
 }
@@ -1438,6 +1513,7 @@ mod tests {
             token_store: Arc::new(TokenStore::new(None)),
             heartbeat: HeartbeatConfig::from_secs(15, 10, 300),
             escalation_rules: Arc::new(Vec::new()),
+            health: Arc::new(Health::default()),
         }
     }
 

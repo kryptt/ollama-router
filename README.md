@@ -275,10 +275,49 @@ or 5xx response heads.
   advance *is* the retry.
 - Metrics: `ollama_router_chain_advance{alias,to,reason}` (`to` is the
   candidate backend moved past; reasons:
-  `unreachable|connect|timeout|transport|auth|rate_limited|model_missing|upstream_5xx`) and
+  `unreachable|connect|timeout|transport|payment|auth|rate_limited|model_missing|upstream_5xx|benched`) and
   `ollama_router_chain_exhausted{alias}`. An exhausted chain still records
   `requests_total` — alias as the model, and the backend whose failure was
   relayed (`"none"` when no candidate produced a response).
+
+### Hop health (benching failed chain hops)
+
+A chain hop that fails is **benched**: later requests skip it without an
+upstream call until its re-check delay runs out, so they reach a hop that can
+answer straight away instead of re-paying the same failure.
+
+| Failure | Advances? | Benches | Default base / cap |
+|---|---|---|---|
+| 402 | yes | the hop | 15m / 24h |
+| 401, 403 | yes | **the whole backend** (one credential per backend) | 5m / 12h |
+| 404 | yes | the hop | 10m / 12h |
+| 429 | yes | the hop; `Retry-After: <secs>` overrides the delay | 30s / 1h |
+| 5xx | yes | the hop | 15s / 1h |
+| connect / timeout / transport | yes | the hop | 60s / 2h |
+| 2xx, other 4xx | no, commits | — | — |
+
+- Consecutive failures double the delay, up to the cap. A success clears the
+  hop's bench (and its backend's).
+- When a bench expires, exactly one request is let through as the probe; the
+  rest keep skipping for up to 600s while it runs. A probe that never reports
+  (client hung up) simply lets the next request probe after that.
+- If every hop in a chain is benched or unreachable, all of them are tried
+  anyway: the client always gets a real upstream answer.
+- In memory only; a restart forgets every bench. Alias chains only — a
+  concrete-model request has nothing to fail over to.
+- Override any delay in `router.toml` (live-reloaded, unknown reasons reject
+  the file):
+
+  ```toml
+  [health.payment]        # payment | auth | model_missing | rate_limited | upstream_5xx | transport
+  base_secs = 900
+  cap_secs = 86400
+  ```
+
+- Visibility: `ollama_router_hop_benched{backend,model,reason}` counts benches,
+  skips show as `chain_advance{reason="benched"}`, and `GET /status` lists the
+  hops benched right now (`benched[]`: backend, model or null for the whole
+  backend, reason, strikes, remaining_secs).
 
 ### Reasoning effort
 

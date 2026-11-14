@@ -448,6 +448,7 @@ fn app_state_with(reg: &SharedRegistry, metrics: &Arc<Metrics>) -> AppState {
         token_store: Arc::new(TokenStore::new(None)),
         heartbeat: HeartbeatConfig::from_secs(15, 2, 30),
         escalation_rules: Arc::new(Vec::new()),
+        health: Arc::new(ollama_router::health::Health::default()),
     }
 }
 
@@ -524,6 +525,67 @@ async fn alias_chain_advances_past_rate_limited_candidate() {
         text.contains(r#"backend="p2""#) && text.contains(r#"model="m:latest""#),
         "{text}"
     );
+}
+
+/// 402 advances the chain AND benches the hop: the next request skips it
+/// without an upstream call, and `/status` lists it.
+#[tokio::test]
+async fn payment_required_advances_and_benches_the_hop() {
+    let b1 = start_counting_backend(vec!["m:latest"], StatusCode::PAYMENT_REQUIRED).await;
+    let b2 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+
+    let (_dir, config, reg) = policy_setup(
+        &[("p1", &b1.url), ("p2", &b2.url)],
+        &alias_toml("ali", &["p1/m:latest", "p2/m:latest"]),
+    );
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+
+    let client = Client::new();
+    for _ in 0..3 {
+        let resp = post_chat(&client, &base, "ali", false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    assert_eq!(b1.chat_hits(), 1, "benched after the first 402");
+    assert_eq!(b2.chat_hits(), 3);
+
+    let text = state.metrics.encode().unwrap();
+    assert!(text.contains(r#"reason="payment""#), "{text}");
+    assert!(text.contains(r#"reason="benched""#), "{text}");
+    assert!(
+        text.contains(
+            r#"ollama_router_hop_benched_total{backend="p1",model="m:latest",reason="payment"} 1"#
+        ),
+        "{text}"
+    );
+    let benched = state.health.benched(std::time::Instant::now());
+    assert_eq!(benched.len(), 1);
+    assert_eq!(benched[0].backend, "p1");
+}
+
+/// When every hop is benched, the walk tries them all anyway: the client
+/// gets the honest upstream answer, never a blind 502.
+#[tokio::test]
+async fn all_benched_chain_still_attempts_every_hop() {
+    let b1 = start_counting_backend(vec!["m:latest"], StatusCode::PAYMENT_REQUIRED).await;
+    let b2 = start_counting_backend(vec!["m:latest"], StatusCode::PAYMENT_REQUIRED).await;
+
+    let (_dir, config, reg) = policy_setup(
+        &[("p1", &b1.url), ("p2", &b2.url)],
+        &alias_toml("ali", &["p1/m:latest", "p2/m:latest"]),
+    );
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+
+    let client = Client::new();
+    for _ in 0..2 {
+        let resp = post_chat(&client, &base, "ali", false).await;
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+    assert_eq!(b1.chat_hits(), 2);
+    assert_eq!(b2.chat_hits(), 2);
 }
 
 /// `reasoning_effort` is the scale every client speaks and the one thing

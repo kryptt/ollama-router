@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+use crate::health::Delays;
 use crate::metrics::{BackendLabels, ConfigReloadLabels, Metrics};
 use crate::policy::{Alias, BackendSpec, FileConfig, PolicyError, Pricing, Validated};
 
@@ -245,6 +246,8 @@ pub struct Registry {
     /// `model_map`: an alias is resolved before (and shadows) any concrete
     /// model lookup.
     aliases: HashMap<String, Alias>,
+    /// Re-check delays for benched alias-chain hops (`[health]`).
+    health_delays: Delays,
     discovery_done: bool,
 }
 
@@ -255,6 +258,7 @@ impl Registry {
             model_map: HashMap::new(),
             fallbacks: HashMap::new(),
             aliases: HashMap::new(),
+            health_delays: Delays::default(),
             discovery_done: false,
         };
         // Nothing to remove from an empty roster, so the returned names are
@@ -279,6 +283,7 @@ impl Registry {
             backends,
             fallbacks,
             aliases,
+            health,
         } = validated;
 
         // Keyed by name, because position is exactly what must be free to
@@ -341,6 +346,7 @@ impl Registry {
         // observe new aliases against the old backend list.
         self.fallbacks = fallbacks;
         self.aliases = aliases;
+        self.health_delays = health;
         self.rebuild_model_map();
         removed
     }
@@ -427,6 +433,11 @@ impl Registry {
         self.aliases
             .get_key_value(stripped)
             .map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Re-check delays for benched alias-chain hops.
+    pub fn health_delays(&self) -> &Delays {
+        &self.health_delays
     }
 
     /// All configured alias names, in arbitrary order.
@@ -1595,6 +1606,7 @@ mod tests {
             model_map: HashMap::new(),
             fallbacks: HashMap::new(),
             aliases: HashMap::new(),
+            health_delays: Delays::default(),
             discovery_done: false,
         };
         assert!(!reg.is_ready());

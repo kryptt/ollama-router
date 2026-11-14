@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod config;
 pub mod handler;
+pub mod health;
 pub mod heartbeat;
 pub mod metrics;
 pub mod models;

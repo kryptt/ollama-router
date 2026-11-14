@@ -146,6 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         token_store: Arc::clone(&token_store),
         heartbeat: heartbeat_cfg,
         escalation_rules,
+        health: Arc::new(ollama_router::health::Health::default()),
     };
 
     // Built here so a bad EXTRA_CA_FILE is fatal at startup rather than a

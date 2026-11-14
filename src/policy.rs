@@ -19,8 +19,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+use crate::health::{Delay, Delays, Reason};
 
 /// The raw TOML document, before validation.
 ///
@@ -45,6 +48,18 @@ pub struct FileConfig {
     /// aliases, and TOML's native duplicate-key rejection replaces a
     /// hand-written check.
     aliases: HashMap<String, RawAlias>,
+    /// `[health.<reason>]` re-check delay overrides for benched hops
+    /// (`payment`, `auth`, `model_missing`, `rate_limited`, `upstream_5xx`,
+    /// `transport`). Optional; unlisted reasons keep their defaults.
+    #[serde(default)]
+    health: HashMap<String, RawDelay>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDelay {
+    base_secs: u64,
+    cap_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,6 +185,7 @@ pub struct Validated {
     pub backends: Vec<BackendSpec>,
     pub fallbacks: HashMap<String, String>,
     pub aliases: HashMap<String, Alias>,
+    pub health: Delays,
 }
 
 #[derive(Debug)]
@@ -250,7 +266,31 @@ impl FileConfig {
             backends,
             fallbacks,
             aliases,
+            health,
         } = self;
+
+        let mut delays = Delays::default();
+        let mut health_entries: Vec<(&String, &RawDelay)> = health.iter().collect();
+        health_entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, raw) in health_entries {
+            let Some(reason) = Reason::from_name(name) else {
+                let known: Vec<&str> = Reason::ALL.iter().map(|r| r.as_str()).collect();
+                return invalid(format!(
+                    "unknown [health.{name}]; expected one of: {}",
+                    known.join(", ")
+                ));
+            };
+            if raw.base_secs == 0 || raw.cap_secs < raw.base_secs {
+                return invalid(format!("[health.{name}] needs 0 < base_secs <= cap_secs"));
+            }
+            delays.set(
+                reason,
+                Delay {
+                    base: Duration::from_secs(raw.base_secs),
+                    cap: Duration::from_secs(raw.cap_secs),
+                },
+            );
+        }
 
         if backends.is_empty() {
             return invalid("`backends` must contain at least one entry");
@@ -311,6 +351,7 @@ impl FileConfig {
             backends: specs,
             fallbacks,
             aliases: validated_aliases,
+            health: delays,
         })
     }
 }
@@ -447,6 +488,26 @@ mod tests {
 
     fn parse(raw: &str) -> Validated {
         FileConfig::parse(raw).expect("expected a valid policy document")
+    }
+
+    #[test]
+    fn health_overrides_parse_and_validate() {
+        let v = parse(&format!(
+            "{MINIMAL}\n[health.payment]\nbase_secs = 60\ncap_secs = 120\n"
+        ));
+        assert_eq!(v.health.get(Reason::Payment).cap, Duration::from_secs(120));
+        assert_eq!(
+            v.health.get(Reason::Auth),
+            Delays::default().get(Reason::Auth)
+        );
+        assert_rejects(
+            &format!("{MINIMAL}\n[health.paymnet]\nbase_secs = 1\ncap_secs = 2\n"),
+            "unknown [health.paymnet]",
+        );
+        assert_rejects(
+            &format!("{MINIMAL}\n[health.auth]\nbase_secs = 10\ncap_secs = 5\n"),
+            "base_secs <= cap_secs",
+        );
     }
 
     #[track_caller]

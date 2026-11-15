@@ -605,6 +605,8 @@ struct ChainCandidate {
     /// candidate outright.
     serves: bool,
     target: AttemptTarget,
+    /// The alias's `extra_body` for this candidate's backend.
+    extra_body: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Snapshot an alias's candidate chain out of the registry: the canonical
@@ -634,6 +636,7 @@ fn snapshot_alias_chain(reg: &Registry, model: &str) -> Option<(String, Vec<Chai
                 return None;
             };
             Some(ChainCandidate {
+                extra_body: alias.extra_body.get(&c.backend).cloned(),
                 model: c.model.clone(),
                 reachable: view.healthy || view.in_grace_period,
                 serves: view.serves(&c.model),
@@ -749,7 +752,11 @@ async fn route_alias_chain(
             continue;
         }
 
-        let rewritten = match translate::rewrite_model_field(&body_bytes, &cand.model) {
+        let rewritten = match translate::rewrite_model_field_with(
+            &body_bytes,
+            &cand.model,
+            cand.extra_body.as_ref(),
+        ) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(error = %e, alias = %alias, "failed to rewrite model field for alias candidate");

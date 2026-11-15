@@ -982,6 +982,7 @@ mod tests {
                     model: "qwen3.6:latest".to_string(),
                 }],
                 fallback: crate::policy::AliasFallback::default(),
+                extra_body: Default::default(),
             },
         )]);
 

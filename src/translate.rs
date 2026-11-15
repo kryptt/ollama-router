@@ -75,9 +75,22 @@ pub fn ollama_chat_to_openai_request(bytes: &[u8]) -> Result<Vec<u8>, serde_json
 /// hosted backends 404 on unknown IDs and local ones would silently load
 /// the wrong model.
 pub fn rewrite_model_field(bytes: &[u8], model: &str) -> Result<Vec<u8>, serde_json::Error> {
+    rewrite_model_field_with(bytes, model, None)
+}
+
+/// `rewrite_model_field`, also setting the top-level fields in `extra`
+/// (an alias's per-backend `extra_body`); they overwrite the client's.
+pub fn rewrite_model_field_with(
+    bytes: &[u8],
+    model: &str,
+    extra: Option<&serde_json::Map<String, Value>>,
+) -> Result<Vec<u8>, serde_json::Error> {
     let mut root: Value = serde_json::from_slice(bytes)?;
     if let Some(obj) = root.as_object_mut() {
         obj.insert("model".to_string(), Value::String(model.to_string()));
+        if let Some(extra) = extra {
+            obj.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
     }
     serde_json::to_vec(&root)
 }
@@ -682,6 +695,19 @@ mod tests {
     fn parse_request(input: &[u8]) -> Value {
         let out = ollama_chat_to_openai_request(input).unwrap();
         serde_json::from_slice(&out).unwrap()
+    }
+
+    #[test]
+    fn rewrite_model_field_with_merges_extra_top_level() {
+        let extra: Map<String, Value> =
+            serde_json::from_str(r#"{"provider":{"sort":"latency"}}"#).unwrap();
+        let input = br#"{"model":"auto","provider":{"sort":"price"},"stream":true}"#;
+        let out: Value =
+            serde_json::from_slice(&rewrite_model_field_with(input, "m", Some(&extra)).unwrap())
+                .unwrap();
+        assert_eq!(out["model"], "m");
+        assert_eq!(out["provider"]["sort"], "latency");
+        assert_eq!(out["stream"], true);
     }
 
     #[test]

@@ -632,6 +632,34 @@ async fn all_benched_chain_still_attempts_every_hop() {
     assert_eq!(b2.chat_hits(), 2);
 }
 
+/// An alias's `extra_body.<backend>` reaches that backend's hop only.
+#[tokio::test]
+async fn alias_extra_body_is_merged_for_its_backend_only() {
+    let b1 = start_body_echo_backend(vec!["m:latest"], StatusCode::TOO_MANY_REQUESTS).await;
+    let b2 = start_body_echo_backend(vec!["m:latest"], StatusCode::OK).await;
+
+    let toml = format!(
+        "{}[aliases.ali.extra_body.p2.provider]\nsort = \"throughput\"\n",
+        alias_toml("ali", &["p1/m:latest", "p2/m:latest"])
+    );
+    let (_dir, config, reg) = policy_setup(&[("p1", &b1.url), ("p2", &b2.url)], &toml);
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+
+    let resp = Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&json!({"model": "ali", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let forwarded: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(forwarded["provider"]["sort"], "throughput");
+    assert_eq!(forwarded["model"], "m:latest");
+    assert_eq!(b1.chat_hits(), 1);
+}
+
 /// `reasoning_effort` is the scale every client speaks and the one thing
 /// llama.cpp ignores. The router must rewrite it into llama.cpp's own
 /// spelling — and must still do so on the candidate a chain advanced ONTO,

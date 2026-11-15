@@ -17,7 +17,7 @@
 //! `external = true` on a backend that a `local` alias chains through
 //! rejects the whole file, rather than silently un-pinning it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::time::Duration;
 
@@ -129,6 +129,11 @@ struct RawAlias {
     reasoning: Option<bool>,
     /// Fallback pricing (per-token strings).
     pricing: Option<RawPricing>,
+    /// Top-level JSON fields merged into the request body, per backend
+    /// name, for this alias's hops on that backend (e.g. OpenRouter's
+    /// `provider` routing object).
+    #[serde(default)]
+    extra_body: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
 }
 
 /// One `backend/model` candidate in an alias chain.
@@ -153,6 +158,9 @@ pub struct Alias {
     /// Config-declared capability fallbacks. Used only for candidates
     /// whose backend doesn't report the corresponding field.
     pub fallback: AliasFallback,
+    /// Backend name -> top-level fields merged into the request body for
+    /// this alias's hops on that backend. Keys are declared backends.
+    pub extra_body: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
 }
 
 /// A validated backend declaration. Position in [`Validated::backends`] is
@@ -444,6 +452,16 @@ fn validate_alias(
         });
     }
 
+    if let Some(b) = raw
+        .extra_body
+        .keys()
+        .find(|b| !backends.iter().any(|d| &d.name == *b))
+    {
+        return invalid(format!(
+            "alias '{name}': extra_body names backend '{b}', which is not declared in [[backends]]"
+        ));
+    }
+
     if raw.local
         && let Some(c) = candidates.iter().find(|c| external.contains(&c.backend))
     {
@@ -467,6 +485,7 @@ fn validate_alias(
                 completion: p.completion.clone(),
             }),
         },
+        extra_body: raw.extra_body.clone(),
     })
 }
 
@@ -488,6 +507,23 @@ mod tests {
 
     fn parse(raw: &str) -> Validated {
         FileConfig::parse(raw).expect("expected a valid policy document")
+    }
+
+    #[test]
+    fn alias_extra_body_parses_and_names_declared_backends() {
+        let v = parse(&format!(
+            "{MINIMAL}\n[aliases.x]\nchain = [\"a/m\"]\n\
+             [aliases.x.extra_body.a.provider]\nsort = \"throughput\"\nquantizations = [\"fp8\"]\n"
+        ));
+        let extra = &v.aliases["x"].extra_body["a"];
+        assert_eq!(extra["provider"]["sort"], "throughput");
+        assert_eq!(extra["provider"]["quantizations"][0], "fp8");
+        assert_rejects(
+            &format!(
+                "{MINIMAL}\n[aliases.x]\nchain = [\"a/m\"]\n[aliases.x.extra_body.nope]\nk = 1\n"
+            ),
+            "extra_body names backend 'nope'",
+        );
     }
 
     #[test]

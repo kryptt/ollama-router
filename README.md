@@ -273,6 +273,15 @@ or 5xx response heads.
   (synthesised, pydantic-safe entries); concrete models keep listing.
 - There are deliberately no per-candidate retries or backoff — the chain
   advance *is* the retry.
+- `extra_body.<backend>` sets top-level request fields on this alias's hops
+  to that backend only, overwriting the client's. Use it for provider
+  routing, e.g. OpenRouter:
+  ```toml
+  [aliases."auto:coding".extra_body.openrouter.provider]
+  sort = "throughput"
+  quantizations = ["fp8", "bf16"]
+  ```
+  A backend name that is not declared rejects the file.
 - Metrics: `ollama_router_chain_advance{alias,to,reason}` (`to` is the
   candidate backend moved past; reasons:
   `unreachable|connect|timeout|transport|payment|no_credit|auth|rate_limited|model_missing|upstream_5xx|benched`) and

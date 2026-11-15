@@ -49,7 +49,7 @@ pub struct FileConfig {
     /// hand-written check.
     aliases: HashMap<String, RawAlias>,
     /// `[health.<reason>]` re-check delay overrides for benched hops
-    /// (`payment`, `auth`, `model_missing`, `rate_limited`, `upstream_5xx`,
+    /// (`payment`, `no_credit`, `auth`, `model_missing`, `rate_limited`, `upstream_5xx`,
     /// `transport`). Optional; unlisted reasons keep their defaults.
     #[serde(default)]
     health: HashMap<String, RawDelay>,

@@ -709,7 +709,15 @@ async fn route_alias_chain(
         .any(|c| c.reachable && !health.is_benched(&c.target.name, &c.model, now));
 
     let mut last_failure: Option<(Response, String)> = None;
+    // Backends that already failed this request account-wide (auth, no
+    // credit): their other hops would fail the same way, even on the
+    // attempt-all pass.
+    let mut dead_backends: Vec<String> = Vec::new();
     for cand in candidates {
+        if dead_backends.contains(&cand.target.name) {
+            record_chain_advance(&ctx.state.metrics, &alias, &cand.target.name, "benched");
+            continue;
+        }
         if !attempt_all && !cand.reachable {
             record_chain_advance(&ctx.state.metrics, &alias, &cand.target.name, "unreachable");
             continue;
@@ -779,8 +787,12 @@ async fn route_alias_chain(
             } => {
                 // 402 / 401 / 403 / 404 / 429 / 5xx advance and bench the
                 // hop; anything else (2xx, the client's own 4xx) commits.
-                match Reason::from_status(response.status()) {
+                let (response, reason) = classify_failure(response).await;
+                match reason {
                     Some(reason) => {
+                        if reason.backend_wide() {
+                            dead_backends.push(cand.target.name.clone());
+                        }
                         bench(
                             ctx,
                             &alias,
@@ -914,6 +926,22 @@ fn survey_log(alias: &str, headers: &HeaderMap, body: &[u8]) {
 }
 
 /// Bench a failed hop with the live `[health]` delays, count it and log it.
+/// The bench reason for an upstream reply. A 402 / 404 body is read (and
+/// put back) because it can say "no credit", which benches the backend.
+async fn classify_failure(response: Response) -> (Response, Option<Reason>) {
+    let status = response.status();
+    if !matches!(status, StatusCode::PAYMENT_REQUIRED | StatusCode::NOT_FOUND) {
+        return (response, Reason::from_status(status));
+    }
+    let (mut parts, body) = response.into_parts();
+    let bytes = axum::body::to_bytes(body, 64 * 1024)
+        .await
+        .unwrap_or_default();
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    let reason = Reason::from_response(status, &bytes);
+    (Response::from_parts(parts, Body::from(bytes)), reason)
+}
+
 async fn bench(
     ctx: &AttemptContext<'_>,
     alias: &str,

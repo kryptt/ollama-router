@@ -47,7 +47,7 @@ pub struct Metrics {
     /// past candidate backend `to` because of `reason`. The hop it came
     /// from is implied by the chain order in the alias file, so it is not
     /// a label. `reason` is one of: unreachable | connect | timeout |
-    /// transport | payment | auth | rate_limited | model_missing |
+    /// transport | payment | no_credit | auth | rate_limited | model_missing |
     /// upstream_5xx | benched.
     /// Cardinality is bounded by the operator's alias file (aliases ×
     /// chain length × 10 reasons).
@@ -56,7 +56,7 @@ pub struct Metrics {
     /// response — every candidate was unreachable or failed.
     pub chain_exhausted: Family<ChainLabels, Counter>,
     /// Alias-chain hops benched after a classified failure (`reason`:
-    /// payment | auth | model_missing | rate_limited | upstream_5xx |
+    /// payment | no_credit | auth | model_missing | rate_limited | upstream_5xx |
     /// transport). Skips while benched show as `chain_advance{reason="benched"}`.
     /// Cardinality bounded by the alias file's hops × 6 reasons.
     pub hop_benched: Family<HopBenchLabels, Counter>,

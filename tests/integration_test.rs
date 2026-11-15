@@ -149,6 +149,13 @@ fn mock_backend_router(
     });
     let chat_handler = post(move |payload: Bytes| async move {
         chat_hits.fetch_add(1, Ordering::SeqCst);
+        // A model named `nocredit*` answers like Nous with an empty balance.
+        if payload.windows(8).any(|w| w == b"nocredit") {
+            return (
+                chat_status,
+                "insufficient_credits_for_paid_model".to_string(),
+            );
+        }
         (chat_status, format!("echoed: {}", payload.len()))
     });
     let version_handler = get(|| async { (StatusCode::OK, r#"{"version":"0.9.0"}"#) });
@@ -562,6 +569,43 @@ async fn payment_required_advances_and_benches_the_hop() {
     let benched = state.health.benched(std::time::Instant::now());
     assert_eq!(benched.len(), 1);
     assert_eq!(benched[0].backend, "p1");
+}
+
+/// A 404 saying "insufficient credits" benches the whole backend: its other
+/// hops are skipped in the same request and in later ones.
+#[tokio::test]
+async fn no_credit_404_benches_the_whole_backend() {
+    let b1 = start_counting_backend(
+        vec!["nocredit-a:latest", "nocredit-b:latest"],
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    let b2 = start_counting_backend(vec!["m:latest"], StatusCode::OK).await;
+
+    let (_dir, config, reg) = policy_setup(
+        &[("p1", &b1.url), ("p2", &b2.url)],
+        &alias_toml(
+            "ali",
+            &[
+                "p1/nocredit-a:latest",
+                "p1/nocredit-b:latest",
+                "p2/m:latest",
+            ],
+        ),
+    );
+    let state = app_state(&reg);
+    let base = spawn_router(state.clone()).await;
+    drop(run_discovery_to_completion(&reg, &config).await);
+
+    let client = Client::new();
+    for _ in 0..3 {
+        let resp = post_chat(&client, &base, "ali", false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    assert_eq!(b1.chat_hits(), 1, "one no-credit reply benches all of p1");
+    assert_eq!(b2.chat_hits(), 3);
+    let text = state.metrics.encode().unwrap();
+    assert!(text.contains(r#"reason="no_credit""#), "{text}");
 }
 
 /// When every hop is benched, the walk tries them all anyway: the client

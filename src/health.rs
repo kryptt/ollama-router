@@ -44,6 +44,10 @@ const PROBE_LEASE: Duration = Duration::from_secs(600);
 pub enum Reason {
     /// 402: the account behind the backend is out of credit.
     Payment,
+    /// 402 / 404 whose body says the account has no credit (Nous answers an
+    /// empty balance with `404 insufficient_credits_for_paid_model`). The
+    /// whole account is out, so this benches the backend, not one model.
+    NoCredit,
     /// 401 / 403: the backend's credential is bad. Benches the backend.
     Auth,
     /// 404: the backend does not (or no longer) serve this model.
@@ -57,8 +61,9 @@ pub enum Reason {
 }
 
 impl Reason {
-    pub const ALL: [Reason; 6] = [
+    pub const ALL: [Reason; 7] = [
         Reason::Payment,
+        Reason::NoCredit,
         Reason::Auth,
         Reason::ModelMissing,
         Reason::RateLimited,
@@ -70,6 +75,7 @@ impl Reason {
     pub fn as_str(self) -> &'static str {
         match self {
             Reason::Payment => "payment",
+            Reason::NoCredit => "no_credit",
             Reason::Auth => "auth",
             Reason::ModelMissing => "model_missing",
             Reason::RateLimited => "rate_limited",
@@ -95,8 +101,20 @@ impl Reason {
         }
     }
 
-    fn backend_wide(self) -> bool {
-        matches!(self, Reason::Auth)
+    /// `from_status`, refined by the error body: a 402 or 404 saying the
+    /// account has no credit is `NoCredit`, not a per-model failure.
+    pub fn from_response(status: StatusCode, body: &[u8]) -> Option<Reason> {
+        let credit = matches!(status, StatusCode::PAYMENT_REQUIRED | StatusCode::NOT_FOUND)
+            && body.windows(20).any(|w| w == b"insufficient_credits");
+        if credit {
+            Some(Reason::NoCredit)
+        } else {
+            Reason::from_status(status)
+        }
+    }
+
+    pub fn backend_wide(self) -> bool {
+        matches!(self, Reason::Auth | Reason::NoCredit)
     }
 }
 
@@ -131,6 +149,7 @@ impl Default for Delays {
     fn default() -> Self {
         Delays(HashMap::from([
             (Reason::Payment, Delay::secs(15 * 60, 24 * 3600)),
+            (Reason::NoCredit, Delay::secs(15 * 60, 24 * 3600)),
             (Reason::Auth, Delay::secs(5 * 60, 12 * 3600)),
             (Reason::ModelMissing, Delay::secs(10 * 60, 12 * 3600)),
             (Reason::RateLimited, Delay::secs(30, 3600)),
@@ -432,6 +451,28 @@ mod tests {
         assert_eq!(h.admit("freellmapi", "a", t), Admit::Go);
         h.record_success("nous", "b");
         assert_eq!(h.admit("nous", "a", t), Admit::Go);
+    }
+
+    #[test]
+    fn no_credit_body_benches_whole_backend() {
+        let body = br#"{"status":404,"code":"insufficient_credits_for_paid_model"}"#;
+        assert_eq!(
+            Reason::from_response(StatusCode::NOT_FOUND, body),
+            Some(Reason::NoCredit)
+        );
+        assert_eq!(
+            Reason::from_response(StatusCode::NOT_FOUND, b"no such model"),
+            Some(Reason::ModelMissing)
+        );
+        assert_eq!(
+            Reason::from_response(StatusCode::PAYMENT_REQUIRED, b""),
+            Some(Reason::Payment)
+        );
+        let h = Health::default();
+        let t = Instant::now();
+        h.record_failure("nous", "a", Reason::NoCredit, None, &Delays::default(), t);
+        assert_eq!(h.admit("nous", "b", t), Admit::Skip(Reason::NoCredit));
+        assert_eq!(h.admit("freellmapi", "a", t), Admit::Go);
     }
 
     #[test]

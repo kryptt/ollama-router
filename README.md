@@ -275,7 +275,7 @@ or 5xx response heads.
   advance *is* the retry.
 - Metrics: `ollama_router_chain_advance{alias,to,reason}` (`to` is the
   candidate backend moved past; reasons:
-  `unreachable|connect|timeout|transport|payment|auth|rate_limited|model_missing|upstream_5xx|benched`) and
+  `unreachable|connect|timeout|transport|payment|no_credit|auth|rate_limited|model_missing|upstream_5xx|benched`) and
   `ollama_router_chain_exhausted{alias}`. An exhausted chain still records
   `requests_total` — alias as the model, and the backend whose failure was
   relayed (`"none"` when no candidate produced a response).
@@ -289,6 +289,7 @@ answer straight away instead of re-paying the same failure.
 | Failure | Advances? | Benches | Default base / cap |
 |---|---|---|---|
 | 402 | yes | the hop | 15m / 24h |
+| 402 / 404 with `insufficient_credits` in the body | yes | **the whole backend** (account out of credit; Nous sends 404) | 15m / 24h |
 | 401, 403 | yes | **the whole backend** (one credential per backend) | 5m / 12h |
 | 404 | yes | the hop | 10m / 12h |
 | 429 | yes | the hop; `Retry-After: <secs>` overrides the delay | 30s / 1h |
@@ -311,7 +312,7 @@ answer straight away instead of re-paying the same failure.
   the file):
 
   ```toml
-  [health.payment]        # payment | auth | model_missing | rate_limited | upstream_5xx | transport
+  [health.payment]        # payment | no_credit | auth | model_missing | rate_limited | upstream_5xx | transport
   base_secs = 900
   cap_secs = 86400
   ```

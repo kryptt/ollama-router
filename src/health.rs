@@ -49,6 +49,7 @@ pub enum Reason {
     /// whole account is out, so this benches the backend, not one model.
     NoCredit,
     /// 401 / 403: the backend's credential is bad. Benches the backend.
+    /// A 403 whose body names a spend budget is `Payment` instead.
     Auth,
     /// 404: the backend does not (or no longer) serve this model.
     ModelMissing,
@@ -102,12 +103,20 @@ impl Reason {
     }
 
     /// `from_status`, refined by the error body: a 402 or 404 saying the
-    /// account has no credit is `NoCredit`, not a per-model failure.
+    /// account has no credit is `NoCredit`, not a per-model failure. A 403
+    /// saying a spend budget is exceeded (OpenRouter: `"Workspace monthly
+    /// budget of $100.00 exceeded"`, `limit_source`) is `Payment`: the key
+    /// still works and free models still serve, so only this hop benches.
     pub fn from_response(status: StatusCode, body: &[u8]) -> Option<Reason> {
         let credit = matches!(status, StatusCode::PAYMENT_REQUIRED | StatusCode::NOT_FOUND)
             && body.windows(20).any(|w| w == b"insufficient_credits");
+        let budget = status == StatusCode::FORBIDDEN
+            && (body.windows(6).any(|w| w == b"budget")
+                || body.windows(12).any(|w| w == b"limit_source"));
         if credit {
             Some(Reason::NoCredit)
+        } else if budget {
+            Some(Reason::Payment)
         } else {
             Reason::from_status(status)
         }
@@ -473,6 +482,28 @@ mod tests {
         h.record_failure("nous", "a", Reason::NoCredit, None, &Delays::default(), t);
         assert_eq!(h.admit("nous", "b", t), Admit::Skip(Reason::NoCredit));
         assert_eq!(h.admit("freellmapi", "a", t), Admit::Go);
+    }
+
+    #[test]
+    fn budget_403_benches_only_the_hop() {
+        let body = br#"{"error":{"message":"Workspace monthly budget of $100.00 exceeded.","code":403,"metadata":{"limit_source":"openrouter_workspace_budget"}}}"#;
+        let reason = Reason::from_response(StatusCode::FORBIDDEN, body);
+        assert_eq!(reason, Some(Reason::Payment));
+        assert_eq!(
+            Reason::from_response(StatusCode::FORBIDDEN, b"invalid key"),
+            Some(Reason::Auth)
+        );
+        let h = Health::default();
+        let t = Instant::now();
+        h.record_failure(
+            "openrouter",
+            "paid",
+            Reason::Payment,
+            None,
+            &Delays::default(),
+            t,
+        );
+        assert_eq!(h.admit("openrouter", "free:free", t), Admit::Go);
     }
 
     #[test]

@@ -933,11 +933,15 @@ fn survey_log(alias: &str, headers: &HeaderMap, body: &[u8]) {
 }
 
 /// Bench a failed hop with the live `[health]` delays, count it and log it.
-/// The bench reason for an upstream reply. A 402 / 404 body is read (and
-/// put back) because it can say "no credit", which benches the backend.
+/// The bench reason for an upstream reply. A 402 / 403 / 404 body is read
+/// (and put back): it can say "no credit" (benches the backend) or "spend
+/// budget exceeded" (benches only that paid hop).
 async fn classify_failure(response: Response) -> (Response, Option<Reason>) {
     let status = response.status();
-    if !matches!(status, StatusCode::PAYMENT_REQUIRED | StatusCode::NOT_FOUND) {
+    if !matches!(
+        status,
+        StatusCode::PAYMENT_REQUIRED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+    ) {
         return (response, Reason::from_status(status));
     }
     let (mut parts, body) = response.into_parts();
